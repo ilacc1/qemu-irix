@@ -554,7 +554,8 @@ const mips_def_t mips_defs[] =
         .CP0_Config0 = (2 << CP0C0_Impl) | (1 << CP0C0_IC) | (1 << CP0C0_DC) |
                        (2 << CP0C0_K0),
         /* Note: Config1 is only used internally, the R4000 has only Config0. */
-        .CP0_Config1 = (1 << CP0C1_FP) | (47 << CP0C1_MMU),
+        .CP0_Config1 = (1 << CP0C1_FP) | (1 << CP0C1_WR) |
+                   (47 << CP0C1_MMU),
         .CP0_LLAddr_rw_bitmask = 0xFFFFFFFF,
         .CP0_LLAddr_shift = 4,
         .SYNCI_Step = 16,

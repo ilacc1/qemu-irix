@@ -179,15 +179,25 @@ void eeprom93xx_write(eeprom_t *eeprom, int eecs, int eesk, int eedi)
                 }
             } else if (command == 3) {
                 /* Erase word. */
-                eeprom->contents[address] = 0xffff;
+                eeprom->contents[address % eeprom->size] = 0xffff;
             } else if (tick >= 2 + 2 + eeprom->addrbits + 16) {
+                /*
+                 * Microwire WRITE is a self-timed erase+program cycle:
+                 * the cell is erased internally before programming, so
+                 * a WRITE stores the full word even when the guest never
+                 * issues a separate ERASE (the IP22 PROM only ever sends
+                 * EWEN/WRITE/EWDS). Using &= here leaves 0->1 transitions
+                 * stuck and the guest retries forever; MAME's 93Cxx model
+                 * assigns the word directly.
+                 */
                 if (command == 1) {
                     /* Write word. */
-                    eeprom->contents[address] &= eeprom->data;
+                    eeprom->contents[address % eeprom->size] =
+                        eeprom->data;
                 } else if (command == 0 && subcommand == 1) {
                     /* Write all. */
                     for (address = 0; address < eeprom->size; address++) {
-                        eeprom->contents[address] &= eeprom->data;
+                        eeprom->contents[address] = eeprom->data;
                     }
                 }
             }
@@ -227,13 +237,19 @@ void eeprom93xx_write(eeprom_t *eeprom, int eecs, int eesk, int eedi)
             address = ((address << 1) | eedi);
             if (tick == 2 + 2 + eeprom->addrbits) {
                 logout("%s command, address = 0x%02x (value 0x%04x)\n",
-                       opstring[command], address, eeprom->contents[address]);
+                       opstring[command], address,
+                       eeprom->contents[address % eeprom->size]);
                 if (command == 2) {
                     eedo = 0;
                 }
-                address = address % eeprom->size;
                 if (command == 0) {
-                    /* Command code in upper 2 bits of address. */
+                    /*
+                     * Command code in upper 2 bits of the address
+                     * field. Decode from the full field: folding it
+                     * to the device size first (e.g. 0xC0 % 128)
+                     * would turn EWEN into WRAL and ERAL into EWDS,
+                     * so the write-enable latch could never set.
+                     */
                     switch (address >> (eeprom->addrbits - 2)) {
                     case 0:
                         logout("write disable command\n");
@@ -252,7 +268,8 @@ void eeprom93xx_write(eeprom_t *eeprom, int eecs, int eesk, int eedi)
                     }
                 } else {
                     /* Read, write or erase word. */
-                    eeprom->data = eeprom->contents[address];
+                    eeprom->data =
+                        eeprom->contents[address % eeprom->size];
                 }
             }
         } else if (tick < 2 + 2 + eeprom->addrbits + 16) {

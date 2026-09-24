@@ -857,12 +857,47 @@ static int scsi_disk_emulate_inquiry(SCSIRequest *req, uint8_t *outbuf)
     outbuf[2] = s->qdev.default_scsi_version;
     outbuf[3] = 2 | 0x10; /* Format 2, HiSup */
 
-    if (buflen > 36) {
-        outbuf[4] = buflen - 5; /* Additional Length = (Len - 1) - 4 */
-    } else {
-        /* If the allocation length of CDB is too small,
-               the additional length is not adjusted */
-        outbuf[4] = 36 - 5;
+    /*
+     * IP22 IRIX 6.5 wd93 attach issues INQUIRY with alloc 64 to the
+     * boot disk and validates the payload before filling its driver
+     * table (entry+68); with QEMU's old alloc-sized Additional Length
+     * (59 for alloc 64, 28 trailing zeros claimed valid) the table
+     * never fills and the kernel spins at 880f0edc/8815dd2c with disk
+     * frozen (84 ops). MAME nscsi/hd.cpp (no IDNT for this CHD, so
+     * Seagate defaults) returns 56 bytes (Additional Length 52,
+     * residual alloc-available) with command-support bytes 36-53
+     * rather than fabricating alloc zeros. Mirror that: 56 available
+     * (QEMU vendor/product kept for PROM compat, Seagate capability
+     * bytes for IRIX validation), cap transfer at 56, residual for
+     * over-alloc; the WD shim already completes over-allocated
+     * INQUIRY/MODE SENSE/REQUEST SENSE with residual as GOOD.
+     * PROM INQUIRY 36 truncates to 36 (Additional Length still 52,
+     * like MAME) with no residual change.
+     */
+    outbuf[4] = 52; /* Additional Length = 56 - 4 */
+    /* Command-support bytes (MAME Seagate defaults, SPC CCS): */
+    outbuf[36] = 0x00;
+    outbuf[37] = 0x08;
+    outbuf[38] = 0x00;
+    outbuf[39] = 0x99;
+    outbuf[40] = 0xa0;
+    outbuf[41] = 0x27;
+    outbuf[42] = 0x34;
+    outbuf[43] = 0x01;
+    outbuf[44] = 0x04;
+    outbuf[45] = 0xa0;
+    outbuf[46] = 0x01;
+    outbuf[47] = 0x18;
+    outbuf[48] = 0x07;
+    outbuf[49] = 0x00;
+    outbuf[50] = 0xa0;
+    outbuf[51] = 0x00;
+    outbuf[52] = 0x00;
+    outbuf[53] = 0xff;
+    outbuf[54] = 0x00;
+    outbuf[55] = 0x00;
+    if (buflen > 56) {
+        buflen = 56;
     }
 
     /* Sync data transfer and TCQ.  */
@@ -2086,6 +2121,13 @@ static int32_t scsi_disk_emulate_command(SCSIRequest *req, uint8_t *buf)
         if (buflen < 0) {
             goto illegal_request;
         }
+        /*
+         * Cap the transfer to available (56, like MAME's 56 vs alloc
+         * 64 with resid 8) so over-alloc INQUIRY returns residual
+         * rather than padded zeros. The WD shim completes such
+         * probes as GOOD with residual.
+         */
+        r->buflen = buflen;
         break;
     case MODE_SENSE:
     case MODE_SENSE_10:

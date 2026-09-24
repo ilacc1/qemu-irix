@@ -34,6 +34,10 @@ config ESP
     bool
     select SCSI
 
+config SGI_WD33C93
+    bool
+    select ESP
+
 config ESP_PCI
     bool
     default y if PCI_DEVICES

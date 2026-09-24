@@ -86,3 +86,28 @@ config MIPS_BOSTON
 
 config FW_CFG_MIPS
     bool
+
+config SGI_INDIGO2
+    bool
+    default y
+    depends on MIPS64
+    select SGI_WD33C93
+    select ESCC
+    select NMC93XX_EEPROM
+    select ISA_BUS
+    select RC4030
+    select I8259
+    select I8254
+    select I8257
+    select PCSPK
+    select VGA_MMIO
+    select G364FB
+    select DP8393X
+    select ESP
+    select FDC_SYSBUS
+    select MC146818RTC
+    select PCKBD
+    select SERIAL_MM
+    select PARALLEL
+    select DS1225Y
+    select JAZZ_LED
