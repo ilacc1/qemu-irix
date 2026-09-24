@@ -243,8 +243,8 @@ static uint64_t sgi_ioc2_int2_read(void *opaque, hwaddr addr, unsigned size)
         rv = sgi_ioc2_map_status_read(state);
         break;
     case 0x08:
-        /* Write-only in MAME; retain last for the presence-test readback. */
-        rv = state->pit_timer_clear_last;
+        /* MAME int2_map: timer clear is write-only; reads return 0. */
+        rv = 0;
         break;
     case 0x0c:
         rv = state->pit_c0_last;

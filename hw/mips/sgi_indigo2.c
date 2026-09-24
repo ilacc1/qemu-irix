@@ -46,6 +46,7 @@
 #include "hw/display/bochs-vbe.h"
 #include "hw/audio/pcspk.h"
 #include "hw/input/i8042.h"
+#include "hw/core/or-irq.h"
 #include "hw/core/sysbus.h"
 #include "system/qtest.h"
 #include "system/reset.h"
@@ -1060,10 +1061,17 @@ static void mips_sgi_indigo2_init(MachineState *machine)
     qdev_prop_set_uint32(DEVICE(i8042), "size", 0x1000);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(i8042), &error_fatal);
 
-    qdev_connect_gpio_out(DEVICE(i8042), I8042_KBD_IRQ,
-                            qdev_get_gpio_in(ioc2dev, 8));
-    qdev_connect_gpio_out(DEVICE(i8042), I8042_MOUSE_IRQ,
-                            qdev_get_gpio_in(ioc2dev, 8));
+    /* MAME ioc2.cpp kbdc_irq merger: kbd+aux IRQs OR into one line. */
+    {
+        DeviceState *kbdc_or = qdev_new(TYPE_OR_IRQ);
+        qdev_prop_set_uint16(kbdc_or, "num-lines", 2);
+        qdev_realize_and_unref(kbdc_or, NULL, &error_fatal);
+        qdev_connect_gpio_out(DEVICE(i8042), I8042_KBD_IRQ,
+                              qdev_get_gpio_in(kbdc_or, 0));
+        qdev_connect_gpio_out(DEVICE(i8042), I8042_MOUSE_IRQ,
+                              qdev_get_gpio_in(kbdc_or, 1));
+        qdev_connect_gpio_out(kbdc_or, 0, qdev_get_gpio_in(ioc2dev, 8));
+    }
 
     memory_region_add_subregion(address_space, 0x80005000,
                                  sysbus_mmio_get_region(SYS_BUS_DEVICE(i8042), 0));

@@ -91,6 +91,7 @@ config SGI_INDIGO2
     bool
     default y
     depends on MIPS64
+    select OR_IRQ
     select SGI_WD33C93
     select ESCC
     select NMC93XX_EEPROM

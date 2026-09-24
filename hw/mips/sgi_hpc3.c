@@ -60,6 +60,8 @@ struct SgiHpc3State {
     /* PS/2 streaming-report enable. Motion packets go out only while set;
      * command replies are always answered, like real hardware. */
     bool mouse_reporting;
+    uint8_t mouse_resolution;
+    uint8_t mouse_sample_rate;
     uint8_t last_kbd_resp;
     uint8_t last_aux_resp;
     int mouse_x;
@@ -366,12 +368,23 @@ static void sgi_hpc3_aux_command(SgiHpc3State *state, uint8_t val)
 {
     if (state->mouse_expect == 1) {
         state->mouse_expect = 0;
+        state->mouse_sample_rate = val;
+        sgi_hpc3_aux_respond(state, 0xfa);
+        return;
+    }
+    /* MAME hle_mouse.cpp E8: resolution takes one parameter byte. */
+    if (state->mouse_expect == 2) {
+        state->mouse_expect = 0;
+        state->mouse_resolution = val;
         sgi_hpc3_aux_respond(state, 0xfa);
         return;
     }
     switch (val) {
     case 0xff:
         state->mouse_reporting = false;
+        /* MAME hle_mouse.cpp defaults on reset. */
+        state->mouse_resolution = 2;
+        state->mouse_sample_rate = 100;
         sgi_hpc3_aux_respond(state, 0xfa);
         sgi_hpc3_aux_respond(state, 0xaa);
         sgi_hpc3_aux_respond(state, 0x00);
@@ -389,10 +402,11 @@ static void sgi_hpc3_aux_command(SgiHpc3State *state, uint8_t val)
         sgi_hpc3_aux_respond(state, 0x00);
         break;
     case 0xe9:
+        /* MAME hle_mouse.cpp defaults: mode 0, resolution 2, rate 100. */
         sgi_hpc3_aux_respond(state, 0xfa);
         sgi_hpc3_aux_respond(state, 0x00);
-        sgi_hpc3_aux_respond(state, 0x00);
-        sgi_hpc3_aux_respond(state, 0x64);
+        sgi_hpc3_aux_respond(state, state->mouse_resolution);
+        sgi_hpc3_aux_respond(state, state->mouse_sample_rate);
         break;
     case 0xeb:
         sgi_hpc3_aux_respond(state, 0xfa);
@@ -408,17 +422,25 @@ static void sgi_hpc3_aux_command(SgiHpc3State *state, uint8_t val)
         break;
     case 0xf6:
         state->mouse_reporting = false;
+        /* MAME hle_mouse.cpp defaults: mode 0, rate 100, resolution 2. */
+        state->mouse_resolution = 2;
+        state->mouse_sample_rate = 100;
+        sgi_hpc3_aux_respond(state, 0xfa);
+        break;
+    case 0xe8:
+        state->mouse_expect = 2;
         sgi_hpc3_aux_respond(state, 0xfa);
         break;
     case 0xf0:
     case 0xea:
     case 0xec:
-    case 0xe8:
     case 0xe6:
+    case 0xe7:
         sgi_hpc3_aux_respond(state, 0xfa);
         break;
     default:
-        sgi_hpc3_aux_respond(state, 0xfa);
+        /* MAME hle_mouse.cpp: unknown commands answer 0xfc error. */
+        sgi_hpc3_aux_respond(state, 0xfc);
         break;
     }
 }
@@ -771,6 +793,11 @@ static uint64_t sgi_hpc3_bbram_read(void *opaque, hwaddr addr, unsigned size)
     now = state->bbram_clock_base_time +
             (clock_ns - state->bbram_clock_base_ns) / 1000000000ULL;
     localtime_r(&now, &current);
+    /* MAME ds1386.h REGISTER_*: 0-0x0d clock/alarms/command/watchdog,
+     * 0x0e+ user NVRAM; DS1286 is 64 bytes (MAME ds1386.cpp data_r). */
+    if (reg >= 64) {
+        return 0;
+    }
     switch (reg) {
     case 0x00:
         return sgi_hpc3_bcd((g_get_real_time() / 10000) % 100);    case 0x01:
@@ -788,8 +815,8 @@ static uint64_t sgi_hpc3_bbram_read(void *opaque, hwaddr addr, unsigned size)
     case 0x0a:
         return sgi_hpc3_bcd(current.tm_year % 100);
     default:
-        /* DS1386 decodes 13 address bits; the NVRAM mirrors across the window. */
-        return state->bbram[addr & 0x1fff];
+        /* Alarms/command/watchdog/user: stored RAM, not live time. */
+        return state->bbram[reg];
     }
 }
 
@@ -797,8 +824,13 @@ static void sgi_hpc3_bbram_write(void *opaque, hwaddr addr,
                                   uint64_t val, unsigned size)
 {
     SgiHpc3State *state = SGI_HPC3(opaque);
+    hwaddr reg = size == 4 ? addr >> 2 : addr;
 
-    state->bbram[addr & 0x1fff] = val;
+    /* MAME ds1386.cpp data_w: ignore accesses beyond the 64-byte DS1286. */
+    if (reg >= 64) {
+        return;
+    }
+    state->bbram[reg] = val;
 }
 
 static const MemoryRegionOps sgi_hpc3_bbram_ops = {
@@ -898,7 +930,7 @@ static void sgi_hpc3_unrealize(DeviceState *device)
 
 static const VMStateDescription vmstate_sgi_hpc3 = {
     .name = TYPE_SGI_HPC3,
-    .version_id = 5,
+    .version_id = 6,
     .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT8_ARRAY(pio0_data, SgiHpc3State, 0x100),
@@ -920,6 +952,8 @@ static const VMStateDescription vmstate_sgi_hpc3 = {
         VMSTATE_UINT8(kbd_expect, SgiHpc3State),
         VMSTATE_UINT8(mouse_expect, SgiHpc3State),
         VMSTATE_BOOL(mouse_reporting, SgiHpc3State),
+        VMSTATE_UINT8(mouse_resolution, SgiHpc3State),
+        VMSTATE_UINT8(mouse_sample_rate, SgiHpc3State),
         VMSTATE_UINT8(last_kbd_resp, SgiHpc3State),
         VMSTATE_UINT8(last_aux_resp, SgiHpc3State),
         VMSTATE_INT32(mouse_x, SgiHpc3State),
@@ -954,6 +988,8 @@ static void sgi_hpc3_reset(DeviceState *device)
     state->kbd_expect = 0;
     state->mouse_expect = 0;
     state->mouse_reporting = false;
+    state->mouse_resolution = 2;
+    state->mouse_sample_rate = 100;
     state->last_kbd_resp = 0;
     state->last_aux_resp = 0;
     state->mouse_x = 0;
@@ -1046,7 +1082,10 @@ static void sgi_hpc3_write_back_nvram(void)
     if (!state) {
         return;
     }
-    if (sgi_hpc3_nvram_eeprom_path[0] && state->eeprom) {
+    /* Never overwrite the frozen 0444 reference seeds; they stay
+     * read-only and QEMU simply skips write-back when unwritable. */
+    if (sgi_hpc3_nvram_eeprom_path[0] && state->eeprom &&
+        access(sgi_hpc3_nvram_eeprom_path, W_OK) == 0) {
         uint16_t *data = eeprom93xx_data(state->eeprom);
         uint8_t bytes[256];
         f = fopen(sgi_hpc3_nvram_eeprom_path, "wb");
@@ -1060,7 +1099,8 @@ static void sgi_hpc3_write_back_nvram(void)
             fclose(f);
         }
     }
-    if (sgi_hpc3_nvram_rtc_path[0]) {
+    if (sgi_hpc3_nvram_rtc_path[0] &&
+        access(sgi_hpc3_nvram_rtc_path, W_OK) == 0) {
         /* DS1286: persist the 64-byte image MAME uses. */
         f = fopen(sgi_hpc3_nvram_rtc_path, "wb");
         if (f) {
@@ -1140,16 +1180,15 @@ static void sgi_hpc3_init(Object *object)
         if (rtc_file) {
             /* IP22 carries a DS1286 (64 bytes, MAME indy_indigo2.cpp), not
              * the Indy/IP24 DS1386_8K; load the seed as-is. */
-            uint8_t nvram[0x2000];
+            uint8_t nvram[64];
             size_t got = fread(nvram, 1, sizeof(nvram), rtc_file);
             if (got > 0) {
-                memcpy(state->bbram, nvram,
-                       got > sizeof(state->bbram) ? sizeof(state->bbram) : got);
+                memcpy(state->bbram, nvram, got);
             }
             fclose(rtc_file);
         } else {
-            /* MAME ds1386 nvram_default(): zeros + TE|WAM|TDM. */
-            state->bbram[0x0c] = 0x8c;
+            /* MAME ds1386.cpp nvram_default(): zeros + TE|WAM|TDM at 0x0b. */
+            state->bbram[0x0b] = 0x8c;
         }
         if (rtc_path[0]) {
             sgi_hpc3_note_nvram_paths(NULL, rtc_path);
