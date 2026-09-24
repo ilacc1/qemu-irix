@@ -60,6 +60,11 @@ static uint64_t sgi_hpc3_scsi_channel_read(void *opaque, hwaddr addr,
     case 0x1004:
         rv = sgi_wd33c93_dma_reg_read(channel->state->wd[channel->index], 0x3004);
         break;
+    case 0x1008:
+    case 0x100c:
+        /* MAME hpc3.cpp:302-315: GIO/DEV FIFO pointers read as 0. */
+        rv = 0;
+        break;
     case 0x1010:
         rv = channel->state->dma_config[channel->index];
         break;

@@ -40,6 +40,8 @@ struct SGIWD33C93State {
     uint32_t dma_count;
     uint32_t dma_control;
     uint32_t dma_desc_flags;
+    bool dma_irq;
+    bool dma_active;
     QEMUTimer *progress_timer;
 };
 
@@ -90,7 +92,12 @@ static void sgi_wd_update_irq(SGIWD33C93State *state)
 
 static void sgi_wd_reset_state(SGIWD33C93State *state)
 {
+    uint8_t own_id = state->wd_regs[0];
     memset(state->wd_regs, 0, sizeof(state->wd_regs));
+    /* MAME wd33c9x.cpp:421-424: 0x1a-0x1e read back 0xff. */
+    memset(&state->wd_regs[0x1a], 0xff, 5);
+    /* MAME wd33c9x.cpp:738-754: soft reset preserves OWN_ID. */
+    state->wd_regs[0] = own_id;
     state->register_select = 0;
     state->auxiliary_status = 0x80;
     state->scsi_status = SGI_WD_STATUS_SELECT_TRANSFER_SUCCESS;
@@ -102,11 +109,14 @@ static void sgi_wd_reset_state(SGIWD33C93State *state)
     state->dma_count = 0;
     state->dma_control = 0;
     state->dma_desc_flags = 0;
+    state->dma_irq = false;
+    state->dma_active = false;
     if (state->progress_timer) {
         timer_del(state->progress_timer);
     }
     sgi_wd_irq_fifo_reset(state);
-    sgi_wd_irq_fifo_push(state, 0x00);
+    /* MAME wd33c9x.cpp:751: RESET_EAF when OWN_ID EAF is set. */
+    sgi_wd_irq_fifo_push(state, (own_id & 0x08) ? 0x01 : 0x00);
     if (state->esp) {
         esp_hard_reset(state->esp);
     }
@@ -167,12 +177,33 @@ static bool sgi_wd_dma_next(SGIWD33C93State *state)
     if (state->dma_count) {
         return true;
     }
+    /* MAME hpc3.cpp:963-983: IRQ on bit 29 at chain end. */
+    if (state->dma_desc_flags & (1U << 29)) {
+        state->dma_irq = true;
+    }
     if (state->dma_desc_flags & (1U << 31)) {
         state->dma_control &= ~0x10U;
+        state->dma_active = false;
         return false;
     }
     sgi_wd_dma_fetch_descriptor(state);
     return state->dma_count != 0;
+}
+
+/* MAME wd33c9x.cpp:1127,1199: DRQ only when CONTROL DMA != POLLED. */
+static bool sgi_wd_wd_dma_mode(SGIWD33C93State *state)
+{
+    return (state->wd_regs[0x01] & 0xe0) != 0;
+}
+
+/* MAME hpc3.cpp:985-1000: flush raises IRQ on bit 29, drops ENABLE. */
+static void sgi_wd_dma_flush(SGIWD33C93State *state)
+{
+    if (state->dma_desc_flags & (1U << 29)) {
+        state->dma_irq = true;
+    }
+    state->dma_active = false;
+    state->dma_control &= ~(0x10U | 0x08U);
 }
 
 /*
@@ -282,19 +313,28 @@ void sgi_wd33c93_dma_reg_write(SGIWD33C93State *state, hwaddr addr,
         state->dma_count = value & 0x3fff;
         break;
     case 0x3004:
-    case 0x1004:
-        state->dma_control = value;
-        if (value & 0x08) {
-            /*
-             * HPC3 SCSI FIFO flush (MAME hpc3 scsi_fifo_flush): abort residual
-             * DMA so a short over-allocated probe does not leave ENABLE set.
-             */
-            state->dma_control &= ~(0x10U | 0x08U);
+    case 0x1004: {
+        /* MAME hpc3.cpp:414-442: WRMASK keeps ENABLE/active. */
+        bool was_active = state->dma_active;
+        if (value & 0x20) {
+            state->dma_control = (value & ~(0x01U | 0x10U | 0x20U)) |
+                                 (state->dma_control & 0x10U);
+            if (was_active) {
+                state->dma_control |= 0x10U;
+            }
+        } else {
+            state->dma_control = value & ~(0x01U | 0x20U);
+            state->dma_active = (state->dma_control & 0x10U) != 0;
         }
-        if (value & 0x10) {
+        if (value & 0x08) {
+            sgi_wd_dma_flush(state);
+        }
+        /* MAME hpc3.cpp:429-431: fetch on rising ENABLE, not every write. */
+        if (!was_active && state->dma_active) {
             sgi_wd_dma_fetch_descriptor(state);
         }
         break;
+    }
     }
 }
 
@@ -312,17 +352,28 @@ uint32_t sgi_wd33c93_dma_reg_read(SGIWD33C93State *state, hwaddr addr)
         return state->dma_next_desc;
     case 0x3000:
     case 0x1000:
-        return state->dma_count;
+        /* MAME hpc3.cpp:275-282: live count plus descriptor upper flags. */
+        return (state->dma_count & 0x3fff) |
+               (state->dma_desc_flags & 0xffffc000U);
     case 0x3004:
-    case 0x1004:
+    case 0x1004: {
+        uint32_t ret = state->dma_control;
+        /* MAME hpc3.cpp:287-300: IRQ bit presents and clears on read. */
+        if (state->dma_irq) {
+            ret |= 0x01U;
+            state->dma_irq = false;
+        }
         /*
          * The PROM polls for bit 0x10 clear at chain end; reflect the drained
          * state here since no further ESP call updates it.
          */
         if (state->dma_count == 0) {
             state->dma_control &= ~0x10U;
+            state->dma_active = false;
+            ret &= ~0x10U;
         }
-        return state->dma_control;
+        return ret;
+    }
     default:
         return 0;
     }
@@ -330,14 +381,10 @@ uint32_t sgi_wd33c93_dma_reg_read(SGIWD33C93State *state, hwaddr addr)
 
 static unsigned sgi_wd_cdb_length(uint8_t opcode)
 {
+    /* MAME wd33c9x.cpp:1744-1749: only groups 1 and 5 are long. */
     switch (opcode >> 5) {
-    case 0:
-        return 6;
     case 1:
-    case 2:
         return 10;
-    case 4:
-        return 16;
     case 5:
         return 12;
     default:
@@ -355,9 +402,17 @@ static void sgi_wd_start_transfer(SGIWD33C93State *state)
                                state->wd_regs[0x14];
     unsigned i;
 
+    /* MAME wd33c9x.cpp:1432-1448: SBT forces 1, zero count means 1. */
+    if (state->wd_regs[0x18] & 0x80) {
+        transfer_count = 1;
+    } else if (!transfer_count) {
+        transfer_count = 1;
+    }
+
     esp_hard_reset(state->esp);
     state->command_active = true;
-    state->auxiliary_status = 0x80;
+    /* MAME wd33c9x.cpp:733-735: Level II commands set BSY. */
+    state->auxiliary_status = 0x80 | 0x20;
     sgi_wd_irq_fifo_reset(state);
     state->selection_status_pending = false;
     state->completion_phase = 0;
@@ -368,12 +423,14 @@ static void sgi_wd_start_transfer(SGIWD33C93State *state)
     esp_reg_write(state->esp, ESP_TCMID, transfer_count >> 8);
     esp_reg_write(state->esp, ESP_TCHI, transfer_count >> 16);
     state->esp->wregs[ESP_WBUSID] = state->wd_regs[0x15] & BUSID_DID;
-    esp_reg_write(state->esp, ESP_FIFO, (state->wd_regs[0x0f] & 7) | 0x80);
+    /* MAME wd33c9x.cpp:1761-1763: IDENTIFY with ER bit from SOURCE_ID. */
+    esp_reg_write(state->esp, ESP_FIFO, (state->wd_regs[0x0f] & 7) | 0x80 |
+                                        ((state->wd_regs[0x16] & 0x80) ? 0x40 : 0));
     for (i = 0; i < cdb_length; i++) {
         esp_reg_write(state->esp, ESP_FIFO, state->wd_regs[3 + i]);
     }
     esp_reg_write(state->esp, ESP_CMD, CMD_SELATN);
-    if (state->dma_count && state->esp->async_len) {
+    if (sgi_wd_wd_dma_mode(state) && state->dma_count && state->esp->async_len) {
         esp_reg_write(state->esp, ESP_CMD, CMD_TI | CMD_DMA);
     }
     /*
@@ -386,7 +443,8 @@ static void sgi_wd_start_transfer(SGIWD33C93State *state)
         if (probe_op == 0x12 || probe_op == 0x1a || probe_op == 0x03) {
             for (int sync_iter = 0; sync_iter < 8; sync_iter++) {
                 aio_poll(qemu_get_aio_context(), false);
-                if (state->dma_count && state->esp->async_len &&
+                if (sgi_wd_wd_dma_mode(state) && state->dma_count &&
+                    state->esp->async_len &&
                     state->esp->rregs[ESP_CMD] != (CMD_TI | CMD_DMA)) {
                     esp_reg_write(state->esp, ESP_CMD, CMD_TI | CMD_DMA);
                 }
@@ -418,6 +476,8 @@ static void sgi_wd_start_transfer(SGIWD33C93State *state)
 static void sgi_wd_update_status(SGIWD33C93State *state)
 {
     if (!state->command_active) {
+        /* MAME wd33c9x.cpp:968-972: FINISHED clears BSY. */
+        state->auxiliary_status &= ~0x20;
         return;
     }
     /*
@@ -447,7 +507,11 @@ static void sgi_wd_update_status(SGIWD33C93State *state)
          * TI|DMA (it reloads the count and discards multi-chunk progress).
          * No IRQ is pushed for DATA_IN: in DMA mode the chip asserts DRQ,
          * never an IRQ, and completion is reported exactly once below.
+         * Polled CONTROL stays on the PIO DATA path (MAME wd33c9x RECV).
          */
+        if (!sgi_wd_wd_dma_mode(state)) {
+            break;
+        }
         esp_reg_write(state->esp, ESP_CMD, CMD_TI | CMD_DMA);
         continue;
     }
@@ -470,6 +534,10 @@ static void sgi_wd_update_status(SGIWD33C93State *state)
                !state->irq_fifo_size) {
         sgi_wd_irq_fifo_push(state, SGI_WD_STATUS_SELECTION_TIMEOUT);
         state->wd_regs[0x10] = 0;
+        /* QEMU ack of MAME's ARB_TIMEOUT_ABORT bus release. */
+        esp_reg_read(state->esp, ESP_RINTR);
+        state->command_active = false;
+        state->auxiliary_status &= ~0x20;
         break;
     }
     if ((state->esp->rregs[ESP_RINTR] & INTR_FC) &&
@@ -504,10 +572,19 @@ static void sgi_wd_update_status(SGIWD33C93State *state)
              * with no second poll needed. Bulk READs never enter here with
              * residual (gated above). An IRQ alone cannot wake the waiter
              * (IOC2 masks stay 0), so the polled bits must already be final.
+             * MAME FINISHED clears BSY; the guest reads status next.
              */
-            if (overAlloc) {
-                state->dma_control &= ~0x10U;
+            state->command_active = false;
+            state->auxiliary_status &= ~0x20;
+            /*
+             * Chain consumed (MAME hpc3 decrement_chain EOX): drop ENABLE
+             * and active so the next transfer refetches its descriptor.
+             */
+            if (state->dma_desc_flags & (1U << 29)) {
+                state->dma_irq = true;
             }
+            state->dma_control &= ~0x10U;
+            state->dma_active = false;
             if (state->esp->rregs[ESP_RINTR]) {
                 esp_reg_read(state->esp, ESP_RINTR);
             }
@@ -596,9 +673,15 @@ static uint64_t sgi_wd_read(void *opaque, hwaddr addr, unsigned size)
             status = SGI_WD_STATUS_SELECT_TRANSFER_SUCCESS;
             state->scsi_status = status;
             state->auxiliary_status |= 0x80;
+            state->auxiliary_status &= ~0x20;
             state->completion_phase = 3;
             state->wd_regs[0x0f] = state->esp->status;
             state->wd_regs[0x10] = SGI_WD_PHASE_COMMAND_COMPLETE;
+            if (state->dma_desc_flags & (1U << 29)) {
+                state->dma_irq = true;
+            }
+            state->dma_control &= ~0x10U;
+            state->dma_active = false;
             if (state->esp->rregs[ESP_RINTR]) {
                 esp_reg_read(state->esp, ESP_RINTR);
             }
@@ -627,19 +710,12 @@ static uint64_t sgi_wd_read(void *opaque, hwaddr addr, unsigned size)
             sgi_wd_irq_fifo_pop(state);
         }
         /*
-         * Consuming DATA_IN before function-complete releases the latch so
-         * the STATUS collect and completion path can run afterwards.
+         * Consuming the status release the latch so the STATUS collect and
+         * completion path can run afterwards (MAME wd33c9x update_irq pops
+         * the next pending status on each SCSI Status read).
          */
-        if (status == (SGI_WD_STATUS_REQ | SGI_WD_PHASE_DATA_IN) &&
-            (state->esp->rregs[ESP_RINTR] & INTR_BS) &&
-            !(state->esp->rregs[ESP_RINTR] & (INTR_FC | INTR_DC))) {
-            state->data_status_queued = false;
-        }
         if (state->selection_status_pending && status == SGI_WD_STATUS_SELECT_TRANSFER_SUCCESS) {
             state->selection_status_pending = false;
-        }
-        if (status == (SGI_WD_STATUS_TRANSFER_SUCCESS | SGI_WD_PHASE_DATA_IN)) {
-            state->completion_phase = 1;
         }
         /*
          * Do NOT ack the ESP interrupt on status read: it is the completion
@@ -647,9 +723,11 @@ static uint64_t sgi_wd_read(void *opaque, hwaddr addr, unsigned size)
          */
         if (status == SGI_WD_STATUS_SELECTION_TIMEOUT) {
             state->command_active = false;
+            state->auxiliary_status &= ~0x20;
         }
         if (state->completion_phase == 3) {
             state->command_active = false;
+            state->auxiliary_status &= ~0x20;
         }
         sgi_wd_update_status(state);
         state->register_select = 0x18;
@@ -700,26 +778,11 @@ static uint64_t sgi_wd_read(void *opaque, hwaddr addr, unsigned size)
             /*
              * IRIX polls COMMAND_PHASE directly for 0x60 and never issues
              * PROM-style status reads; drive progress here too (the QEMU
-             * equivalent of HW DRQ).
+             * equivalent of HW DRQ). MAME SAT completes with 0x16/0x60 at
+             * once, so no TARGET_LUN stepping here.
              */
             sgi_wd_update_status(state);
             uint8_t value = state->wd_regs[state->register_select];
-            bool pio_data_pending =                !state->dma_count && state->command_active &&
-                !fifo8_is_empty(&state->esp->fifo);
-
-            if (state->register_select == 0x0f &&
-                state->completion_phase == 1 && !pio_data_pending) {
-                state->completion_phase = 2;
-                state->wd_regs[0x10] = SGI_WD_PHASE_STATUS_RECEIVED;
-                sgi_wd_irq_fifo_push(state,
-                                     SGI_WD_STATUS_SELECT_TRANSFER_SUCCESS);
-                sgi_wd_update_irq(state);
-            }
-            if (state->register_select == 0x16 &&
-                state->completion_phase == 2 && !pio_data_pending) {
-                state->wd_regs[0x10] = SGI_WD_PHASE_COMMAND_COMPLETE;
-                state->completion_phase = 3;
-            }
 
             state->register_select = (state->register_select + 1) & 0x1f;
             return value;
@@ -786,6 +849,8 @@ static const VMStateDescription vmstate_sgi_wd = {
         VMSTATE_UINT32(dma_count, SGIWD33C93State),
         VMSTATE_UINT32(dma_control, SGIWD33C93State),
         VMSTATE_UINT32(dma_desc_flags, SGIWD33C93State),
+        VMSTATE_BOOL(dma_irq, SGIWD33C93State),
+        VMSTATE_BOOL(dma_active, SGIWD33C93State),
         VMSTATE_END_OF_LIST()
     },
 };
