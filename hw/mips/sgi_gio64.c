@@ -56,11 +56,11 @@ enum {
 #define VC2_CURSOR_MODE_GLYPH 0U
 #define VC2_CURSOR_MODE_BIT (1U << 8)
 #define VC2_CURSOR_SIZE_64 (1U << 9)
-/* XL24 (Newport) IDs. XMAP9 rev 3 matches MAME's xl24 wiring; CMAP rev 0x74
- * is what the PROM needs: high nibble 7 for the graphics info, low 3 bits
- * >= 2 for VC2 programming (MAME's 0x02 fails this PROM). */
+/* XL24 (Newport) IDs. XMAP9 rev 3 and CMAP rev 0x02 match MAME's xl24
+ * wiring (MAME newport.cpp:4497-4499); the PROM programs its video tables
+ * against these IDs, so any other revision selects a different mode. */
 #define XL24_XMAP_REVISION 3
-#define XL24_CMAP_REVISION 0x74
+#define XL24_CMAP_REVISION 0x02
 #define XL24_CMAP_STATUS 8
 
 struct SGIGIO64State {
@@ -291,16 +291,6 @@ static void sgi_gio64_update_screen_size(SGIGIO64State *state)
             done = x_done && y_done;
             src++;
         }
-    }
-    /*
-     * The decoded width overcounts by 18px: the ported duration assignment
-     * credits the next state's duration to the previous visible timing
-     * (MAME newport.cpp:669-700 vs the VC2 spec/Linux `newport_get_resolution`
-     * per-state accounting; diff 20-2). The extra 18 are uniform background,
-     * so crop them here and render full-bleed at the corrected width.
-     */
-    if (x_done && y_done && state->readout_x1 - state->readout_x0 > 18) {
-        state->readout_x1 -= 18;
     }
     g_free(vt_table);
 }
