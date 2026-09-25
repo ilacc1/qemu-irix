@@ -852,6 +852,7 @@ static void mips_sgi_indigo2_init(MachineState *machine)
     SysBusESPState *sysbus_esp;
     ESPState *esp;
     ESPState *esp2;
+    DeviceState *scsi_ors[2];
     int n;
 
     cpuclk = clock_new(OBJECT(machine), "cpu-refclk");
@@ -983,13 +984,25 @@ static void mips_sgi_indigo2_init(MachineState *machine)
 
     sysbus = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(sysbus, &error_fatal);
-    sysbus_connect_irq(sysbus, 0, qdev_get_gpio_in(ioc2dev, 0));
+    /* MAME indy_indigo2.cpp:296: the WD33C93 INT (not the ESP backend)
+     * drives IOC2 SCSI0; both OR into the IOC2 input (MAME ioc2.cpp:730). */
+    {
+        DeviceState *scsi_or = qdev_new(TYPE_OR_IRQ);
+        qdev_prop_set_uint16(scsi_or, "num-lines", 2);
+        qdev_realize_and_unref(scsi_or, NULL, &error_fatal);
+        sysbus_connect_irq(sysbus, 0, qdev_get_gpio_in(scsi_or, 0));
+        qdev_connect_gpio_out(scsi_or, 0, qdev_get_gpio_in(ioc2dev, 0));
+        scsi_ors[0] = scsi_or;
+    }
     dev = qdev_new("sgi-wd33c93");
     object_property_set_link(OBJECT(dev), "esp", OBJECT(esp), &error_abort);
     sgi_wd33c93[0] = SGI_WD33C93(dev);
     sysbus = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(sysbus, &error_fatal);
     sysbus_mmio_map(sysbus, 0, SGI_SCSI_BASE);
+
+    qdev_connect_gpio_out(DEVICE(sgi_wd33c93[0]), 0,
+                          qdev_get_gpio_in(scsi_ors[0], 1));
 
     scsi_bus_legacy_handle_cmdline(&esp->bus);
 
@@ -1004,7 +1017,15 @@ static void mips_sgi_indigo2_init(MachineState *machine)
     esp2->dma_enabled = 1;
     sysbus = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(sysbus, &error_fatal);
-    sysbus_connect_irq(sysbus, 0, qdev_get_gpio_in(ioc2dev, 1));
+    /* MAME indy_indigo2.cpp:440: WD33C93 INT drives IOC2 SCSI1 (ioc2.cpp:738). */
+    {
+        DeviceState *scsi_or = qdev_new(TYPE_OR_IRQ);
+        qdev_prop_set_uint16(scsi_or, "num-lines", 2);
+        qdev_realize_and_unref(scsi_or, NULL, &error_fatal);
+        sysbus_connect_irq(sysbus, 0, qdev_get_gpio_in(scsi_or, 0));
+        qdev_connect_gpio_out(scsi_or, 0, qdev_get_gpio_in(ioc2dev, 1));
+        scsi_ors[1] = scsi_or;
+    }
     dev = qdev_new("sgi-wd33c93");
     object_property_set_link(OBJECT(dev), "esp", OBJECT(esp2), &error_abort);
     sgi_wd33c93[1] = SGI_WD33C93(dev);
@@ -1012,6 +1033,21 @@ static void mips_sgi_indigo2_init(MachineState *machine)
     sysbus_realize_and_unref(sysbus, &error_fatal);
     memory_region_add_subregion_overlap(address_space, SGI_HPC3_BASE + 0x48000,
                                         sysbus_mmio_get_region(sysbus, 0), 2);
+
+    qdev_connect_gpio_out(DEVICE(sgi_wd33c93[1]), 0,
+                          qdev_get_gpio_in(scsi_ors[1], 1));
+
+    /* MAME indy_indigo2.cpp:359: HPC3 DMA-done to IOC2 local1 0x10. */
+    {
+        DeviceState *dma_or = qdev_new(TYPE_OR_IRQ);
+        qdev_prop_set_uint16(dma_or, "num-lines", 2);
+        qdev_realize_and_unref(dma_or, NULL, &error_fatal);
+        qdev_connect_gpio_out_named(DEVICE(sgi_wd33c93[0]), "dma-done", 0,
+                                    qdev_get_gpio_in(dma_or, 0));
+        qdev_connect_gpio_out_named(DEVICE(sgi_wd33c93[1]), "dma-done", 0,
+                                    qdev_get_gpio_in(dma_or, 1));
+        qdev_connect_gpio_out(dma_or, 0, qdev_get_gpio_in(ioc2dev, 9));
+    }
 
     dev = qdev_new(TYPE_SGI_HPC3_SCSI);
     object_property_set_link(OBJECT(dev), "wd0", OBJECT(sgi_wd33c93[0]),

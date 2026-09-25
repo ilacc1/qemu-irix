@@ -3,6 +3,7 @@
 #include "qemu/aio.h"
 #include "qemu/main-loop.h"
 #include "hw/core/cpu.h"
+#include "hw/core/irq.h"
 #include "hw/core/sysbus.h"
 #include "hw/scsi/sgi_wd33c93.h"
 #include "hw/scsi/esp.h"
@@ -24,6 +25,8 @@ struct SGIWD33C93State {
     SysBusDevice parent_obj;
     MemoryRegion regs;
     ESPState *esp;
+    qemu_irq irq;
+    qemu_irq dma_done_irq;
     uint8_t wd_regs[32];
     uint8_t register_select;
     uint8_t auxiliary_status;
@@ -42,6 +45,8 @@ struct SGIWD33C93State {
     uint32_t dma_desc_flags;
     bool dma_irq;
     bool dma_active;
+    bool irq_level;
+    bool irq_initiator;
     QEMUTimer *progress_timer;
 };
 
@@ -81,13 +86,43 @@ static void sgi_wd_irq_fifo_pop(SGIWD33C93State *state)
 
 static void sgi_wd_update_irq(SGIWD33C93State *state)
 {
+    bool level = false;
+
+    /* MAME wd33c9x.cpp:958: FINISHED returns to disconnected mode. */
+    if (!state->command_active) {
+        state->irq_initiator = false;
+    }
     if (state->auxiliary_status & 0x80) {
         state->auxiliary_status &= ~0x80;
     }
     if (state->irq_fifo_size) {
         state->scsi_status = sgi_wd_irq_fifo_peek(state);
         state->auxiliary_status |= 0x80;
+        /* MAME wd33c9x.cpp:1643: EDI/IDI silence SELECT phases mid-transfer. */
+        level = true;
+        if (state->irq_initiator &&
+            ((state->wd_regs[0x18] & 0x1f) == 8 ||
+             (state->wd_regs[0x18] & 0x1f) == 9)) {
+            if (state->scsi_status == 0x85 &&
+                !(state->wd_regs[0x01] & 0x04)) {
+                level = false;
+            }
+            if (state->scsi_status == 0x16 &&
+                (state->wd_regs[0x01] & 0x08)) {
+                level = false;
+            }
+        }
     }
+    if (level != state->irq_level) {
+        state->irq_level = level;
+        qemu_set_irq(state->irq, level);
+    }
+}
+
+/* MAME hpc3.cpp:969-971,991-993: desc bit29 raises SCSI DMA-done. */
+static void sgi_wd_update_dma_irq(SGIWD33C93State *state)
+{
+    qemu_set_irq(state->dma_done_irq, state->dma_irq);
 }
 
 static void sgi_wd_reset_state(SGIWD33C93State *state)
@@ -100,6 +135,9 @@ static void sgi_wd_reset_state(SGIWD33C93State *state)
     state->wd_regs[0] = own_id;
     state->register_select = 0;
     state->auxiliary_status = 0x80;
+    /* MAME wd33c9x.cpp:433: reset drops the IRQ line. */
+    state->irq_level = false;
+    qemu_set_irq(state->irq, 0);
     state->scsi_status = SGI_WD_STATUS_SELECT_TRANSFER_SUCCESS;
     state->command_active = false;
     state->selection_status_pending = false;
@@ -121,6 +159,7 @@ static void sgi_wd_reset_state(SGIWD33C93State *state)
         esp_hard_reset(state->esp);
     }
     sgi_wd_update_irq(state);
+    sgi_wd_update_dma_irq(state);
 }
 
 static void sgi_wd_reset(DeviceState *device)
@@ -180,6 +219,7 @@ static bool sgi_wd_dma_next(SGIWD33C93State *state)
     /* MAME hpc3.cpp:963-983: IRQ on bit 29 at chain end. */
     if (state->dma_desc_flags & (1U << 29)) {
         state->dma_irq = true;
+        sgi_wd_update_dma_irq(state);
     }
     if (state->dma_desc_flags & (1U << 31)) {
         state->dma_control &= ~0x10U;
@@ -201,6 +241,7 @@ static void sgi_wd_dma_flush(SGIWD33C93State *state)
 {
     if (state->dma_desc_flags & (1U << 29)) {
         state->dma_irq = true;
+        sgi_wd_update_dma_irq(state);
     }
     state->dma_active = false;
     state->dma_control &= ~(0x10U | 0x08U);
@@ -362,6 +403,7 @@ uint32_t sgi_wd33c93_dma_reg_read(SGIWD33C93State *state, hwaddr addr)
         if (state->dma_irq) {
             ret |= 0x01U;
             state->dma_irq = false;
+            sgi_wd_update_dma_irq(state);
         }
         /*
          * The PROM polls for bit 0x10 clear at chain end; reflect the drained
@@ -411,6 +453,8 @@ static void sgi_wd_start_transfer(SGIWD33C93State *state)
 
     esp_hard_reset(state->esp);
     state->command_active = true;
+    /* MAME wd33c9x.cpp:1051: SELECT enters initiator mode. */
+    state->irq_initiator = true;
     /* MAME wd33c9x.cpp:733-735: Level II commands set BSY. */
     state->auxiliary_status = 0x80 | 0x20;
     sgi_wd_irq_fifo_reset(state);
@@ -582,6 +626,7 @@ static void sgi_wd_update_status(SGIWD33C93State *state)
              */
             if (state->dma_desc_flags & (1U << 29)) {
                 state->dma_irq = true;
+                sgi_wd_update_dma_irq(state);
             }
             state->dma_control &= ~0x10U;
             state->dma_active = false;
@@ -679,6 +724,7 @@ static uint64_t sgi_wd_read(void *opaque, hwaddr addr, unsigned size)
             state->wd_regs[0x10] = SGI_WD_PHASE_COMMAND_COMPLETE;
             if (state->dma_desc_flags & (1U << 29)) {
                 state->dma_irq = true;
+                sgi_wd_update_dma_irq(state);
             }
             state->dma_control &= ~0x10U;
             state->dma_active = false;
@@ -830,8 +876,8 @@ static const Property sgi_wd_properties[] = {
 
 static const VMStateDescription vmstate_sgi_wd = {
     .name = TYPE_SGI_WD33C93,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT8_ARRAY(wd_regs, SGIWD33C93State, 32),
         VMSTATE_UINT8(register_select, SGIWD33C93State),
@@ -851,6 +897,8 @@ static const VMStateDescription vmstate_sgi_wd = {
         VMSTATE_UINT32(dma_desc_flags, SGIWD33C93State),
         VMSTATE_BOOL(dma_irq, SGIWD33C93State),
         VMSTATE_BOOL(dma_active, SGIWD33C93State),
+        VMSTATE_BOOL(irq_level, SGIWD33C93State),
+        VMSTATE_BOOL(irq_initiator, SGIWD33C93State),
         VMSTATE_END_OF_LIST()
     },
 };
@@ -859,6 +907,10 @@ static void sgi_wd_realize(DeviceState *device, Error **errp)
 {
     SGIWD33C93State *state = SGI_WD33C93(device);
 
+    /* Completion INT output (MAME wd33c9x.h:17 irq_cb); board ORs it with ESP. */
+    qdev_init_gpio_out(device, &state->irq, 1);
+    /* HPC3 SCSI DMA-done (MAME hpc3 bit29); board ORs to IOC2 local1 0x10. */
+    qdev_init_gpio_out_named(device, &state->dma_done_irq, "dma-done", 1);
     state->esp->dma_memory_read = sgi_wd_dma_read;
     state->esp->dma_memory_write = sgi_wd_dma_write;
     state->esp->dma_opaque = state;

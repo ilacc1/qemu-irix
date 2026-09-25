@@ -18,6 +18,7 @@
  *   6 gio2       -> local1 0x80
  *   7 duart      -> mappable 0x20
  *   8 kbd        -> mappable 0x10
+ *   9 hpc_dma    -> local1 0x10 (MAME ioc2 hpc_dma_done_w)
  * GPIO outputs 0/1 are the CPU interrupts for local channel 0/1.
  */
 
@@ -176,6 +177,13 @@ static void sgi_ioc2_gpio_in(void *opaque, int n, int level)
                                     (state->map_status & ~0x10);
         sgi_ioc2_map_mask_write(state, 0, state->map_mask[0]);
         sgi_ioc2_map_mask_write(state, 1, state->map_mask[1]);
+        break;
+    case 9:
+        if (level) {
+            sgi_ioc2_raise_local(state, 1, 0x10);
+        } else {
+            sgi_ioc2_lower_local(state, 1, 0x10);
+        }
         break;
     default:
         break;
@@ -486,7 +494,7 @@ static void sgi_ioc2_init(Object *object)
     memory_region_init_io(&state->int2_iomem, object, &sgi_ioc2_int2_ops,
                           state, TYPE_SGI_IOC2 "-int2", SGI_IOC2_INT2_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(object), &state->int2_iomem);
-    qdev_init_gpio_in(DEVICE(object), sgi_ioc2_gpio_in, 9);
+    qdev_init_gpio_in(DEVICE(object), sgi_ioc2_gpio_in, 10);
     qdev_init_gpio_out(DEVICE(object), state->out, 2);
 }
 
