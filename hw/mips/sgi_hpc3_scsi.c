@@ -2,6 +2,7 @@
 #include "qemu/timer.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/mips/sgi_hpc3_scsi.h"
+#include "hw/mips/sgi_hpc3.h"
 #include "hw/scsi/sgi_wd33c93.h"
 #include "migration/vmstate.h"
 #include "qapi/error.h"
@@ -46,6 +47,10 @@ static uint64_t sgi_hpc3_scsi_channel_read(void *opaque, hwaddr addr,
      * polling HPC3 to drive WD is the QEMU equivalent (HPC3 DRQ<->WD
      * link, MAME hpc3 scsi_drq/do_scsi_dma plus wd33c9x DRQ).
      */
+    if (channel->index == 1 && !channel->state->wd[1]) {
+        /* Indy (IP24) has no second SCSI channel; answer empty. */
+        return 0;
+    }
     sgi_wd33c93_poll(channel->state->wd[channel->index]);
     switch (addr) {
     case 0x0000:
@@ -75,6 +80,10 @@ static uint64_t sgi_hpc3_scsi_channel_read(void *opaque, hwaddr addr,
         rv = 0;
         break;
     }
+    if (sgi_ip22_trace_enabled()) {
+        fprintf(stderr, "HPC3CH-R ch=%u reg=%04x val=%08x\n",
+                channel->index, (unsigned)addr, (unsigned)rv);
+    }
     return rv;
 }
 
@@ -82,6 +91,22 @@ static void sgi_hpc3_scsi_channel_write(void *opaque, hwaddr addr,
                                          uint64_t value, unsigned size)
 {
     SgiHpc3ScsiChannel *channel = opaque;
+
+    if (channel->index == 1 && !channel->state->wd[1]) {
+        /* Indy (IP24) has no second SCSI channel; ignore writes, but still
+         * retain dma/pio config like real hardware. */
+        switch (addr) {
+        case 0x1010:
+            channel->state->dma_config[channel->index] = value;
+            break;
+        case 0x1014:
+            channel->state->pio_config[channel->index] = value;
+            break;
+        default:
+            break;
+        }
+        return;
+    }
 
     switch (addr) {
     case 0x0000:
@@ -106,6 +131,10 @@ static void sgi_hpc3_scsi_channel_write(void *opaque, hwaddr addr,
     case 0x1014:
         channel->state->pio_config[channel->index] = value;
         break;
+    }
+    if (sgi_ip22_trace_enabled()) {
+        fprintf(stderr, "HPC3CH-W ch=%u reg=%04x val=%08x\n",
+                channel->index, (unsigned)addr, (unsigned)value);
     }
 }
 
@@ -150,8 +179,8 @@ static void sgi_hpc3_scsi_realize(DeviceState *device, Error **errp)
 {
     SgiHpc3ScsiState *state = SGI_HPC3_SCSI(device);
 
-    if (!state->wd[0] || !state->wd[1]) {
-        error_setg(errp, "both SGI WD33C93 controller links are required");
+    if (!state->wd[0]) {
+        error_setg(errp, "SGI WD33C93 channel 0 link is required");
     }
 }
 

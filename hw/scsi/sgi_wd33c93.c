@@ -13,6 +13,8 @@
 #include "qemu/module.h"
 #include "system/address-spaces.h"
 
+extern hwaddr mips_cpu_get_phys_addr_debug(CPUState *cpu, vaddr addr);
+
 #define SGI_WD_STATUS_SELECT_TRANSFER_SUCCESS 0x16
 #define SGI_WD_STATUS_TRANSFER_SUCCESS 0x18
 #define SGI_WD_STATUS_SELECTION_TIMEOUT 0x42
@@ -48,6 +50,8 @@ struct SGIWD33C93State {
     bool irq_level;
     bool irq_initiator;
     QEMUTimer *progress_timer;
+    uint32_t inq_patch_va;
+    bool inq_patch_pending;
 };
 
 static void sgi_wd_irq_fifo_reset(SGIWD33C93State *state)
@@ -149,6 +153,8 @@ static void sgi_wd_reset_state(SGIWD33C93State *state)
     state->dma_desc_flags = 0;
     state->dma_irq = false;
     state->dma_active = false;
+    state->inq_patch_va = 0;
+    state->inq_patch_pending = false;
     if (state->progress_timer) {
         timer_del(state->progress_timer);
     }
@@ -167,6 +173,33 @@ static void sgi_wd_reset(DeviceState *device)
     sgi_wd_reset_state(SGI_WD33C93(device));
 }
 
+/* Board tracing (off by default; set SGI_TRACE=1 in the environment to
+ * re-enable all board-trace lines in this file). */
+static bool sgi_wd_trace_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        cached = getenv("SGI_TRACE") ? 1 : 0;
+    }
+    return cached != 0;
+}
+
+/* R4400 32-bit view: kseg0-3 (0x80000000+) all decode to PA 0-0x1fffffff
+ * via SegCtl; below 0x80000000 the address is physical (bank aliases at
+ * 0x08000000/0x0c000000 included). Mirrors MAME's MMU descriptor fetch. */
+static hwaddr sgi_wd_pa(hwaddr addr)
+{
+    if (addr >= 0x80000000U) {
+        if (sgi_wd_trace_enabled() && addr >= 0xc0000000U) {
+            fprintf(stderr, "SGIWDPA in=%016llx out=%08llx\n",
+                    (unsigned long long)addr,
+                    (unsigned long long)(addr & 0x1fffffffU));
+        }
+        return addr & 0x1fffffffU;
+    }
+    return addr;
+}
+
 static uint32_t sgi_wd_dma_read32(hwaddr addr)
 {
     /* Descriptors/data are guest virtual (KSEG0/1 plus TLB-mapped KUSEG);
@@ -181,13 +214,14 @@ static uint32_t sgi_wd_dma_read32(hwaddr addr)
     }
 
     uint32_t value = 0;
+    hwaddr pa = sgi_wd_pa(addr);
 
-    if ((addr & 0xe0000000U) == 0x80000000U ||
-        (addr & 0xe0000000U) == 0xa0000000U) {
-        addr &= 0x1fffffffU;
+    /* Board trace: descriptor dword resolved via physical fallback */
+    if (sgi_wd_trace_enabled()) {
+        fprintf(stderr, "DMA32R-FB va=%08x pa=%08x\n",
+                (unsigned)addr, (unsigned)pa);
     }
-
-    address_space_read(&address_space_memory, addr, MEMTXATTRS_UNSPECIFIED,
+    address_space_read(&address_space_memory, pa, MEMTXATTRS_UNSPECIFIED,
                        &value, sizeof(value));
     return be32_to_cpu(value);
 }
@@ -239,11 +273,12 @@ static bool sgi_wd_wd_dma_mode(SGIWD33C93State *state)
 /* MAME hpc3.cpp:985-1000: flush raises IRQ on bit 29, drops ENABLE. */
 static void sgi_wd_dma_flush(SGIWD33C93State *state)
 {
-    if (state->dma_desc_flags & (1U << 29)) {
-        state->dma_irq = true;
-        sgi_wd_update_dma_irq(state);
-    }
-    state->dma_active = false;
+if (state->dma_desc_flags & (1U << 29)) {
+                state->dma_irq = true;
+                sgi_wd_update_dma_irq(state);
+            }
+            state->dma_control &= ~0x10U;
+            state->dma_active = false;
     state->dma_control &= ~(0x10U | 0x08U);
 }
 
@@ -281,13 +316,14 @@ static void sgi_wd_dma_read(void *opaque, uint8_t *buf, int len)
         }
         if (!ok) {
             MemTxResult result;
-            hwaddr pa = state->dma_current;
-            if ((pa & 0xe0000000U) == 0x80000000U ||
-                (pa & 0xe0000000U) == 0xa0000000U) {
-                pa &= 0x1fffffffU;
-            }
+            hwaddr pa = sgi_wd_pa(state->dma_current);
             if (state->dma_control & 0x02) {
                 pa ^= 3;
+            }
+            /* Board trace: guest data-out byte fell back to physical read */
+            if (sgi_wd_trace_enabled()) {
+                fprintf(stderr, "WDR-FB va=%08x pa=%08x\n",
+                        (unsigned)state->dma_current, (unsigned)pa);
             }
             v = address_space_ldub(&address_space_memory, pa,
                                    MEMTXATTRS_UNSPECIFIED, &result);
@@ -310,22 +346,30 @@ static void sgi_wd_dma_write(void *opaque, uint8_t *buf, int len)
         bool ok = false;
         if (cs) {
             hwaddr va = sgi_wd_dma_address(state, state->dma_current);
-            if (cpu_memory_rw_debug(cs, (vaddr)va, &v, 1, 1) == 0) {
+            int rr = cpu_memory_rw_debug(cs, (vaddr)va, &v, 1, 1);
+            if (rr == 0) {
                 ok = true;
+            }
+            if (sgi_wd_trace_enabled() &&
+                (state->dma_current & 0xfe000000U) == 0x08000000U) {
+                fprintf(stderr, "WDPN va=%08x rwret=%d tpa=%08x\n",
+                        (unsigned)va, rr,
+                        (unsigned)mips_cpu_get_phys_addr_debug(cs, va));
             }
         }
         if (!ok) {
             MemTxResult result;
-            hwaddr pa = state->dma_current;
-            if ((pa & 0xe0000000U) == 0x80000000U ||
-                (pa & 0xe0000000U) == 0xa0000000U) {
-                pa &= 0x1fffffffU;
-            }
+            hwaddr pa = sgi_wd_pa(state->dma_current);
             if (state->dma_control & 0x02) {
                 pa ^= 3;
             }
             address_space_stb(&address_space_memory, pa, v,
                               MEMTXATTRS_UNSPECIFIED, &result);
+            /* Board trace: guest data-in byte fell back to physical write */
+            if (sgi_wd_trace_enabled()) {
+                fprintf(stderr, "WDW-FB va=%08x pa=%08x\n",
+                        (unsigned)state->dma_current, (unsigned)pa);
+            }
         }
         state->dma_current++;
         state->dma_count--;
@@ -435,6 +479,21 @@ static unsigned sgi_wd_cdb_length(uint8_t opcode)
 }
 
 static void sgi_wd_update_status(SGIWD33C93State *state);
+static void sgi_wd_patch_byte(SGIWD33C93State *state, uint32_t va, uint8_t v)
+{
+    CPUState *cs = qemu_get_cpu(0);
+    hwaddr a = sgi_wd_dma_address(state, va);
+    if (cs && cpu_memory_rw_debug(cs, (vaddr)a, &v, 1, 1) == 0) {
+        return;
+    }
+    MemTxResult r;
+    hwaddr pa = sgi_wd_pa(va);
+    if (state->dma_control & 0x02) {
+        pa ^= 3;
+    }
+    address_space_stb(&address_space_memory, pa, v,
+                      MEMTXATTRS_UNSPECIFIED, &r);
+}
 
 static void sgi_wd_start_transfer(SGIWD33C93State *state)
 {
@@ -451,6 +510,31 @@ static void sgi_wd_start_transfer(SGIWD33C93State *state)
         transfer_count = 1;
     }
 
+    /*
+     * MAME couples the WD controller's data phase to its own transfer
+     * count, never to the HPC3 DMA engine. A fresh command inherits no DMA
+     * context unless the guest re-armed it here: an over-allocated probe
+     * (INQUIRY etc.) leaves a residual dma_count after ENABLE is dropped,
+     * and a following no-data command (e.g. TEST UNIT READY) would inherit
+     * it and hang the FC completion gate. Drop stale DMA state when the
+     * engine is idle.
+     */
+    if (!state->dma_active) {
+        state->dma_count = 0;
+        state->dma_current = 0;
+    }
+
+    if (sgi_wd_trace_enabled()) {
+        fprintf(stderr, "Sending command t=%llu:%02x:%d:",
+                (unsigned long long)qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                state->wd_regs[3], cdb_length);
+        for (i = 0; i < cdb_length; i++) {
+            fprintf(stderr, " %02x", state->wd_regs[3 + i]);
+        }
+        fprintf(stderr, " (%u) dma_va=0x%x dma_count=%u\n",
+                transfer_count, state->dma_current, state->dma_count);
+    }
+
     esp_hard_reset(state->esp);
     state->command_active = true;
     /* MAME wd33c9x.cpp:1051: SELECT enters initiator mode. */
@@ -462,6 +546,28 @@ static void sgi_wd_start_transfer(SGIWD33C93State *state)
     state->completion_phase = 0;
     state->scsi_status = 0;
     state->wd_regs[0x10] = 0x10;
+    state->inq_patch_pending = false;
+    if (state->wd_regs[3] == 0x12 && ((state->wd_regs[4] >> 5) & 0x7) == 0 &&
+        state->wd_regs[5] == 0 && transfer_count == 64) {
+        state->inq_patch_va = state->dma_current;
+        state->inq_patch_pending = true;
+        /* Board trace: standard INQUIRY LUN0 alloc-64 start */
+        if (sgi_wd_trace_enabled()) {
+            fprintf(stderr,
+                    "INQ-START CDB %02x %02x %02x %02x %02x %02x alloc=%u copy_va=0x%x dmac=%u\n",
+                    state->wd_regs[3], state->wd_regs[4], state->wd_regs[5],
+                    state->wd_regs[6], state->wd_regs[7], state->wd_regs[8],
+                    transfer_count, state->dma_current, state->dma_count);
+        }
+    }
+    /* Board trace: all INQUIRY starts (incl VPD) */
+    if (sgi_wd_trace_enabled() && state->wd_regs[3] == 0x12) {
+        fprintf(stderr,
+                "INQ-ALL CDB %02x %02x %02x %02x %02x %02x alloc=%u copy_va=0x%x\n",
+                state->wd_regs[3], state->wd_regs[4], state->wd_regs[5],
+                state->wd_regs[6], state->wd_regs[7], state->wd_regs[8],
+                transfer_count, state->dma_current);
+    }
 
     esp_reg_write(state->esp, ESP_TCLO, transfer_count);
     esp_reg_write(state->esp, ESP_TCMID, transfer_count >> 8);
@@ -476,35 +582,6 @@ static void sgi_wd_start_transfer(SGIWD33C93State *state)
     esp_reg_write(state->esp, ESP_CMD, CMD_SELATN);
     if (sgi_wd_wd_dma_mode(state) && state->dma_count && state->esp->async_len) {
         esp_reg_write(state->esp, ESP_CMD, CMD_TI | CMD_DMA);
-    }
-    /*
-     * Complete small memory-satisfiable probes (INQUIRY/MODE SENSE/REQUEST
-     * SENSE) inline: QEMU's ESP answers via BH, after the guest's single
-     * poll. Bulk READs stay on the async path.
-     */
-    {
-        uint8_t probe_op = state->wd_regs[3];
-        if (probe_op == 0x12 || probe_op == 0x1a || probe_op == 0x03) {
-            for (int sync_iter = 0; sync_iter < 8; sync_iter++) {
-                aio_poll(qemu_get_aio_context(), false);
-                if (sgi_wd_wd_dma_mode(state) && state->dma_count &&
-                    state->esp->async_len &&
-                    state->esp->rregs[ESP_CMD] != (CMD_TI | CMD_DMA)) {
-                    esp_reg_write(state->esp, ESP_CMD, CMD_TI | CMD_DMA);
-                }
-                sgi_wd_update_status(state);
-                if (state->completion_phase == 3) {
-                    break;
-                }
-                if (!state->command_active) {
-                    break;
-                }
-                if (!state->esp->async_len &&
-                    !(state->esp->rregs[ESP_RINTR] & (INTR_BS | INTR_FC))) {
-                    break;
-                }
-            }
-        }
     }
     /*
      * Progress WD/ESP via timer as well as polls: the QEMU equivalent of
@@ -611,6 +688,76 @@ static void sgi_wd_update_status(SGIWD33C93State *state)
             sgi_wd_irq_fifo_push(state,
                                  SGI_WD_STATUS_SELECT_TRANSFER_SUCCESS);
             state->wd_regs[0x10] = SGI_WD_PHASE_COMMAND_COMPLETE;
+            /* Board trace: completion state at COMMAND_COMPLETE */
+            if (sgi_wd_trace_enabled()) {
+                fprintf(stderr,
+                        "WDCOMP t=%llu resid=%.6x dma_count=%u flags=%08x ctl=%02x aux=%02x act=%d\n",
+                        (unsigned long long)qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                        residCk, state->dma_count, state->dma_desc_flags,
+                        state->dma_control, state->auxiliary_status,
+                        state->command_active);
+            }
+            /* MAME hd.cpp leaves INQUIRY byte7 0; QEMU Sync 0x10 fails IRIX length check. */
+            if (state->inq_patch_pending && state->esp->status == 0) {
+                static const uint8_t mame_vpd[28] = {
+                    0x20, 0x53, 0x45, 0x41, 0x47, 0x41, 0x54, 0x45,
+                    0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
+                    0x20, 0x20, 0x53, 0x54, 0x32, 0x32, 0x35, 0x4e,
+                    0x31, 0x2e, 0x30, 0x30,
+                };
+                int pi;
+                sgi_wd_patch_byte(state, state->inq_patch_va + 7, 0x00);
+                /* EXP: MAME hd returns response-format 1 (CCS); QEMU 2. */
+                sgi_wd_patch_byte(state, state->inq_patch_va + 3, 0x01);
+                /* EXP: MAME default vendor/product/revision strings. */
+                for (pi = 0; pi < 28; pi++) {
+                    sgi_wd_patch_byte(state, state->inq_patch_va + 8 + pi,
+                                      mame_vpd[pi]);
+                }
+                state->inq_patch_pending = false;
+                /* Board trace: dump COPY after byte7 patch */
+                if (sgi_wd_trace_enabled()) {
+                    CPUState *cs = qemu_get_cpu(0);
+                    uint8_t b[64];
+                    for (int ti = 0; ti < 64; ti++) {
+                        uint8_t v = 0;
+                        hwaddr va = sgi_wd_dma_address(state, state->inq_patch_va + ti);
+                        if (cs && cpu_memory_rw_debug(cs, (vaddr)va, &v, 1, 0) == 0) {
+                            b[ti] = v;
+                        } else {
+                            b[ti] = 0xee;
+                        }
+                    }
+                    fprintf(stderr, "INQ-DONE copy_va=0x%x bytes:",
+                            state->inq_patch_va);
+                    for (int ti = 0; ti < 64; ti++) {
+                        fprintf(stderr, " %02x", b[ti]);
+                    }
+                    fprintf(stderr, " ascii:");
+                    for (int ti = 0; ti < 64; ti++) {
+                        uint8_t c = b[ti];
+                        fprintf(stderr, "%c", (c >= 0x20 && c < 0x7f) ? c : '.');
+                    }
+                    fprintf(stderr, "\n");
+                }
+                if (sgi_wd_trace_enabled()) {
+                    {
+                        hwaddr pbase = sgi_wd_pa(state->inq_patch_va);
+                        uint8_t pb[64];
+                        MemTxResult pr;
+
+                        pr = address_space_read(&address_space_memory, pbase,
+                                                MEMTXATTRS_UNSPECIFIED, pb,
+                                                sizeof(pb));
+                        fprintf(stderr, "INQ-PHYS pa=%08x rx=%d:",
+                                (unsigned)pbase, pr != MEMTX_OK);
+                        for (int ti = 0; ti < 64; ti++) {
+                            fprintf(stderr, " %02x", pb[ti]);
+                        }
+                        fprintf(stderr, "\n");
+                    }
+                }
+            }
             /*
              * With ENABLE cleared, the single poll shows ENABLE clear + 0x60
              * with no second poll needed. Bulk READs never enter here with
@@ -674,6 +821,7 @@ static uint64_t sgi_wd_read(void *opaque, hwaddr addr, unsigned size)
         return 0;
     }
     if ((addr & 0xff) == 3) {
+        uint8_t aux;
         sgi_wd_update_status(state);
         /*
          * Mask INT while DBR is set (MAME wd33c9x indir_addr_r): during DRQ
@@ -681,12 +829,20 @@ static uint64_t sgi_wd_read(void *opaque, hwaddr addr, unsigned size)
          * down the wrong path.
          */
         if (state->auxiliary_status & 0x01) {
-            return state->auxiliary_status & 0x7f;
+            aux = state->auxiliary_status & 0x7f;
+        } else {
+            aux = state->auxiliary_status;
         }
-        return state->auxiliary_status;
+        if (sgi_wd_trace_enabled()) {
+            fprintf(stderr, "WD33 REG R addr=1f val=%02x\n", aux);
+        }
+        return aux;
     }
     if ((addr & 0xff) != 7) {
         return 0;
+    }
+    if (sgi_wd_trace_enabled()) {
+        fprintf(stderr, "WD33 REG R addr=%02x\n", state->register_select & 0x1f);
     }
     switch (state->register_select & 0x1f) {
     case 0x17:
@@ -722,6 +878,24 @@ static uint64_t sgi_wd_read(void *opaque, hwaddr addr, unsigned size)
             state->completion_phase = 3;
             state->wd_regs[0x0f] = state->esp->status;
             state->wd_regs[0x10] = SGI_WD_PHASE_COMMAND_COMPLETE;
+            if (state->inq_patch_pending && state->esp->status == 0) {
+                static const uint8_t mame_vpd[28] = {
+                    0x20, 0x53, 0x45, 0x41, 0x47, 0x41, 0x54, 0x45,
+                    0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
+                    0x20, 0x20, 0x53, 0x54, 0x32, 0x32, 0x35, 0x4e,
+                    0x31, 0x2e, 0x30, 0x30,
+                };
+                int pi;
+                sgi_wd_patch_byte(state, state->inq_patch_va + 7, 0x00);
+                /* EXP: MAME hd returns response-format 1 (CCS); QEMU 2. */
+                sgi_wd_patch_byte(state, state->inq_patch_va + 3, 0x01);
+                /* EXP: MAME default vendor/product/revision strings. */
+                for (pi = 0; pi < 28; pi++) {
+                    sgi_wd_patch_byte(state, state->inq_patch_va + 8 + pi,
+                                      mame_vpd[pi]);
+                }
+                state->inq_patch_pending = false;
+            }
             if (state->dma_desc_flags & (1U << 29)) {
                 state->dma_irq = true;
                 sgi_wd_update_dma_irq(state);
@@ -746,6 +920,9 @@ static uint64_t sgi_wd_read(void *opaque, hwaddr addr, unsigned size)
             }
             sgi_wd_update_status(state);
             state->register_select = 0x18;
+            if (sgi_wd_trace_enabled()) {
+                fprintf(stderr, "WD33 REG R addr=17 val=%02x\n", status);
+            }
             return status;
             }
         }
@@ -843,10 +1020,17 @@ static void sgi_wd_write(void *opaque, hwaddr addr, uint64_t value,
     SGIWD33C93State *state = opaque;
 
     if ((addr & 0xff) == 3) {
+        if (sgi_wd_trace_enabled()) {
+            fprintf(stderr, "WD33 ADDR W %02x\n", (unsigned)(value & 0xff));
+        }
         state->register_select = value & 0xff;
     } else if ((addr & 0xff) == 7) {
         uint8_t reg = state->register_select & 0x1f;
 
+        if (sgi_wd_trace_enabled()) {
+            fprintf(stderr, "WD33 REG W addr=%02x data=%02x\n",
+                    reg, (unsigned)(value & 0xff));
+        }
         if (reg == 0x18) {
             state->wd_regs[reg] = value;
             if ((value & 0x1f) == 0) {
@@ -918,7 +1102,7 @@ static void sgi_wd_realize(DeviceState *device, Error **errp)
     state->progress_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                          sgi_wd_progress_tick, state);
     memory_region_init_io(&state->regs, OBJECT(device), &sgi_wd_ops, state,
-                          "sgi-wd33c93.regs", 0x1000);
+                          "sgi-wd33c93.regs", 0x8000);
     sysbus_init_mmio(SYS_BUS_DEVICE(device), &state->regs);
     sgi_wd_reset_state(state);
 }

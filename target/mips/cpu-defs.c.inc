@@ -571,6 +571,27 @@ const mips_def_t mips_defs[] =
         .mmu_type = MMU_TYPE_R4000,
     },
     {
+        .name = "R4000SC",
+        .CP0_PRid = 0x00000430,
+        /* SGI R4000SC: MAME R4000 identity with 8K instruction/data caches. */
+        .CP0_Config0 = (2 << CP0C0_Impl) | (1 << CP0C0_IC) | (1 << CP0C0_DC) |
+                       (2 << CP0C0_K0),
+        .CP0_Config1 = (1 << CP0C1_FP) | (1 << CP0C1_WR) |
+                       (47 << CP0C1_MMU),
+        .CP0_LLAddr_rw_bitmask = 0xFFFFFFFF,
+        .CP0_LLAddr_shift = 4,
+        .SYNCI_Step = 16,
+        .CCRes = 2,
+        .CP0_Status_rw_bitmask = 0x3678FFFF,
+        .CP1_fcr0 = (0x5 << FCR0_PRID) | (0x0 << FCR0_REV),
+        .CP1_fcr31 = 0,
+        .CP1_fcr31_rw_bitmask = 0x0183FFFF,
+        .SEGBITS = 40,
+        .PABITS = 36,
+        .insn_flags = CPU_MIPS3,
+        .mmu_type = MMU_TYPE_R4000,
+    },
+    {
         .name = "VR5432",
         .CP0_PRid = 0x00005400,
         /* No L2 cache, icache size 8k, dcache size 8k, uncached coherency. */

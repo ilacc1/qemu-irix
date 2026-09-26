@@ -26,28 +26,21 @@
 #include "hw/mips/sgi_hpc3_scsi.h"
 #include "hw/mips/sgi_ioc2.h"
 #include "hw/mips/sgi_mc.h"
-#include "hw/intc/i8259.h"
-#include "hw/dma/i8257.h"
-#include "hw/char/serial-mm.h"
 #include "hw/char/escc.h"
 #include "hw/nvram/eeprom93xx.h"
-#include "hw/char/parallel.h"
 #include "hw/isa/isa.h"
-#include "hw/block/fdc.h"
 #include "system/system.h"
 #include "hw/core/boards.h"
 #include "net/net.h"
 #include "hw/scsi/esp.h"
 #include "hw/scsi/sgi_wd33c93.h"
 #include "hw/core/loader.h"
-#include "hw/rtc/mc146818rtc.h"
-#include "hw/timer/i8254.h"
 #include "hw/display/vga.h"
 #include "hw/display/bochs-vbe.h"
-#include "hw/audio/pcspk.h"
 #include "hw/input/i8042.h"
 #include "hw/core/or-irq.h"
 #include "hw/core/sysbus.h"
+#include "hw/core/irq.h"
 #include "system/qtest.h"
 #include "system/reset.h"
 #include "qapi/error.h"
@@ -82,22 +75,6 @@ static void main_cpu_reset(void *opaque)
 {
     MIPSCPU *cpu = opaque;
     cpu_reset(CPU(cpu));
-}
-
-static uint64_t rtc_read(void *opaque, hwaddr addr, unsigned size)
-{
-    uint8_t val;
-    address_space_read(&address_space_memory, 0x90000071,
-                       MEMTXATTRS_UNSPECIFIED, &val, 1);
-    return val;
-}
-
-static void rtc_write(void *opaque, hwaddr addr,
-                      uint64_t val, unsigned size)
-{
-    uint8_t buf = val & 0xff;
-    address_space_write(&address_space_memory, 0x90000071,
-                        MEMTXATTRS_UNSPECIFIED, &buf, 1);
 }
 
 static uint32_t sgi_hpc3_intstat;
@@ -221,12 +198,6 @@ static bool sgi_hpc3_pbus_access(hwaddr addr, unsigned *channel,
     *reg = addr & 0x1fff;
     return *channel < ARRAY_SIZE(sgi_hpc3_pbus_dma);
 }
-
-static const MemoryRegionOps rtc_ops = {
-    .read = rtc_read,
-    .write = rtc_write,
-    .endianness = DEVICE_NATIVE_ENDIAN,
-};
 
 static uint64_t eisa_io_read(void *opaque, hwaddr addr, unsigned size)
 {
@@ -385,6 +356,16 @@ static const MemoryRegionOps sgi_hpc3_pbus_dma_ops = {
 
 static uint32_t sgi_hpc3_dma_cfg[16];
 static uint32_t sgi_hpc3_pio_cfg[16];
+
+/* Board tracing (off by default; set SGI_TRACE=1 to re-enable). */
+bool sgi_ip22_trace_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        cached = getenv("SGI_TRACE") ? 1 : 0;
+    }
+    return cached != 0;
+}
 static uint8_t sgi_hpc3_pio_regs[0x1000];
 static uint16_t sgi_hal2_codec[2][2];
 static uint16_t sgi_hal2_bres[3][3];
@@ -732,10 +713,10 @@ static uint64_t sgi_hpc3_misc_read(void *opaque, hwaddr addr, unsigned size)
         return 0;
     }
     if (addr >= 0x14000 && addr < 0x15000) {
-        return sgi_hpc3_dma_cfg[((addr - 0x14000) >> 7) & 7];
+        return sgi_hpc3_dma_cfg[((addr - 0x14000) >> 9) & 7];
     }
     if (addr >= 0x15000 && addr < 0x16000) {
-        return sgi_hpc3_pio_cfg[((addr - 0x15000) >> 6) & 15];
+        return sgi_hpc3_pio_cfg[((addr - 0x15000) >> 8) & 15];
     }
     if (addr >= 0xc000 && addr < 0xc500) {
         return sgi_edlc_read(addr - 0xc000);
@@ -746,19 +727,28 @@ static uint64_t sgi_hpc3_misc_read(void *opaque, hwaddr addr, unsigned size)
 static void sgi_hpc3_misc_write(void *opaque, hwaddr addr,
                              uint64_t val, unsigned size)
 {
+    if (sgi_ip22_trace_enabled()) {
+        fprintf(stderr, "HPCMISC-W off=%05x val=%08x sz=%u\n",
+                (unsigned)addr, (unsigned)val, size);
+    }
     /* PIO window [0x10000,0x14000) is owned by the sgi-hpc3 device. */
     if (addr >= 0x11800 && addr < 0x11900) {
         return;
     }
     if (addr >= 0x14000 && addr < 0x15000) {
-        unsigned channel = ((addr - 0x14000) >> 7) & 7;
+        unsigned channel = ((addr - 0x14000) >> 9) & 7;
 
         sgi_hpc3_dma_cfg[channel] = val;
         sgi_hpc3_pbus_dma[channel].config = val;
         return;
     }
     if (addr >= 0x15000 && addr < 0x16000) {
-        sgi_hpc3_pio_cfg[((addr - 0x15000) >> 6) & 15] = val;
+        sgi_hpc3_pio_cfg[((addr - 0x15000) >> 8) & 15] = val;
+        if (sgi_ip22_trace_enabled()) {
+            fprintf(stderr, "PIO-CFG ch=%u val=%08x\n",
+                    (unsigned)(((addr - 0x15000) >> 8) & 15),
+                    (unsigned)val);
+        }
         return;
     }
     if (addr >= 0xc000 && addr < 0xc500) {
@@ -827,24 +817,23 @@ static void mips_sgi_indigo2_init(MachineState *machine)
     MIPSCPU *cpu;
     MIPSCPUClass *mcc;
     CPUMIPSState *env;
-    qemu_irq *i8259;
     MemoryRegion *isa_mem = g_new(MemoryRegion, 1);
     MemoryRegion *isa_io = g_new(MemoryRegion, 1);
-    MemoryRegion *rtc = g_new(MemoryRegion, 1);
     MemoryRegion *bios = g_new(MemoryRegion, 1);
     MemoryRegion *bios2 = g_new(MemoryRegion, 1);
-    ISABus *isa_bus;
-    ISADevice *pit;
-    ISADevice *pcspk;
-    DriveInfo *fds[MAX_FD];
     DeviceState *dev;
     DeviceState *ioc2dev;
+    DeviceState *mcdev;
     SysBusDevice *sysbus;
     MMIOKBDState *i8042;
     MemoryRegion *hpc_pbus_dma = g_new(MemoryRegion, 1);
     MemoryRegion *hpc_misc = g_new(MemoryRegion, 1);
     MemoryRegion *eisa_io = g_new(MemoryRegion, 1);
+    MemoryRegion *vino_stub = g_new(MemoryRegion, 1);
     MemoryRegion *i8042_alias = g_new(MemoryRegion, 1);
+    MemoryRegion *i8042_data_alias = g_new(MemoryRegion, 1);
+    MemoryRegion *i8042_status_alias = g_new(MemoryRegion, 1);
+    MemoryRegion *ioc2_base_alias = g_new(MemoryRegion, 1);
     NICInfo *nd;
     DeviceState *rc4030;
     rc4030_dma *dmas;
@@ -856,8 +845,11 @@ static void mips_sgi_indigo2_init(MachineState *machine)
     int n;
 
     cpuclk = clock_new(OBJECT(machine), "cpu-refclk");
-    /* IP22 runs at 150MHz (MAME indigo2_4415); CPU stays R4000 (no QEMU R4400). */
-    clock_set_hz(cpuclk, 150000000ULL);
+    /* Indy (IP24) is an R4000 at 200MHz (MAME indy_4020); Indigo2 (IP22)
+     * runs its R4400-class CPU at 150MHz with a stock R4000 stand-in. */
+    bool is_indy = !!object_dynamic_cast(OBJECT(machine),
+                                        MACHINE_TYPE_NAME("indy"));
+    clock_set_hz(cpuclk, is_indy ? 200000000ULL : 150000000ULL);
 
     cpu = mips_cpu_create_with_clock(machine->cpu_type, cpuclk, TARGET_BIG_ENDIAN);
     env = &cpu->env;
@@ -870,7 +862,15 @@ static void mips_sgi_indigo2_init(MachineState *machine)
     memory_region_add_subregion(address_space, SGI_MEM_BASE, machine->ram);
     memory_region_init_io(eisa_io, NULL, &eisa_io_ops, NULL,
                           "sgi-ip22-eisa-io", 0x20000);
-    memory_region_add_subregion(address_space, 0x00080000, eisa_io);
+    if (is_indy) {
+        /* IP24 maps VINO video capture at 0x00080000 (MAME ip24_map); no
+         * VINO model exists yet, so answer all-ones (no device) there. */
+        memory_region_init_io(vino_stub, NULL, &eisa_io_ops, NULL,
+                              "sgi-ip24-vino-stub", 0x20000);
+        memory_region_add_subregion(address_space, 0x00080000, vino_stub);
+    } else {
+        memory_region_add_subregion(address_space, 0x00080000, eisa_io);
+    }
     for (n = 0; n < ARRAY_SIZE(sgi_hpc3_pbus_dma); n++) {
         sgi_hpc3_pbus_dma[n].timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                                    sgi_hpc3_pbus_tick,
@@ -886,6 +886,7 @@ static void mips_sgi_indigo2_init(MachineState *machine)
                              &error_fatal);
     sysbus = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(sysbus, &error_fatal);
+    mcdev = dev;
     memory_region_add_subregion(address_space, SGI_MC_BASE,
                                 sysbus_mmio_get_region(sysbus, 0));
 
@@ -911,23 +912,53 @@ static void mips_sgi_indigo2_init(MachineState *machine)
 
     rc4030 = rc4030_init(&dmas, &rc4030_dma_mr);
     sysbus = SYS_BUS_DEVICE(rc4030);
-    sysbus_connect_irq(sysbus, 0, env->irq[6]);
-    sysbus_connect_irq(sysbus, 1, env->irq[3]);
+    /* No rc4030 on IP22 (MAME has none): it is a QEMU DMA backend only.
+     * Its timer/jazz IRQs stay unconnected so they can never raise IP6/IP3,
+     * which on real hardware belong to other sources. */
     /* IOC2 (PIO6 base + PIO4 INT2) drives CPU INT0/INT1 directly, as in
      * MAME. The ESCC/i8042 sub-windows stay on top of PIO6; the rc4030 is
      * only a QEMU DMA backend and must not gate IP22 interrupts. */
+    /* Indy (IP24) uses the GUINNESS IOC2: interrupt registers in the PIO6
+     * window (MAME ioc2_guinness_device::map), no PIO4 INT2 window.
+     * Indigo2 (IP22) uses FULL_HOUSE with the separate INT2 window. */
     dev = qdev_new(TYPE_SGI_IOC2);
+    qdev_prop_set_bit(dev, "guinness", is_indy);
     sysbus = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(sysbus, &error_fatal);
-    memory_region_add_subregion_overlap(address_space, SGI_HPC3_BASE + 0x58614,
-                                        sysbus_mmio_get_region(sysbus, 0), 5);
-    memory_region_add_subregion_overlap(address_space, SGI_HPC3_BASE + 0x58400,
-                                        sysbus_mmio_get_region(sysbus, 1), 5);
+    if (is_indy) {
+        /* MAME indy_indigo2.cpp:258-261 pio6_map:
+         *   map(0x00, 0x2f).m("ioc2", ioc2_guinness_device::map)
+         *                    .umask16(0x00ff);
+         * installed on AS_PIO6 (indy_indigo2.cpp:378), and MAME
+         * hpc3.cpp:713-734 decodes PIO data as channel=(offset>>8)&15 with
+         * the register index at byte offset (offset & 0xff).  Channel 6 of
+         * the 0x58000 PIO window is HPC3+0x58600, so the GUINNESS window
+         * is HPC3+0x58600-0x5862f. */
+        memory_region_init_alias(ioc2_base_alias, NULL, "sgi_ip24.ioc2_pio6",
+                                 sysbus_mmio_get_region(sysbus, 0), 0, 0x30);
+        memory_region_add_subregion_overlap(address_space, SGI_HPC3_BASE + 0x58600,
+                                            ioc2_base_alias, 30);
+    } else {
+        memory_region_add_subregion_overlap(address_space, SGI_HPC3_BASE + 0x58614,
+                                            sysbus_mmio_get_region(sysbus, 0), 5);
+    }
+    if (!is_indy) {
+        memory_region_add_subregion_overlap(address_space, SGI_HPC3_BASE + 0x58400,
+                                            sysbus_mmio_get_region(sysbus, 1), 5);
+    }
+    /* MAME ioc2 raise_local_irq(channel) drives m_maincpu->set_input_line(channel);
+     * MAME mips3 maps line N to Cause bit 10+N, i.e. channel 0 -> IP2 and
+     * channel 1 -> IP3, matching QEMU env->irq[2]/env->irq[3]. */
     qdev_connect_gpio_out(DEVICE(dev), 0, env->irq[2]);
     qdev_connect_gpio_out(DEVICE(dev), 1, env->irq[3]);
+    /* MAME ioc2 timer0_int/timer1_int drive CPU lines 2/3 (IP4/IP5). */
+    qdev_connect_gpio_out(DEVICE(dev), 2, env->irq[4]);
+    qdev_connect_gpio_out(DEVICE(dev), 3, env->irq[5]);
     sgi_ioc2_enet_edlc_irq = qdev_get_gpio_in(DEVICE(dev), 2);
     sgi_ioc2_enet_hpc_irq = qdev_get_gpio_in(DEVICE(dev), 3);
     ioc2dev = dev;
+    /* MAME indy_indigo2.cpp:318: MEMCTL DMA-done to IOC2 local0 0x10. */
+    qdev_connect_gpio_out(mcdev, 0, qdev_get_gpio_in(ioc2dev, 10));
     /* Single GIO64 owner (MAME gio64_device); rc4030 MMIO must not shadow it. */
     dev = qdev_new("sgi-gio64");
     sysbus = SYS_BUS_DEVICE(dev);
@@ -956,21 +987,6 @@ static void mips_sgi_indigo2_init(MachineState *machine)
     memory_region_init(isa_mem, NULL, "isa-mem", 0x01000000);
     memory_region_add_subregion(address_space, SGI_IO_BASE, isa_io);
     memory_region_add_subregion(address_space, SGI_IO_BASE + 0x01000000ULL, isa_mem);
-    isa_bus = isa_bus_new(NULL, isa_mem, isa_io, &error_abort);
-
-    i8259 = i8259_init(isa_bus, env->irq[4]);
-    isa_bus_register_input_irqs(isa_bus, i8259);
-
-    i8257_dma_init(OBJECT(rc4030), isa_bus, 0);
-
-    /* The IP22 has no ISA PIT; leave the i8254 IRQ unconnected (a
-     * free-running 18.2Hz OUT0 would trip the PROM spurious-interrupt
-     * check). It stays for the PC-speaker reference. */
-    pit = i8254_pit_init(isa_bus, 0x40, -1, NULL);
-
-    pcspk = isa_new(TYPE_PC_SPEAKER);
-    object_property_set_link(OBJECT(pcspk), "pit", OBJECT(pit), &error_fatal);
-    isa_realize_and_unref(pcspk, isa_bus, &error_fatal);
 
     dev = qdev_new(TYPE_SYSBUS_ESP);
     sysbus_esp = SYSBUS_ESP(dev);
@@ -1006,36 +1022,39 @@ static void mips_sgi_indigo2_init(MachineState *machine)
 
     scsi_bus_legacy_handle_cmdline(&esp->bus);
 
-    /* Indigo2 has a second, initially empty, SCSI channel at HPC3 HD1. */
-    dev = qdev_new(TYPE_SYSBUS_ESP);
-    sysbus_esp = SYSBUS_ESP(dev);
-    esp2 = &sysbus_esp->esp;
-    esp2->dma_memory_read = rc4030_dma_read;
-    esp2->dma_memory_write = rc4030_dma_write;
-    esp2->dma_opaque = dmas[0];
-    sysbus_esp->it_shift = 0;
-    esp2->dma_enabled = 1;
-    sysbus = SYS_BUS_DEVICE(dev);
-    sysbus_realize_and_unref(sysbus, &error_fatal);
-    /* MAME indy_indigo2.cpp:440: WD33C93 INT drives IOC2 SCSI1 (ioc2.cpp:738). */
-    {
-        DeviceState *scsi_or = qdev_new(TYPE_OR_IRQ);
-        qdev_prop_set_uint16(scsi_or, "num-lines", 2);
-        qdev_realize_and_unref(scsi_or, NULL, &error_fatal);
-        sysbus_connect_irq(sysbus, 0, qdev_get_gpio_in(scsi_or, 0));
-        qdev_connect_gpio_out(scsi_or, 0, qdev_get_gpio_in(ioc2dev, 1));
-        scsi_ors[1] = scsi_or;
-    }
-    dev = qdev_new("sgi-wd33c93");
-    object_property_set_link(OBJECT(dev), "esp", OBJECT(esp2), &error_abort);
-    sgi_wd33c93[1] = SGI_WD33C93(dev);
-    sysbus = SYS_BUS_DEVICE(dev);
-    sysbus_realize_and_unref(sysbus, &error_fatal);
-    memory_region_add_subregion_overlap(address_space, SGI_HPC3_BASE + 0x48000,
-                                        sysbus_mmio_get_region(sysbus, 0), 2);
+    /* Indy (IP24) has a single SCSI channel (MAME ip24 has no scsibus2);
+     * Indigo2 has a second, initially empty, channel at HPC3 HD1. */
+    if (!is_indy) {
+        dev = qdev_new(TYPE_SYSBUS_ESP);
+        sysbus_esp = SYSBUS_ESP(dev);
+        esp2 = &sysbus_esp->esp;
+        esp2->dma_memory_read = rc4030_dma_read;
+        esp2->dma_memory_write = rc4030_dma_write;
+        esp2->dma_opaque = dmas[0];
+        sysbus_esp->it_shift = 0;
+        esp2->dma_enabled = 1;
+        sysbus = SYS_BUS_DEVICE(dev);
+        sysbus_realize_and_unref(sysbus, &error_fatal);
+        /* MAME indy_indigo2.cpp:440: WD33C93 INT drives IOC2 SCSI1 (ioc2.cpp:738). */
+        {
+            DeviceState *scsi_or = qdev_new(TYPE_OR_IRQ);
+            qdev_prop_set_uint16(scsi_or, "num-lines", 2);
+            qdev_realize_and_unref(scsi_or, NULL, &error_fatal);
+            sysbus_connect_irq(sysbus, 0, qdev_get_gpio_in(scsi_or, 0));
+            qdev_connect_gpio_out(scsi_or, 0, qdev_get_gpio_in(ioc2dev, 1));
+            scsi_ors[1] = scsi_or;
+        }
+        dev = qdev_new("sgi-wd33c93");
+        object_property_set_link(OBJECT(dev), "esp", OBJECT(esp2), &error_abort);
+        sgi_wd33c93[1] = SGI_WD33C93(dev);
+        sysbus = SYS_BUS_DEVICE(dev);
+        sysbus_realize_and_unref(sysbus, &error_fatal);
+        memory_region_add_subregion_overlap(address_space, SGI_HPC3_BASE + 0x48000,
+                                            sysbus_mmio_get_region(sysbus, 0), 2);
 
-    qdev_connect_gpio_out(DEVICE(sgi_wd33c93[1]), 0,
-                          qdev_get_gpio_in(scsi_ors[1], 1));
+        qdev_connect_gpio_out(DEVICE(sgi_wd33c93[1]), 0,
+                              qdev_get_gpio_in(scsi_ors[1], 1));
+    }
 
     /* MAME indy_indigo2.cpp:359: HPC3 DMA-done to IOC2 local1 0x10. */
     {
@@ -1044,16 +1063,20 @@ static void mips_sgi_indigo2_init(MachineState *machine)
         qdev_realize_and_unref(dma_or, NULL, &error_fatal);
         qdev_connect_gpio_out_named(DEVICE(sgi_wd33c93[0]), "dma-done", 0,
                                     qdev_get_gpio_in(dma_or, 0));
-        qdev_connect_gpio_out_named(DEVICE(sgi_wd33c93[1]), "dma-done", 0,
-                                    qdev_get_gpio_in(dma_or, 1));
+        if (!is_indy) {
+            qdev_connect_gpio_out_named(DEVICE(sgi_wd33c93[1]), "dma-done", 0,
+                                        qdev_get_gpio_in(dma_or, 1));
+        }
         qdev_connect_gpio_out(dma_or, 0, qdev_get_gpio_in(ioc2dev, 9));
     }
 
     dev = qdev_new(TYPE_SGI_HPC3_SCSI);
     object_property_set_link(OBJECT(dev), "wd0", OBJECT(sgi_wd33c93[0]),
                              &error_fatal);
-    object_property_set_link(OBJECT(dev), "wd1", OBJECT(sgi_wd33c93[1]),
-                             &error_fatal);
+    if (!is_indy) {
+        object_property_set_link(OBJECT(dev), "wd1", OBJECT(sgi_wd33c93[1]),
+                                 &error_fatal);
+    }
     sysbus = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(sysbus, &error_fatal);
     memory_region_add_subregion_overlap(address_space, SGI_HPC3_BASE + 0x10000,
@@ -1065,15 +1088,6 @@ static void mips_sgi_indigo2_init(MachineState *machine)
     memory_region_add_subregion_overlap(address_space, SGI_HPC3_BASE + 0x2a000,
                                         sysbus_mmio_get_region(sysbus, 3), 30);
 
-    for (n = 0; n < MAX_FD; n++) {
-        fds[n] = drive_get(IF_FLOPPY, 0, n);
-    }
-    fdctrl_init_sysbus(qdev_get_gpio_in(rc4030, 1), 0x80003000, fds);
-
-    mc146818_rtc_init(isa_bus, 1980, NULL);
-    memory_region_init_io(rtc, NULL, &rtc_ops, NULL, "rtc", 0x1000);
-    memory_region_add_subregion(address_space, 0x80004000, rtc);
-
     /*
      * HPC3 windows: PIO, BBRAM (DS1386 RTC+NVRAM), EEPROM (93C56).
      * Realize before the i8042 below: QEMU input dispatch is
@@ -1082,6 +1096,13 @@ static void mips_sgi_indigo2_init(MachineState *machine)
      */
     dev = qdev_new(TYPE_SGI_HPC3);
     qdev_prop_set_chr(dev, "chr", serial_hd(2));
+    /* The Indy modelled here is MAME indy_4020: R4000 at 200MHz (4x50MHz),
+     * ip24() with DS1386_8K, 16KiB icache/dcache, 50MHz system clock.  Its
+     * DS1386_8K gives the 8KiB BBRAM below; the IP22 Indigo2 uses a 64-byte
+     * DS1286.  NVRAM seed dir is the MAME machine name, so indy_4020 here. */
+    qdev_prop_set_uint32(dev, "bbram-size", is_indy ? 0x2000 : 64);
+    qdev_prop_set_string(dev, "nvram-dir", is_indy ? "indy_4020"
+                                                   : "indigo2_4415");
     sysbus = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(sysbus, &error_fatal);
     memory_region_add_subregion_overlap(address_space, SGI_HPC3_BASE + 0x58000,
@@ -1111,17 +1132,29 @@ static void mips_sgi_indigo2_init(MachineState *machine)
 
     memory_region_add_subregion(address_space, 0x80005000,
                                  sysbus_mmio_get_region(SYS_BUS_DEVICE(i8042), 0));
-    memory_region_init_alias(i8042_alias, NULL, "sgi_ip22.i8042_pio6",
-                             sysbus_mmio_get_region(SYS_BUS_DEVICE(i8042), 0),
-                             0, 2);
-    memory_region_add_subregion_overlap(address_space,
-                                        SGI_HPC3_BASE + 0x58610,
-                                        i8042_alias, 20);
+    if (is_indy) {
+        memory_region_init_alias(i8042_data_alias, NULL, "sgi_ip24.i8042_data",
+                                 sysbus_mmio_get_region(SYS_BUS_DEVICE(i8042), 0),
+                                 0, 1);
+        memory_region_init_alias(i8042_status_alias, NULL, "sgi_ip24.i8042_status",
+                                 sysbus_mmio_get_region(SYS_BUS_DEVICE(i8042), 0),
+                                 1, 1);
+        memory_region_add_subregion_overlap(address_space, SGI_HPC3_BASE + 0x59840,
+                                            i8042_data_alias, 1000);
+        memory_region_add_subregion_overlap(address_space, SGI_HPC3_BASE + 0x59844,
+                                            i8042_status_alias, 1000);
+    } else {
+        memory_region_init_alias(i8042_alias, NULL, "sgi_ip22.i8042_pio6",
+                                 sysbus_mmio_get_region(SYS_BUS_DEVICE(i8042), 0),
+                                 0, 2);
+        memory_region_add_subregion_overlap(address_space, SGI_HPC3_BASE + 0x58610,
+                                            i8042_alias, 20);
+    }
 
     /* IOC2-compatible Z8530 SCC in HPC3 PIO6. */
     dev = qdev_new(TYPE_ESCC);
     qdev_prop_set_uint32(dev, "frequency", 10000000);
-    qdev_prop_set_uint32(dev, "it_shift", 0);
+    qdev_prop_set_uint32(dev, "it_shift", is_indy ? 2 : 0);
     qdev_prop_set_bit(dev, "bit_swap", false);
     qdev_prop_set_chr(dev, "chrA", serial_hd(0));
     qdev_prop_set_chr(dev, "chrB", serial_hd(1));
@@ -1129,19 +1162,11 @@ static void mips_sgi_indigo2_init(MachineState *machine)
     qdev_prop_set_uint32(dev, "chnBtype", 0);
     sysbus = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(sysbus, &error_fatal);
-    memory_region_add_subregion_overlap(address_space, SGI_HPC3_BASE + 0x5860c,
-                                        sysbus_mmio_get_region(sysbus, 0), 10);
+    memory_region_add_subregion_overlap(address_space,
+                                        SGI_HPC3_BASE +
+                                        (is_indy ? 0x59830 : 0x5860c),
+                                        sysbus_mmio_get_region(sysbus, 0), 1000);
     sysbus_connect_irq(sysbus, 0, qdev_get_gpio_in(ioc2dev, 7));
-
-    /* Legacy alias only; it must not steal serial_hd(1) from the SCC. */
-    serial_mm_init(address_space, 0x80006000, 0,
-                   qdev_get_gpio_in(rc4030, 8), 8000000 / 16,
-                   qemu_chr_new("indigo2.legacy-serial", "null", NULL),
-                   DEVICE_NATIVE_ENDIAN);
-
-    if (parallel_hds[0]) {
-        parallel_mm_init(address_space, 0x80008000, 0, qdev_get_gpio_in(rc4030, 0), parallel_hds[0]);
-    }
 
     nd = qemu_find_nic_info("seeq80c03", true, "seeq80c03");
     if (nd) {
@@ -1158,8 +1183,6 @@ static void mips_sgi_indigo2_init(MachineState *machine)
         qemu_format_nic_info_str(qemu_get_queue(sgi_ethernet_nic),
                                  sgi_ethernet_conf.macaddr.a);
     }
-
-    sysbus_create_simple("jazz-led", 0x8000f000, NULL);
 
     g_free(dmas);
 }
@@ -1183,7 +1206,7 @@ static void mips_sgi_indy_class_init(ObjectClass *oc, const void *data)
     mc->desc = "SGI Indy";
     mc->init = mips_sgi_indigo2_init;
     mc->max_cpus = 1;
-    mc->default_cpu_type = MIPS_CPU_TYPE_NAME("R4000");
+    mc->default_cpu_type = MIPS_CPU_TYPE_NAME("R4000SC");
     mc->default_ram_size = 128 * MiB;
     mc->default_ram_id = "sgi_indy.ram";
 }

@@ -9,6 +9,7 @@
  */
 
 #include "qemu/osdep.h"
+#include <glib/gstdio.h>
 #include "chardev/char-fe.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-properties-system.h"
@@ -73,6 +74,8 @@ struct SgiHpc3State {
     uint8_t mouse_buttons;
     QemuInputHandlerState *kbd_hs;
     uint8_t bbram[0x2000];
+    uint32_t bbram_size;
+    char *nvram_dir;
     uint64_t bbram_clock_base_ns;
     time_t bbram_clock_base_time;
     eeprom_t *eeprom;
@@ -690,6 +693,14 @@ static uint64_t sgi_hpc3_pio_read(void *opaque, hwaddr addr, unsigned size)
     unsigned offset = addr & 0xff;
     uint64_t rv;
 
+    if (sgi_ip22_trace_enabled() && channel != 8) {
+        fprintf(stderr, "PIO-DISP-R ch=%u off=%02x\n", channel, offset);
+    }
+    if (channel >= 10) {
+        channel = (channel & 1) ? 9 : 8;
+    }
+
+    /* Channel 6 (IOC2) is owned by the sgi-ioc2 device and the ESCC. */
     if (channel >= 10) {
         channel = (channel & 1) ? 9 : 8;
     }
@@ -731,6 +742,11 @@ static void sgi_hpc3_pio_write(void *opaque, hwaddr addr, uint64_t val,
     SgiHpc3State *state = SGI_HPC3(opaque);
     unsigned channel = (addr >> 8) & 15;
     unsigned offset = addr & 0xff;
+
+    if (sgi_ip22_trace_enabled()) {
+        fprintf(stderr, "PIO-DISP-W ch=%u off=%02x val=%x\n",
+                channel, offset, (unsigned)val);
+    }
 
     if (channel >= 10) {
         channel = (channel & 1) ? 9 : 8;
@@ -794,8 +810,9 @@ static uint64_t sgi_hpc3_bbram_read(void *opaque, hwaddr addr, unsigned size)
             (clock_ns - state->bbram_clock_base_ns) / 1000000000ULL;
     localtime_r(&now, &current);
     /* MAME ds1386.h REGISTER_*: 0-0x0d clock/alarms/command/watchdog,
-     * 0x0e+ user NVRAM; DS1286 is 64 bytes (MAME ds1386.cpp data_r). */
-    if (reg >= 64) {
+     * 0x0e+ user NVRAM; DS1286 is 64 bytes, DS1386_8K is 8KiB (MAME
+     * ds1386.cpp data_r falls back to RAM below m_ram_size). */
+    if (reg >= state->bbram_size) {
         return 0;
     }
     switch (reg) {
@@ -826,8 +843,8 @@ static void sgi_hpc3_bbram_write(void *opaque, hwaddr addr,
     SgiHpc3State *state = SGI_HPC3(opaque);
     hwaddr reg = size == 4 ? addr >> 2 : addr;
 
-    /* MAME ds1386.cpp data_w: ignore accesses beyond the 64-byte DS1286. */
-    if (reg >= 64) {
+    /* MAME ds1386.cpp data_w: ignore accesses beyond the BBRAM size. */
+    if (reg >= state->bbram_size) {
         return;
     }
     state->bbram[reg] = val;
@@ -909,9 +926,26 @@ static void sgi_hpc3_console_receive(void *opaque, const uint8_t *buf,
     }
 }
 
+/* NVRAM seed resolution + write-back, so PROM env survives relaunch.
+ * The seed dir is the MAME machine name for this board (PROM-specific
+ * env): indy_4020 for the Indy/IP24 (the R4000/200MHz model this board
+ * implements), indigo2_4415 for the IP22. */
+static char sgi_hpc3_nvram_eeprom_path[4096];
+static char sgi_hpc3_nvram_rtc_path[4096];
+static char sgi_hpc3_nvram_dir[128] = "indigo2_4415";
+static SgiHpc3State *sgi_hpc3_nvram_state;
+
+static FILE *sgi_hpc3_open_nvram(const char *name, char *out, size_t outlen);
+static void sgi_hpc3_note_nvram_paths(const char *eeprom, const char *rtc);
+static void sgi_hpc3_note_nvram_state(SgiHpc3State *state);
+
 static void sgi_hpc3_realize(DeviceState *device, Error **errp)
 {
     SgiHpc3State *state = SGI_HPC3(device);
+    char eeprom_path[4096];
+    char rtc_path[4096];
+    FILE *eeprom_file;
+    FILE *rtc_file;
 
     qemu_chr_fe_set_handlers(&state->console,
                              sgi_hpc3_console_can_receive,
@@ -919,6 +953,49 @@ static void sgi_hpc3_realize(DeviceState *device, Error **errp)
                              NULL, NULL, state, NULL, true);
     state->kbd_hs = qemu_input_handler_register(device,
                                                 &sgi_hpc3_kbd_handler);
+
+    /* The seed dir is the MAME machine name set by the board (my guest
+     * NVRAM path resolution uses this global). */
+    if (state->nvram_dir && state->nvram_dir[0]) {
+        snprintf(sgi_hpc3_nvram_dir, sizeof(sgi_hpc3_nvram_dir), "%s",
+                 state->nvram_dir);
+    }
+
+    /* Seed the 93C56 EEPROM from the machine's MAME NVRAM dir. */
+    eeprom_file = sgi_hpc3_open_nvram("eeprom", eeprom_path,
+                                      sizeof(eeprom_path));
+    if (eeprom_file) {
+        uint16_t *eeprom_data = eeprom93xx_data(state->eeprom);
+        uint8_t eeprom_bytes[256];
+        if (fread(eeprom_bytes, sizeof(eeprom_bytes), 1, eeprom_file) == 1) {
+            for (unsigned word = 0; word < 128; word++) {
+                eeprom_data[word] = eeprom_bytes[word * 2] |
+                                     (eeprom_bytes[word * 2 + 1] << 8);
+            }
+        }
+        fclose(eeprom_file);
+    }
+    if (eeprom_path[0]) {
+        sgi_hpc3_note_nvram_paths(eeprom_path, NULL);
+    }
+
+    rtc_file = sgi_hpc3_open_nvram("rtc", rtc_path, sizeof(rtc_path));
+    if (rtc_file) {
+        /* IP22 carries a DS1286 (64 bytes), the Indy/IP24 a DS1386_8K
+         * (8KiB, MAME indy_indigo2.cpp); load the whole seed image. */
+        size_t got = fread(state->bbram, 1, state->bbram_size, rtc_file);
+        if (got > 0) {
+            memset(state->bbram + got, 0, state->bbram_size - got);
+        }
+        fclose(rtc_file);
+    } else {
+        /* MAME ds1386.cpp nvram_default(): zeros + TE|WAM|TDM at 0x0b. */
+        state->bbram[0x0b] = 0x8c;
+    }
+    if (rtc_path[0]) {
+        sgi_hpc3_note_nvram_paths(NULL, rtc_path);
+    }
+    sgi_hpc3_note_nvram_state(state);
 }
 
 static void sgi_hpc3_unrealize(DeviceState *device)
@@ -1001,10 +1078,6 @@ static void sgi_hpc3_reset(DeviceState *device)
 }
 
 /* NVRAM seed resolution + write-back, so PROM env survives relaunch. */
-static char sgi_hpc3_nvram_eeprom_path[4096];
-static char sgi_hpc3_nvram_rtc_path[4096];
-static SgiHpc3State *sgi_hpc3_nvram_state;
-
 static FILE *sgi_hpc3_try_nvram(const char *path, char *out, size_t outlen)
 {
     FILE *f = fopen(path, "rb");
@@ -1015,63 +1088,135 @@ static FILE *sgi_hpc3_try_nvram(const char *path, char *out, size_t outlen)
     return f;
 }
 
-static FILE *sgi_hpc3_open_nvram(const char *name, char *out, size_t outlen)
+/* Locate @name inside a read-only reference NVRAM tree.  Nothing under
+ * reference/mame is ever opened for writing. */
+static char *sgi_hpc3_try_seed(const char *nvram_root, const char *name)
 {
-    FILE *f;
-    ssize_t exe_len;
-    char exe[4096];
-    char first_candidate[4096];
+    char *path = g_strdup_printf("%s/%s/%s", nvram_root,
+                                sgi_hpc3_nvram_dir, name);
+    FILE *f = fopen(path, "rb");
 
-    first_candidate[0] = '\0';
-    out[0] = '\0';
+    if (!f) {
+        g_free(path);
+        return NULL;
+    }
+    fclose(f);
+    return path;
+}
+
+static char *sgi_hpc3_find_seed(const char *name)
+{
+    static const char *const roots[] = {
+        "reference/mame/run/nvram",
+        "../../reference/mame/run/nvram",
+    };
+    char exe[4096];
+    char *found = NULL;
+    ssize_t exe_len;
+    unsigned i;
+
     /* 1. Relative to the QEMU executable (qemu/build -> repo root). */
     exe_len = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
     if (exe_len > 0) {
-        char *slash;
-        exe[exe_len] = '\0';
-        slash = strrchr(exe, '/');
+        char *slash = strrchr(exe, '/');
         if (slash) {
-            char *path;
+            char *root;
             *slash = '\0';
-            path = g_strdup_printf("%s/../../reference/mame/run/"
-                                   "nvram/indigo2_4415/%s", exe, name);
-            if (!first_candidate[0]) {
-                snprintf(first_candidate, sizeof(first_candidate), "%s",
-                         path);
-            }
-            f = sgi_hpc3_try_nvram(path, out, outlen);
-            g_free(path);
-            if (f) {
-                return f;
-            }
+            root = g_strdup_printf("%s/../../reference/mame/run/nvram",
+                                  exe);
+            found = sgi_hpc3_try_seed(root, name);
+            g_free(root);
         }
     }
     /* 2. Relative to cwd (repo root via run-irix.sh, or qemu/build). */
-    {
-        static const char *const rels[] = {
-            "reference/mame/run/nvram/indigo2_4415/",
-            "../../reference/mame/run/nvram/indigo2_4415/",
-            NULL,
-        };
-        for (unsigned i = 0; rels[i]; i++) {
-            char *path = g_strdup_printf("%s%s", rels[i], name);
-            if (!first_candidate[0]) {
-                snprintf(first_candidate, sizeof(first_candidate), "%s",
-                         path);
-            }
-            f = sgi_hpc3_try_nvram(path, out, outlen);
-            g_free(path);
-            if (f) {
-                return f;
-            }
+    for (i = 0; !found && i < G_N_ELEMENTS(roots); i++) {
+        found = sgi_hpc3_try_seed(roots[i], name);
+    }
+    return found;
+}
+
+static bool sgi_hpc3_copy_seed(const char *src, const char *dst)
+{
+    FILE *in = fopen(src, "rb");
+    FILE *out_file;
+    char buf[4096];
+    size_t n;
+    bool ok;
+
+    if (!in) {
+        return false;
+    }
+    out_file = fopen(dst, "wb");
+    if (!out_file) {
+        fclose(in);
+        return false;
+    }
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (fwrite(buf, 1, n, out_file) != n) {
+            break;
         }
     }
-    /* No seed found (normal for the DS1286 RTC): still record the path
-     * for write-back, or BBRAM edits are lost every run. */
-    if (outlen > 0 && first_candidate[0]) {
-        snprintf(out, outlen, "%s", first_candidate);
+    ok = !ferror(in) && !ferror(out_file);
+    fclose(in);
+    if (fclose(out_file) != 0) {
+        ok = false;
     }
-    return NULL;
+    return ok;
+}
+
+static FILE *sgi_hpc3_open_nvram(const char *name, char *out, size_t outlen)
+{
+    char exe[4096];
+    char *work_root = NULL;
+    char *work_path;
+    char *seed_path = NULL;
+    FILE *f;
+    ssize_t exe_len;
+
+    out[0] = '\0';
+
+    /* QEMU's own writable copy, kept beside the binary. */
+    exe_len = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (exe_len > 0) {
+        char *slash = strrchr(exe, '/');
+        if (slash) {
+            *slash = '\0';
+            work_root = g_strdup(exe);
+        }
+    }
+    if (!work_root) {
+        work_root = g_strdup("qemu/build");
+    }
+    work_path = g_strdup_printf("%s/nvram/%s/%s", work_root,
+                                sgi_hpc3_nvram_dir, name);
+
+    /* An existing copy wins: it holds the env the PROM already committed. */
+    f = sgi_hpc3_try_nvram(work_path, out, outlen);
+    if (f) {
+        goto out;
+    }
+
+    /* First run: seed the copy from the read-only reference tree. */
+    seed_path = sgi_hpc3_find_seed(name);
+    if (seed_path) {
+        char *dir = g_path_get_dirname(work_path);
+        if (g_mkdir_with_parents(dir, 0755) == 0) {
+            sgi_hpc3_copy_seed(seed_path, work_path);
+        }
+        g_free(dir);
+        g_free(seed_path);
+    }
+    f = sgi_hpc3_try_nvram(work_path, out, outlen);
+    if (!f && outlen > 0) {
+        /* No seed anywhere (normal for the DS1286 RTC): still record the
+         * working-copy path so BBRAM edits survive the next run. */
+        snprintf(out, outlen, "%s", work_path);
+    }
+
+ out:
+    g_free(work_root);
+    g_free(work_path);
+    return f;
 }
 
 static void sgi_hpc3_write_back_nvram(void)
@@ -1082,8 +1227,9 @@ static void sgi_hpc3_write_back_nvram(void)
     if (!state) {
         return;
     }
-    /* Never overwrite the frozen 0444 reference seeds; they stay
-     * read-only and QEMU simply skips write-back when unwritable. */
+    /* These paths are QEMU's own writable copies under <exe>/nvram/, never
+     * the pristine seeds in reference/mame, so persisting PROM env cannot
+     * modify the reference tree. */
     if (sgi_hpc3_nvram_eeprom_path[0] && state->eeprom &&
         access(sgi_hpc3_nvram_eeprom_path, W_OK) == 0) {
         uint16_t *data = eeprom93xx_data(state->eeprom);
@@ -1099,12 +1245,12 @@ static void sgi_hpc3_write_back_nvram(void)
             fclose(f);
         }
     }
-    if (sgi_hpc3_nvram_rtc_path[0] &&
+    if (sgi_hpc3_nvram_rtc_path[0] && sgi_hpc3_nvram_state &&
         access(sgi_hpc3_nvram_rtc_path, W_OK) == 0) {
-        /* DS1286: persist the 64-byte image MAME uses. */
+        /* Persist the full DS1286/DS1386_8K image MAME uses. */
         f = fopen(sgi_hpc3_nvram_rtc_path, "wb");
         if (f) {
-            fwrite(state->bbram, 1, 64, f);
+            fwrite(state->bbram, 1, state->bbram_size, f);
             fclose(f);
         }
     }
@@ -1136,7 +1282,6 @@ static void sgi_hpc3_note_nvram_state(SgiHpc3State *state)
 static void sgi_hpc3_init(Object *object)
 {
     SgiHpc3State *state = SGI_HPC3(object);
-    FILE *rtc_file;
 
     memory_region_init_io(&state->pio_iomem, object, &sgi_hpc3_pio_ops,
                           state, TYPE_SGI_HPC3 "-pio", SGI_HPC3_PIO_SIZE);
@@ -1149,56 +1294,12 @@ static void sgi_hpc3_init(Object *object)
     sysbus_init_mmio(SYS_BUS_DEVICE(object), &state->eeprom_iomem);
 
     state->eeprom = eeprom93xx_new(DEVICE(object), 128);
-    {
-        /*
-         * Seed from the MAME indigo2_4415 NVRAM dir (exe- then cwd-relative);
-         * MAME cells are native-endian, so load little-endian to match.
-         */
-        char eeprom_path[4096];
-        FILE *eeprom_file = sgi_hpc3_open_nvram("eeprom", eeprom_path,
-                                                sizeof(eeprom_path));
-        uint16_t *eeprom_data = eeprom93xx_data(state->eeprom);
-        uint8_t eeprom_bytes[256];
-        if (eeprom_file && fread(eeprom_bytes, sizeof(eeprom_bytes), 1,
-                                 eeprom_file) == 1) {
-            for (unsigned word = 0; word < 128; word++) {
-                eeprom_data[word] = eeprom_bytes[word * 2] |
-                                     (eeprom_bytes[word * 2 + 1] << 8);
-            }
-        }
-        if (eeprom_file) {
-            fclose(eeprom_file);
-        }
-        if (eeprom_path[0]) {
-            sgi_hpc3_note_nvram_paths(eeprom_path, NULL);
-        }
-    }
-
-    {
-        char rtc_path[4096];
-        rtc_file = sgi_hpc3_open_nvram("rtc", rtc_path, sizeof(rtc_path));
-        if (rtc_file) {
-            /* IP22 carries a DS1286 (64 bytes, MAME indy_indigo2.cpp), not
-             * the Indy/IP24 DS1386_8K; load the seed as-is. */
-            uint8_t nvram[64];
-            size_t got = fread(nvram, 1, sizeof(nvram), rtc_file);
-            if (got > 0) {
-                memcpy(state->bbram, nvram, got);
-            }
-            fclose(rtc_file);
-        } else {
-            /* MAME ds1386.cpp nvram_default(): zeros + TE|WAM|TDM at 0x0b. */
-            state->bbram[0x0b] = 0x8c;
-        }
-        if (rtc_path[0]) {
-            sgi_hpc3_note_nvram_paths(NULL, rtc_path);
-        }
-    }
-    sgi_hpc3_note_nvram_state(state);
 }
 
 static const Property sgi_hpc3_properties[] = {
     DEFINE_PROP_CHR("chr", SgiHpc3State, console),
+    DEFINE_PROP_UINT32("bbram-size", SgiHpc3State, bbram_size, 64),
+    DEFINE_PROP_STRING("nvram-dir", SgiHpc3State, nvram_dir),
 };
 
 static void sgi_hpc3_class_init(ObjectClass *klass, const void *data)
