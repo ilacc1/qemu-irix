@@ -686,6 +686,24 @@ static uint64_t sgi_hpc3_pio8_read(SgiHpc3State *state, unsigned offset)
     return 0;
 }
 
+/*
+ * Channel 8 read tracing. The kernel polls these registers in tight wait
+ * loops, so cap the number of traces per offset instead of the channel as
+ * a whole: a polled offset still shows its loop and rate, while the trace
+ * stays bounded and keeps logging through to the stall.
+ */
+#define SGI_PIO8_TRACE_PER_OFFSET 2000
+static unsigned sgi_pio8_trace_count[256];
+
+static bool sgi_pio8_trace_wanted(unsigned offset)
+{
+    if (sgi_pio8_trace_count[offset] >= SGI_PIO8_TRACE_PER_OFFSET) {
+        return false;
+    }
+    sgi_pio8_trace_count[offset]++;
+    return true;
+}
+
 static uint64_t sgi_hpc3_pio_read(void *opaque, hwaddr addr, unsigned size)
 {
     SgiHpc3State *state = SGI_HPC3(opaque);
@@ -693,7 +711,8 @@ static uint64_t sgi_hpc3_pio_read(void *opaque, hwaddr addr, unsigned size)
     unsigned offset = addr & 0xff;
     uint64_t rv;
 
-    if (sgi_ip22_trace_enabled() && channel != 8) {
+    if (sgi_ip22_trace_enabled() &&
+        (channel != 8 || sgi_pio8_trace_wanted(offset))) {
         fprintf(stderr, "PIO-DISP-R ch=%u off=%02x\n", channel, offset);
     }
     if (channel >= 10) {

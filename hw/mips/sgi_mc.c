@@ -14,6 +14,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/core/irq.h"
 #include "hw/mips/sgi_mc.h"
+#include "hw/mips/sgi_hpc3.h"
 #include "hw/core/sysbus.h"
 #include "migration/vmstate.h"
 #include "qapi/error.h"
@@ -459,7 +460,13 @@ static uint64_t sgi_mc_read_inner(void *opaque, hwaddr addr, unsigned size)
 
 static uint64_t sgi_mc_read(void *opaque, hwaddr addr, unsigned size)
 {
-    return sgi_mc_read_inner(opaque, addr, size);
+    uint64_t val = sgi_mc_read_inner(opaque, addr, size);
+
+    if (sgi_ip22_trace_enabled()) {
+        fprintf(stderr, "MC-R off=%04x sz=%u val=%016llx\n",
+                (unsigned)addr, size, (unsigned long long)val);
+    }
+    return val;
 }
 
 static void sgi_mc_write_inner(void *opaque, hwaddr addr,
@@ -609,6 +616,10 @@ static void sgi_mc_write_inner(void *opaque, hwaddr addr,
 static void sgi_mc_write(void *opaque, hwaddr addr,
                          uint64_t val, unsigned size)
 {
+    if (sgi_ip22_trace_enabled()) {
+        fprintf(stderr, "MC-W off=%04x sz=%u val=%016llx\n",
+                (unsigned)addr, size, (unsigned long long)val);
+    }
     sgi_mc_write_inner(opaque, addr, val, size);
 }
 
