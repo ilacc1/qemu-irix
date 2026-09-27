@@ -16,7 +16,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGIO64State, SGI_GIO64)
 #define GIO64_BUS_SIZE 0xa00000
 #define XL24_REX3_OFFSET 0x0f0000
 #define XL24_REX3_SIZE 0x2000
-#define XL24_WIDTH 1280
+#define XL24_WIDTH 1288
 #define XL24_HEIGHT 1024
 #define XL24_STRIDE 1344
 #define REX3_STATUS_VRINT (1U << 5)
@@ -305,9 +305,9 @@ static unsigned sgi_gio64_display_width(SGIGIO64State *state)
 {
     int w = state->readout_x1 - state->readout_x0;
 
-    /* MAME initial screen 1280x1024 before VID_ENTRY programs VT
+    /* MAME initial screen is 1288x1024 before VID_ENTRY programs VT
      * (newport.cpp:4480-4481). Zero/invalid readout falls back there. */
-    if (w == 1280 || w == 1024) {
+    if (w == 1288 || w == 1024) {
         return w;
     }
     if (w > 0 && w <= XL24_STRIDE) {
@@ -2341,7 +2341,7 @@ static void sgi_gio64_init(Object *object)
     memory_region_add_subregion_overlap(&state->bus, 0,
                                         &state->gio_unmapped, 0);
     /* Power-on defaults (MAME device_reset values); display falls back to
-     * 1280x1024 until VID_ENTRY programs VT. */
+     * 1288x1024 until VID_ENTRY programs VT. */
     memset(state->cmap_palette, 0, sizeof(state->cmap_palette));
     memset(state->cmap_index, 0, sizeof(state->cmap_index));
     memset(state->ramdac_lut_r, 0, sizeof(state->ramdac_lut_r));
