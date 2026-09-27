@@ -34,7 +34,11 @@ struct SgiHpc3State {
     MemoryRegion bbram_iomem;
     MemoryRegion eeprom_iomem;
     CharFrontend console;
-    uint8_t pio0_data[0x100];
+    /* MAME hal2.h:65-72: STATUS 0x10, REVISION 0x20, INDIRECT_ADDRESS 0x30,
+     * INDIRECT_DATA0-3 0x40/0x50/0x60/0x70 reached through IP24 PIO0. */
+    uint16_t hal2_isr;
+    uint16_t hal2_iar;
+    uint16_t hal2_idr[4];
     uint8_t pio8_latch33;
     uint8_t pio8_rx_fifo[256];
     unsigned pio8_rx_head;
@@ -733,24 +737,27 @@ static uint64_t sgi_hpc3_pio_read(void *opaque, hwaddr addr, unsigned size)
         return rv;
     }
     if (channel == 0) {
-        if (offset == 0x3b) {
+        /*
+         * MAME indy_indigo2.cpp:243-246 maps IP24 PIO0 to hal2_device, whose
+         * read handler (hal2.cpp:73-100) only decodes the registers above;
+         * REVISION reads the fixed 0x4010 and everything else reads 0.
+         */
+        switch (offset) {
+        case 0x10:
+            return state->hal2_isr;
+        case 0x20:
+            return 0x4010;
+        case 0x40:
+            return state->hal2_idr[0];
+        case 0x50:
+            return state->hal2_idr[1];
+        case 0x60:
+            return state->hal2_idr[2];
+        case 0x70:
+            return state->hal2_idr[3];
+        default:
             return 0;
         }
-        if (offset == 0x0b) {
-            /* Kbd/mouse status mirror: bit 0 = keyboard byte waits,
-             * bit 5 = mouse byte waits; 0 when idle. */
-            uint64_t v = 0;
-
-            if (state->out_kbd_count > 0) {
-                v |= 0x01;
-            }
-            if (state->out_aux_count > 0) {
-                v |= 0x20;
-            }
-            return v;
-        }
-        rv = state->pio0_data[offset];
-        return rv;
     }
     return 0;
 }
@@ -795,7 +802,31 @@ static void sgi_hpc3_pio_write(void *opaque, hwaddr addr, uint64_t val,
         return;
     }
     if (channel == 0) {
-        state->pio0_data[offset] = val;
+        /* MAME hal2.cpp:104-332: STATUS latches only the 0x1c reset bits,
+         * INDIRECT_ADDRESS is stored, INDIRECT_DATA0-3 are plain registers;
+         * unknown offsets are dropped. */
+        switch (offset) {
+        case 0x10:
+            state->hal2_isr = (state->hal2_isr & ~0x1c) | (val & 0x1c);
+            break;
+        case 0x30:
+            state->hal2_iar = val;
+            break;
+        case 0x40:
+            state->hal2_idr[0] = val;
+            break;
+        case 0x50:
+            state->hal2_idr[1] = val;
+            break;
+        case 0x60:
+            state->hal2_idr[2] = val;
+            break;
+        case 0x70:
+            state->hal2_idr[3] = val;
+            break;
+        default:
+            break;
+        }
         return;
     }
 }
@@ -1029,7 +1060,9 @@ static const VMStateDescription vmstate_sgi_hpc3 = {
     .version_id = 6,
     .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
-        VMSTATE_UINT8_ARRAY(pio0_data, SgiHpc3State, 0x100),
+        VMSTATE_UINT16(hal2_isr, SgiHpc3State),
+        VMSTATE_UINT16(hal2_iar, SgiHpc3State),
+        VMSTATE_UINT16_ARRAY(hal2_idr, SgiHpc3State, 4),
         VMSTATE_UINT8(pio8_latch33, SgiHpc3State),
         VMSTATE_UINT8_ARRAY(pio8_rx_fifo, SgiHpc3State, 256),
         VMSTATE_UINT32(pio8_rx_head, SgiHpc3State),
@@ -1068,7 +1101,9 @@ static void sgi_hpc3_reset(DeviceState *device)
 {
     SgiHpc3State *state = SGI_HPC3(device);
 
-    memset(state->pio0_data, 0, sizeof(state->pio0_data));
+    state->hal2_isr = 0;
+    state->hal2_iar = 0;
+    memset(state->hal2_idr, 0, sizeof(state->hal2_idr));
     state->pio8_latch33 = 0;
     state->pio8_rx_head = 0;
     state->pio8_rx_count = 0;

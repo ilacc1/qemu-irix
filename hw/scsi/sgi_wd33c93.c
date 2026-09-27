@@ -813,7 +813,7 @@ static void sgi_wd_progress_tick(void *opaque)
     }
 }
 
-static uint64_t sgi_wd_read(void *opaque, hwaddr addr, unsigned size)
+static uint64_t sgi_wd_read_inner(void *opaque, hwaddr addr, unsigned size)
 {
     SGIWD33C93State *state = opaque;
 
@@ -833,16 +833,10 @@ static uint64_t sgi_wd_read(void *opaque, hwaddr addr, unsigned size)
         } else {
             aux = state->auxiliary_status;
         }
-        if (sgi_wd_trace_enabled()) {
-            fprintf(stderr, "WD33 REG R addr=1f val=%02x\n", aux);
-        }
         return aux;
     }
     if ((addr & 0xff) != 7) {
         return 0;
-    }
-    if (sgi_wd_trace_enabled()) {
-        fprintf(stderr, "WD33 REG R addr=%02x\n", state->register_select & 0x1f);
     }
     switch (state->register_select & 0x1f) {
     case 0x17:
@@ -1012,6 +1006,24 @@ static uint64_t sgi_wd_read(void *opaque, hwaddr addr, unsigned size)
         }
         return 0;
     }
+}
+
+/*
+ * Log the window offset, the DSP register that was selected before the
+ * access and the value the guest actually read, so the sequence can be
+ * diffed against MAME wd33c93b indir_r/indir_w logging.
+ */
+static uint64_t sgi_wd_read(void *opaque, hwaddr addr, unsigned size)
+{
+    SGIWD33C93State *state = opaque;
+    uint8_t sel = state->register_select & 0x1f;
+    uint64_t value = sgi_wd_read_inner(opaque, addr, size);
+
+    if (sgi_wd_trace_enabled() && state->esp) {
+        fprintf(stderr, "WD33 REG R off=%02x sel=%02x val=%02x\n",
+                (unsigned)(addr & 0xff), sel, (unsigned)value);
+    }
+    return value;
 }
 
 static void sgi_wd_write(void *opaque, hwaddr addr, uint64_t value,
