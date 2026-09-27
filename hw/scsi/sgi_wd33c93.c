@@ -14,6 +14,8 @@
 #include "system/address-spaces.h"
 
 extern hwaddr mips_cpu_get_phys_addr_debug(CPUState *cpu, vaddr addr);
+extern hwaddr mips_cpu_get_phys_page_any_asid(CPUState *cs, vaddr addr);
+void mips_dump_tlb_match(CPUState *cs, vaddr addr);
 
 #define SGI_WD_STATUS_SELECT_TRANSFER_SUCCESS 0x16
 #define SGI_WD_STATUS_TRANSFER_SUCCESS 0x18
@@ -184,6 +186,28 @@ static bool sgi_wd_trace_enabled(void)
     return cached != 0;
 }
 
+/*
+ * Per-key cap for the per-access traces: the kernel polls the auxiliary
+ * status register in a tight loop and streams SCSI DMA bytes, so an
+ * uncapped trace floods stderr and its I/O load slows the vCPU enough to
+ * change guest-visible timing.  Keys 5-7 are per-site totals for the
+ * per-byte DMA fallback traces (every byte is a distinct address).
+ */
+#define SGI_WD_TRACE_PER_KEY 5000
+static unsigned sgi_wd_trace_keys[32][9];
+
+static bool sgi_wd_trace_wanted(unsigned site, unsigned addr)
+{
+    if (site >= 9 || (addr & 0x1f) >= 32) {
+        return true;
+    }
+    if (sgi_wd_trace_keys[addr & 0x1f][site] >= SGI_WD_TRACE_PER_KEY) {
+        return false;
+    }
+    sgi_wd_trace_keys[addr & 0x1f][site]++;
+    return true;
+}
+
 /* R4400 32-bit view: kseg0-3 (0x80000000+) all decode to PA 0-0x1fffffff
  * via SegCtl; below 0x80000000 the address is physical (bank aliases at
  * 0x08000000/0x0c000000 included). Mirrors MAME's MMU descriptor fetch. */
@@ -214,7 +238,26 @@ static uint32_t sgi_wd_dma_read32(hwaddr addr)
     }
 
     uint32_t value = 0;
-    hwaddr pa = sgi_wd_pa(addr);
+    hwaddr pa;
+
+    /*
+     * The debug translation missed (kernel TLB entry loaded under another
+     * ASID).  Translate through the kernel's actual soft-TLB mapping, VPN
+     * match regardless of ASID, so the descriptor dword is read from the
+     * physical page the kernel's own faulted-in mapping reads; identity
+     * stays only as the last resort for genuinely unmapped early boot.
+     */
+    if (cs) {
+        hwaddr tpa = mips_cpu_get_phys_page_any_asid(cs, addr);
+
+        if (tpa != (hwaddr)-1) {
+            pa = tpa;
+        } else {
+            pa = sgi_wd_pa(addr);
+        }
+    } else {
+        pa = sgi_wd_pa(addr);
+    }
 
     /* Board trace: descriptor dword resolved via physical fallback */
     if (sgi_wd_trace_enabled()) {
@@ -316,12 +359,30 @@ static void sgi_wd_dma_read(void *opaque, uint8_t *buf, int len)
         }
         if (!ok) {
             MemTxResult result;
-            hwaddr pa = sgi_wd_pa(state->dma_current);
+            hwaddr pa;
+
+            /*
+             * Same as the write path: the debug translation missed, so use
+             * the kernel's actual soft-TLB mapping (VPN match, any ASID)
+             * and keep identity only as the last resort.
+             */
+            if (cs) {
+                hwaddr tpa = mips_cpu_get_phys_page_any_asid(
+                    cs, sgi_wd_dma_address(state, state->dma_current));
+
+                if (tpa != (hwaddr)-1) {
+                    pa = tpa;
+                } else {
+                    pa = sgi_wd_pa(state->dma_current);
+                }
+            } else {
+                pa = sgi_wd_pa(state->dma_current);
+            }
             if (state->dma_control & 0x02) {
                 pa ^= 3;
             }
             /* Board trace: guest data-out byte fell back to physical read */
-            if (sgi_wd_trace_enabled()) {
+            if (sgi_wd_trace_enabled() && sgi_wd_trace_wanted(5, 0)) {
                 fprintf(stderr, "WDR-FB va=%08x pa=%08x\n",
                         (unsigned)state->dma_current, (unsigned)pa);
             }
@@ -350,7 +411,7 @@ static void sgi_wd_dma_write(void *opaque, uint8_t *buf, int len)
             if (rr == 0) {
                 ok = true;
             }
-            if (sgi_wd_trace_enabled() &&
+            if (sgi_wd_trace_enabled() && sgi_wd_trace_wanted(6, 0) &&
                 (state->dma_current & 0xfe000000U) == 0x08000000U) {
                 fprintf(stderr, "WDPN va=%08x rwret=%d tpa=%08x\n",
                         (unsigned)va, rr,
@@ -359,14 +420,34 @@ static void sgi_wd_dma_write(void *opaque, uint8_t *buf, int len)
         }
         if (!ok) {
             MemTxResult result;
-            hwaddr pa = sgi_wd_pa(state->dma_current);
+            hwaddr pa;
+
+            /*
+             * The debug translation missed (kernel TLB entry loaded under
+             * another ASID).  Translate through the kernel's actual soft-TLB
+             * mapping, matching the VPN regardless of ASID, so the byte
+             * lands on the physical page the kernel's own faulted-in
+             * mapping reads.  Identity stays only as the last resort.
+             */
+            if (cs) {
+                hwaddr tpa = mips_cpu_get_phys_page_any_asid(
+                    cs, sgi_wd_dma_address(state, state->dma_current));
+
+                if (tpa != (hwaddr)-1) {
+                    pa = tpa;
+                } else {
+                    pa = sgi_wd_pa(state->dma_current);
+                }
+            } else {
+                pa = sgi_wd_pa(state->dma_current);
+            }
             if (state->dma_control & 0x02) {
                 pa ^= 3;
             }
             address_space_stb(&address_space_memory, pa, v,
                               MEMTXATTRS_UNSPECIFIED, &result);
             /* Board trace: guest data-in byte fell back to physical write */
-            if (sgi_wd_trace_enabled()) {
+            if (sgi_wd_trace_enabled() && sgi_wd_trace_wanted(7, 0)) {
                 fprintf(stderr, "WDW-FB va=%08x pa=%08x\n",
                         (unsigned)state->dma_current, (unsigned)pa);
             }
@@ -487,7 +568,24 @@ static void sgi_wd_patch_byte(SGIWD33C93State *state, uint32_t va, uint8_t v)
         return;
     }
     MemTxResult r;
-    hwaddr pa = sgi_wd_pa(va);
+    hwaddr pa;
+
+    /*
+     * Same as the DMA data paths: the debug translation missed, so use the
+     * kernel's actual soft-TLB mapping (VPN match, any ASID) and keep
+     * identity only as the last resort.
+     */
+    if (cs) {
+        hwaddr tpa = mips_cpu_get_phys_page_any_asid(cs, a);
+
+        if (tpa != (hwaddr)-1) {
+            pa = tpa;
+        } else {
+            pa = sgi_wd_pa(va);
+        }
+    } else {
+        pa = sgi_wd_pa(va);
+    }
     if (state->dma_control & 0x02) {
         pa ^= 3;
     }
@@ -741,6 +839,23 @@ static void sgi_wd_update_status(SGIWD33C93State *state)
                     fprintf(stderr, "\n");
                 }
                 if (sgi_wd_trace_enabled()) {
+                    /*
+                     * DIAG: the INQ-DONE read-back above returns 0xee
+                     * (cpu_memory_rw_debug missed).  Dump the soft-TLB
+                     * entries matching the patch VA plus the current
+                     * ASID (implemented in target/mips/system/physaddr.c),
+                     * so the next traced run shows whether the kernel
+                     * maps the buffer non-identity (data lands on the
+                     * wrong page) and whether an ASID mismatch hides the
+                     * mapping from the debug translation.
+                     */
+                    CPUState *cs = qemu_get_cpu(0);
+
+                    if (cs) {
+                        mips_dump_tlb_match(cs, state->inq_patch_va);
+                    }
+                }
+                if (sgi_wd_trace_enabled()) {
                     {
                         hwaddr pbase = sgi_wd_pa(state->inq_patch_va);
                         uint8_t pb[64];
@@ -833,7 +948,7 @@ static uint64_t sgi_wd_read(void *opaque, hwaddr addr, unsigned size)
         } else {
             aux = state->auxiliary_status;
         }
-        if (sgi_wd_trace_enabled()) {
+        if (sgi_wd_trace_enabled() && sgi_wd_trace_wanted(0, 0x1f)) {
             fprintf(stderr, "WD33 REG R addr=1f val=%02x\n", aux);
         }
         return aux;
@@ -841,7 +956,7 @@ static uint64_t sgi_wd_read(void *opaque, hwaddr addr, unsigned size)
     if ((addr & 0xff) != 7) {
         return 0;
     }
-    if (sgi_wd_trace_enabled()) {
+    if (sgi_wd_trace_enabled() && sgi_wd_trace_wanted(1, state->register_select)) {
         fprintf(stderr, "WD33 REG R addr=%02x\n", state->register_select & 0x1f);
     }
     switch (state->register_select & 0x1f) {
@@ -920,7 +1035,7 @@ static uint64_t sgi_wd_read(void *opaque, hwaddr addr, unsigned size)
             }
             sgi_wd_update_status(state);
             state->register_select = 0x18;
-            if (sgi_wd_trace_enabled()) {
+            if (sgi_wd_trace_enabled() && sgi_wd_trace_wanted(2, 0x17)) {
                 fprintf(stderr, "WD33 REG R addr=17 val=%02x\n", status);
             }
             return status;
@@ -1020,14 +1135,14 @@ static void sgi_wd_write(void *opaque, hwaddr addr, uint64_t value,
     SGIWD33C93State *state = opaque;
 
     if ((addr & 0xff) == 3) {
-        if (sgi_wd_trace_enabled()) {
+        if (sgi_wd_trace_enabled() && sgi_wd_trace_wanted(3, value)) {
             fprintf(stderr, "WD33 ADDR W %02x\n", (unsigned)(value & 0xff));
         }
         state->register_select = value & 0xff;
     } else if ((addr & 0xff) == 7) {
         uint8_t reg = state->register_select & 0x1f;
 
-        if (sgi_wd_trace_enabled()) {
+        if (sgi_wd_trace_enabled() && sgi_wd_trace_wanted(4, reg)) {
             fprintf(stderr, "WD33 REG W addr=%02x data=%02x\n",
                     reg, (unsigned)(value & 0xff));
         }

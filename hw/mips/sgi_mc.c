@@ -458,11 +458,30 @@ static uint64_t sgi_mc_read_inner(void *opaque, hwaddr addr, unsigned size)
     }
 }
 
+/*
+ * MC tracing, capped per offset like the PIO dispatch traces: the kernel
+ * polls MC registers during bring-up, so an uncapped trace floods and its
+ * I/O load slows the vCPU enough to change guest-visible timing.
+ */
+#define SGI_MC_TRACE_PER_OFFSET 2000
+static unsigned sgi_mc_trace_count[4096];
+
+static bool sgi_mc_trace_wanted(hwaddr addr)
+{
+    unsigned idx = addr & 0xfff;
+
+    if (sgi_mc_trace_count[idx] >= SGI_MC_TRACE_PER_OFFSET) {
+        return false;
+    }
+    sgi_mc_trace_count[idx]++;
+    return true;
+}
+
 static uint64_t sgi_mc_read(void *opaque, hwaddr addr, unsigned size)
 {
     uint64_t val = sgi_mc_read_inner(opaque, addr, size);
 
-    if (sgi_ip22_trace_enabled()) {
+    if (sgi_ip22_trace_enabled() && sgi_mc_trace_wanted(addr)) {
         fprintf(stderr, "MC-R off=%04x sz=%u val=%016llx\n",
                 (unsigned)addr, size, (unsigned long long)val);
     }
@@ -616,7 +635,7 @@ static void sgi_mc_write_inner(void *opaque, hwaddr addr,
 static void sgi_mc_write(void *opaque, hwaddr addr,
                          uint64_t val, unsigned size)
 {
-    if (sgi_ip22_trace_enabled()) {
+    if (sgi_ip22_trace_enabled() && sgi_mc_trace_wanted(addr)) {
         fprintf(stderr, "MC-W off=%04x sz=%u val=%016llx\n",
                 (unsigned)addr, size, (unsigned long long)val);
     }

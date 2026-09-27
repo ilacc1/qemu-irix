@@ -687,20 +687,21 @@ static uint64_t sgi_hpc3_pio8_read(SgiHpc3State *state, unsigned offset)
 }
 
 /*
- * Channel 8 read tracing. The kernel polls these registers in tight wait
- * loops, so cap the number of traces per offset instead of the channel as
- * a whole: a polled offset still shows its loop and rate, while the trace
- * stays bounded and keeps logging through to the stall.
+ * PIO dispatch tracing. The kernel polls PIO registers in tight wait
+ * loops (e.g. the early boot keyboard-status poll hits one offset
+ * 400k+ times), so cap the traces per (channel, offset) pair: a polled
+ * offset still shows its loop and rate, while the trace stays bounded
+ * and keeps logging distinct accesses through to the stall.
  */
-#define SGI_PIO8_TRACE_PER_OFFSET 2000
-static unsigned sgi_pio8_trace_count[256];
+#define SGI_PIO_TRACE_PER_ACCESS 2000
+static unsigned sgi_pio_trace_count[16][256];
 
-static bool sgi_pio8_trace_wanted(unsigned offset)
+static bool sgi_pio_trace_wanted(unsigned channel, unsigned offset)
 {
-    if (sgi_pio8_trace_count[offset] >= SGI_PIO8_TRACE_PER_OFFSET) {
+    if (sgi_pio_trace_count[channel][offset] >= SGI_PIO_TRACE_PER_ACCESS) {
         return false;
     }
-    sgi_pio8_trace_count[offset]++;
+    sgi_pio_trace_count[channel][offset]++;
     return true;
 }
 
@@ -711,15 +712,9 @@ static uint64_t sgi_hpc3_pio_read(void *opaque, hwaddr addr, unsigned size)
     unsigned offset = addr & 0xff;
     uint64_t rv;
 
-    if (sgi_ip22_trace_enabled() &&
-        (channel != 8 || sgi_pio8_trace_wanted(offset))) {
+    if (sgi_ip22_trace_enabled() && sgi_pio_trace_wanted(channel, offset)) {
         fprintf(stderr, "PIO-DISP-R ch=%u off=%02x\n", channel, offset);
     }
-    if (channel >= 10) {
-        channel = (channel & 1) ? 9 : 8;
-    }
-
-    /* Channel 6 (IOC2) is owned by the sgi-ioc2 device and the ESCC. */
     if (channel >= 10) {
         channel = (channel & 1) ? 9 : 8;
     }
@@ -762,7 +757,7 @@ static void sgi_hpc3_pio_write(void *opaque, hwaddr addr, uint64_t val,
     unsigned channel = (addr >> 8) & 15;
     unsigned offset = addr & 0xff;
 
-    if (sgi_ip22_trace_enabled()) {
+    if (sgi_ip22_trace_enabled() && sgi_pio_trace_wanted(channel, offset)) {
         fprintf(stderr, "PIO-DISP-W ch=%u off=%02x val=%x\n",
                 channel, offset, (unsigned)val);
     }

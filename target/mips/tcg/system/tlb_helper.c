@@ -443,6 +443,78 @@ static int r4k_map_address(CPUMIPSState *env, hwaddr *physical, int *prot,
     return TLBRET_NOMATCH;
 }
 
+/*
+ * Local-experiment diagnostic for the WD33C93 DMA fallback: dump every
+ * soft-TLB entry whose VPN matches addr (the r4k_map_address match test
+ * above, ignoring ASID so entries hidden from the debug translation by an
+ * ASID mismatch still show), with PFNs, plus the current ASID.  Used to
+ * find where the kernel really maps a DMA buffer when
+ * cpu_memory_rw_debug misses and the identity fallback writes the wrong
+ * physical page.
+ */
+/*
+ * Local-experiment helper for the WD33C93/HPC3 DMA paths: translate addr
+ * through the soft-TLB matching the VPN but IGNORING ASID, returning the
+ * physical address the kernel's own (faulted-in) mapping uses, or -1.
+ * Rationale: cpu_memory_rw_debug only sees entries matching the CURRENT
+ * ASID, so kernel-context DMA buffers loaded under another ASID miss and
+ * the old identity fallback wrote the wrong physical page (IRIX driver
+ * attach then read garbage and boot stalled at the blue screen).
+ */
+hwaddr mips_cpu_get_phys_page_any_asid(CPUState *cs, vaddr addr)
+{
+    CPUMIPSState *env = cpu_env(cs);
+    target_ulong iaddr = (target_ulong)addr;
+    int i;
+
+    for (i = 0; i < env->tlb->tlb_in_use; i++) {
+        r4k_tlb_t *e = &env->tlb->mmu.r4k.tlb[i];
+        target_ulong mask = e->PageMask | ~(TARGET_PAGE_MASK << 1);
+        target_ulong tag = iaddr & ~mask;
+        target_ulong vpn = e->VPN & ~mask;
+
+        tag &= env->SEGMask;
+        if (vpn == tag && !e->EHINV) {
+            int n = !!(iaddr & mask & ~(mask >> 1));
+
+            if (!(n ? e->V1 : e->V0)) {
+                return -1;
+            }
+            return e->PFN[n] | (iaddr & (mask >> 1));
+        }
+    }
+    return -1;
+}
+
+void mips_dump_tlb_match(CPUState *cs, vaddr addr)
+{
+    CPUMIPSState *env = cpu_env(cs);
+    uint16_t cur_asid = env->CP0_EntryHi & env->CP0_EntryHi_ASID_mask;
+    target_ulong iaddr = (target_ulong)addr;
+    int i;
+
+    fprintf(stderr, "INQ-TLB cur_asid=%u nb=%u in_use=%u:",
+            cur_asid, env->tlb->nb_tlb, env->tlb->tlb_in_use);
+    for (i = 0; i < env->tlb->tlb_in_use; i++) {
+        r4k_tlb_t *e = &env->tlb->mmu.r4k.tlb[i];
+        target_ulong mask = e->PageMask | ~(TARGET_PAGE_MASK << 1);
+        target_ulong tag = iaddr & ~mask;
+        target_ulong vpn = e->VPN & ~mask;
+
+        tag &= env->SEGMask;
+        if (vpn == tag && !e->EHINV) {
+            fprintf(stderr,
+                    " [%d]vpn=%llx pm=%x asid=%u g=%u v=%u%u"
+                    " pfn=%llx/%llx",
+                    i, (unsigned long long)vpn, e->PageMask, e->ASID, e->G,
+                    e->V0, e->V1,
+                    (unsigned long long)e->PFN[0],
+                    (unsigned long long)e->PFN[1]);
+        }
+    }
+    fprintf(stderr, "\n");
+}
+
 static void no_mmu_init(CPUMIPSState *env, const mips_def_t *def)
 {
     env->tlb->nb_tlb = 1;
