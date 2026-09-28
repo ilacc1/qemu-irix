@@ -226,10 +226,13 @@ static hwaddr sgi_wd_pa(hwaddr addr)
 
 static uint32_t sgi_wd_dma_read32(hwaddr addr)
 {
-    /* Descriptors/data are guest virtual (KSEG0/1 plus TLB-mapped KUSEG);
-     * read via the CPU MMU, falling back to direct for early boot. */
+    /* Descriptors/data below 0x80000000 are already physical (MC bank
+     * aliases, exactly like MAME's raw AS_PROGRAM dispatch): use them
+     * directly so DMA can never depend on TLB/ASID state.  KSEG
+     * addresses go through the CPU translation (debug, then any-ASID
+     * soft-TLB) with SegCtl masking as the last resort. */
     CPUState *cs = qemu_get_cpu(0);
-    if (cs) {
+    if (cs && addr >= 0x80000000U) {
         uint8_t b[4];
         if (cpu_memory_rw_debug(cs, (vaddr)addr, b, sizeof(b), 0) == 0) {
             return ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) |
@@ -240,14 +243,7 @@ static uint32_t sgi_wd_dma_read32(hwaddr addr)
     uint32_t value = 0;
     hwaddr pa;
 
-    /*
-     * The debug translation missed (kernel TLB entry loaded under another
-     * ASID).  Translate through the kernel's actual soft-TLB mapping, VPN
-     * match regardless of ASID, so the descriptor dword is read from the
-     * physical page the kernel's own faulted-in mapping reads; identity
-     * stays only as the last resort for genuinely unmapped early boot.
-     */
-    if (cs) {
+    if (cs && addr >= 0x80000000U) {
         hwaddr tpa = mips_cpu_get_phys_page_any_asid(cs, addr);
 
         if (tpa != (hwaddr)-1) {
@@ -351,7 +347,7 @@ static void sgi_wd_dma_read(void *opaque, uint8_t *buf, int len)
     while (len > 0 && sgi_wd_dma_next(state)) {
         uint8_t v = 0;
         bool ok = false;
-        if (cs) {
+        if (cs && state->dma_current >= 0x80000000U) {
             hwaddr va = sgi_wd_dma_address(state, state->dma_current);
             if (cpu_memory_rw_debug(cs, (vaddr)va, &v, 1, 0) == 0) {
                 ok = true;
@@ -362,11 +358,10 @@ static void sgi_wd_dma_read(void *opaque, uint8_t *buf, int len)
             hwaddr pa;
 
             /*
-             * Same as the write path: the debug translation missed, so use
-             * the kernel's actual soft-TLB mapping (VPN match, any ASID)
-             * and keep identity only as the last resort.
+             * Same as the descriptor fetch: below 0x80000000 the address
+             * is already physical; only KSEG consults the CPU translation.
              */
-            if (cs) {
+            if (cs && state->dma_current >= 0x80000000U) {
                 hwaddr tpa = mips_cpu_get_phys_page_any_asid(
                     cs, sgi_wd_dma_address(state, state->dma_current));
 
@@ -405,7 +400,7 @@ static void sgi_wd_dma_write(void *opaque, uint8_t *buf, int len)
     while (len > 0 && sgi_wd_dma_next(state)) {
         uint8_t v = *buf++;
         bool ok = false;
-        if (cs) {
+        if (cs && state->dma_current >= 0x80000000U) {
             hwaddr va = sgi_wd_dma_address(state, state->dma_current);
             int rr = cpu_memory_rw_debug(cs, (vaddr)va, &v, 1, 1);
             if (rr == 0) {
@@ -423,13 +418,12 @@ static void sgi_wd_dma_write(void *opaque, uint8_t *buf, int len)
             hwaddr pa;
 
             /*
-             * The debug translation missed (kernel TLB entry loaded under
-             * another ASID).  Translate through the kernel's actual soft-TLB
-             * mapping, matching the VPN regardless of ASID, so the byte
-             * lands on the physical page the kernel's own faulted-in
-             * mapping reads.  Identity stays only as the last resort.
+             * Below 0x80000000 the address is already physical (MAME
+             * raw-space semantics): use it directly so DMA can never
+             * depend on TLB/ASID state.  Only KSEG consults the CPU
+             * translation first.
              */
-            if (cs) {
+            if (cs && state->dma_current >= 0x80000000U) {
                 hwaddr tpa = mips_cpu_get_phys_page_any_asid(
                     cs, sgi_wd_dma_address(state, state->dma_current));
 
@@ -564,18 +558,15 @@ static void sgi_wd_patch_byte(SGIWD33C93State *state, uint32_t va, uint8_t v)
 {
     CPUState *cs = qemu_get_cpu(0);
     hwaddr a = sgi_wd_dma_address(state, va);
-    if (cs && cpu_memory_rw_debug(cs, (vaddr)a, &v, 1, 1) == 0) {
+    if (cs && va >= 0x80000000U &&
+        cpu_memory_rw_debug(cs, (vaddr)a, &v, 1, 1) == 0) {
         return;
     }
     MemTxResult r;
     hwaddr pa;
 
-    /*
-     * Same as the DMA data paths: the debug translation missed, so use the
-     * kernel's actual soft-TLB mapping (VPN match, any ASID) and keep
-     * identity only as the last resort.
-     */
-    if (cs) {
+    /* Same split as the DMA data paths: physical below 0x80000000. */
+    if (cs && va >= 0x80000000U) {
         hwaddr tpa = mips_cpu_get_phys_page_any_asid(cs, a);
 
         if (tpa != (hwaddr)-1) {
