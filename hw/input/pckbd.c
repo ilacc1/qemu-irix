@@ -479,6 +479,11 @@ static void kbd_reset(void *opaque)
     s->outport = KBD_OUT_RESET | KBD_OUT_A20 | KBD_OUT_ONES;
     s->pending = 0;
     kbd_deassert_irq(s);
+    if (s->keyboard_bat) {
+        /* Attached keyboard BAT (power-on self-test OK), like MAME's
+         * always-present virtual keyboard and real HW. */
+        kbd_queue(s, 0xAA, 0);
+    }
     if (s->throttle_timer) {
         timer_del(s->throttle_timer);
     }
@@ -738,6 +743,7 @@ static void i8042_mmio_init(Object *obj)
 static const Property i8042_mmio_properties[] = {
     DEFINE_PROP_UINT64("mask", MMIOKBDState, kbd.mask, UINT64_MAX),
     DEFINE_PROP_UINT32("size", MMIOKBDState, size, -1),
+    DEFINE_PROP_BOOL("keyboard-bat", MMIOKBDState, kbd.keyboard_bat, false),
 };
 
 static const VMStateDescription vmstate_kbd_mmio = {

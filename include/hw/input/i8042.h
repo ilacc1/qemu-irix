@@ -38,6 +38,13 @@ typedef struct KBDState {
     qemu_irq irqs[2];
     qemu_irq a20_out;
     hwaddr mask;
+    /*
+     * MAME/real HW have a keyboard physically attached, which sends a
+     * BAT byte (0xAA) on power-on. QEMU leaves this false (no keyboard
+     * traffic unless host input arrives); boards with a built-in
+     * keyboard set it so presence detection sees BAT like real HW.
+     */
+    bool keyboard_bat;
 } KBDState;
 
 /*

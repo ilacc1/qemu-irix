@@ -35,6 +35,16 @@ struct SgiHpc3State {
     MemoryRegion eeprom_iomem;
     CharFrontend console;
     uint8_t pio0_data[0x100];
+    /* MAME pio1_map is plain RAM (PROM scratch zeros + readback). */
+    uint8_t pio1_data[0x100];
+    /*
+     * PIO8 backing store for non-shim offsets (FullHouse lcl bytes at
+     * 0x87/0x8F/0x97/0x9B, POST scratch). MAME leaves PIO8 unmapped
+     * (all-ones), but QEMU's PROM runs POST (which MAME skips), so the
+     * a5/5a readback must pass to avoid its 4070 halt loop; unobserved
+     * by MAME either way.
+     */
+    uint8_t pio8_data[0x100];
     uint8_t pio8_latch33;
     uint8_t pio8_rx_fifo[256];
     unsigned pio8_rx_head;
@@ -624,8 +634,10 @@ static uint64_t sgi_hpc3_pio8_read(SgiHpc3State *state, unsigned offset)
                        state->pio8_latch33 == 0x01 ? 0x01 : 0x00);
     }
     if (offset == 0x43) {
-        /* Kbd/mouse data: queued bytes first, then serial RX, else 0xaa
-         * (idle, never a key). Dequeue order keeps the AUX bit accurate. */
+        /* Kbd/mouse data: queued bytes (BAT at reset, then host input)
+         * first, then serial RX, else 0x00 (empty: MAME unmapped reads
+         * 0, and 0xaa-idle would look like a phantom keypress aborting
+         * the PROM countdown to menu). Dequeue order keeps AUX bit. */
         bool aux = false;
         int byte = sgi_hpc3_out_dequeue(state, &aux);
 
@@ -640,7 +652,7 @@ static uint64_t sgi_hpc3_pio8_read(SgiHpc3State *state, unsigned offset)
             state->pio8_rx_count--;
             return c;
         }
-        return 0xaa;
+        return 0x00;
     }
     if (offset == 0x47) {
         /* Kbd/mouse status: bit 0 = byte waits on 0x43, bit 5 = head byte
@@ -677,13 +689,17 @@ static uint64_t sgi_hpc3_pio8_read(SgiHpc3State *state, unsigned offset)
         return 0xff;
     }
     if (offset == 0x58) {
-        /* Early-boot peek at the head byte without dequeuing; 0 when idle. */
-        if (state->out_count > 0) {
-            return (uint64_t)(state->out_data[state->out_head] & 0xff);
-        }
-        return 0;
+        /*
+         * Board ID: MAME leaves PIO8 unmapped (all-ones). That sets
+         * is_fullhouse=1, takes the DA4/PIO0-window PROM path, and
+         * (critically) yields class-6 IOC eminors from ubusmap so the
+         * kernel maps PIO6 (kbdc/Local0 programming at t=12.5s). The
+         * DA4 serial-config caller loop needs PIO0 status cooperation
+         * too (see the 0x3b hard-0 note); both halves are required.
+         */
+        return 0xff;
     }
-    return 0;
+    return state->pio8_data[offset];
 }
 
 /*
@@ -728,8 +744,27 @@ static uint64_t sgi_hpc3_pio_read(void *opaque, hwaddr addr, unsigned size)
         return rv;
     }
     if (channel == 0) {
+        if (offset == 0x08 || offset == 0x20) {
+            /*
+             * MAME hal2.cpp REVISION_REG (0x4010): the PROM's HAL2
+             * probe lands on byte-offset 0x20 in this window
+             * (empirical MAME-off x4 mapping, value-matched on the
+             * 0x18/0x10a/0x1304 init sequence); 0x08 kept for the
+             * direct-mapped view. 0 makes the PROM skip all PIO6/IOC2
+             * probing (wrong ARCS inventory, kernel never programs
+             * Local masks -> SCSI stall).
+             */
+            return 0x4010;
+        }
         if (offset == 0x3b) {
-            return 0;
+            /*
+             * Serial-console status (PROM 0x31490 autobaud/configure):
+             * bit 5 = TX ready so its transmit/wait loops proceed
+             * instead of polling forever on an unresponsive status.
+             * MAME never executes that code (graphics console skips
+             * it), so this is outcome-parity (proceed, no wait).
+             */
+            return 0x20;
         }
         if (offset == 0x0b) {
             /* Kbd/mouse status mirror: bit 0 = keyboard byte waits,
@@ -746,6 +781,9 @@ static uint64_t sgi_hpc3_pio_read(void *opaque, hwaddr addr, unsigned size)
         }
         rv = state->pio0_data[offset];
         return rv;
+    }
+    if (channel == 1) {
+        return state->pio1_data[offset];
     }
     return 0;
 }
@@ -786,11 +824,26 @@ static void sgi_hpc3_pio_write(void *opaque, hwaddr addr, uint64_t val,
         } else if (offset == 0x50) {
             /* Early-boot window; ignored so no phantom keypress results. */
             (void)val;
+        } else if (offset == 0xbb || offset == 0xbf) {
+            /*
+             * PIO8 serial-config status (PROM 0x31490 autobaud measure):
+             * must read back 0 so the combined measurement stays below
+             * its 10000 retry threshold; stored nonzeros (e.g. 39 give
+             * 0x2727) retry forever. MAME never executes this code, so
+             * this is outcome-parity (proceed) rather than value-parity.
+             */
+            (void)val;
+        } else {
+            state->pio8_data[offset] = val;
         }
         return;
     }
     if (channel == 0) {
         state->pio0_data[offset] = val;
+        return;
+    }
+    if (channel == 1) {
+        state->pio1_data[offset] = val;
         return;
     }
 }
@@ -808,13 +861,15 @@ static uint8_t sgi_hpc3_bcd(unsigned value)
     return (value / 10) * 16 + value % 10;
 }
 
+static uint64_t sgi_hpc3_bbram_reg(SgiHpc3State *state, struct tm *current,
+                                   hwaddr reg);
+
 static uint64_t sgi_hpc3_bbram_read(void *opaque, hwaddr addr, unsigned size)
 {
     SgiHpc3State *state = SGI_HPC3(opaque);
     uint64_t clock_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
     time_t now;
     struct tm current;
-    hwaddr reg = size == 4 ? addr >> 2 : addr;
 
     if (!state->bbram_clock_base_ns) {
         state->bbram_clock_base_ns = clock_ns;
@@ -825,26 +880,44 @@ static uint64_t sgi_hpc3_bbram_read(void *opaque, hwaddr addr, unsigned size)
     localtime_r(&now, &current);
     /* MAME ds1386.h REGISTER_*: 0-0x0d clock/alarms/command/watchdog,
      * 0x0e+ user NVRAM; DS1286 is 64 bytes, DS1386_8K is 8KiB (MAME
-     * ds1386.cpp data_r falls back to RAM below m_ram_size). */
+     * ds1386.cpp data_r falls back to RAM below m_ram_size).
+     * NOTE (correctness debt): multi-byte accesses should assemble
+     * consecutive registers BE, but the BE-correct form makes the PROM's
+     * RTC-tick calibration wait an hour (it reads the hours word and
+     * waits for change) while MAME-form (and old QEMU single-lane)
+     * returns fast-ticking seconds and calibrates in ~1s. MAME itself
+     * never runs that calibration (graphics console skips it); until
+     * the console-select gate is MAME-faithful, keep the fast form so
+     * boot proceeds. Revisit post-boot (NVRAM env reads want BE). */
+    if (size == 1) {
+        return sgi_hpc3_bbram_reg(state, &current, addr);
+    } else {
+        return sgi_hpc3_bbram_reg(state, &current, addr >> 2);
+    }
+}
+
+static uint64_t sgi_hpc3_bbram_reg(SgiHpc3State *state, struct tm *current,
+                                   hwaddr reg)
+{
     if (reg >= state->bbram_size) {
         return 0;
     }
     switch (reg) {
     case 0x00:
         return sgi_hpc3_bcd((g_get_real_time() / 10000) % 100);    case 0x01:
-        return sgi_hpc3_bcd(current.tm_sec);
+        return sgi_hpc3_bcd(current->tm_sec);
     case 0x02:
-        return sgi_hpc3_bcd(current.tm_min);
+        return sgi_hpc3_bcd(current->tm_min);
     case 0x04:
-        return sgi_hpc3_bcd(current.tm_hour);
+        return sgi_hpc3_bcd(current->tm_hour);
     case 0x06:
-        return sgi_hpc3_bcd(current.tm_wday + 1);
+        return sgi_hpc3_bcd(current->tm_wday + 1);
     case 0x08:
-        return sgi_hpc3_bcd(current.tm_mday);
+        return sgi_hpc3_bcd(current->tm_mday);
     case 0x09:
-        return sgi_hpc3_bcd(current.tm_mon + 1);
+        return sgi_hpc3_bcd(current->tm_mon + 1);
     case 0x0a:
-        return sgi_hpc3_bcd(current.tm_year % 100);
+        return sgi_hpc3_bcd(current->tm_year % 100);
     default:
         /* Alarms/command/watchdog/user: stored RAM, not live time. */
         return state->bbram[reg];
@@ -855,13 +928,17 @@ static void sgi_hpc3_bbram_write(void *opaque, hwaddr addr,
                                   uint64_t val, unsigned size)
 {
     SgiHpc3State *state = SGI_HPC3(opaque);
-    hwaddr reg = size == 4 ? addr >> 2 : addr;
+    unsigned i;
 
-    /* MAME ds1386.cpp data_w: ignore accesses beyond the BBRAM size. */
-    if (reg >= state->bbram_size) {
-        return;
+    /* MAME ds1386.cpp data_w: byte granular, ignore lanes beyond size. */
+    for (i = 0; i < size; i++) {
+        hwaddr reg = addr + i;
+
+        if (reg >= state->bbram_size) {
+            continue;
+        }
+        state->bbram[reg] = (val >> (8 * (size - 1 - i))) & 0xff;
     }
-    state->bbram[reg] = val;
 }
 
 static const MemoryRegionOps sgi_hpc3_bbram_ops = {
@@ -1025,6 +1102,8 @@ static const VMStateDescription vmstate_sgi_hpc3 = {
     .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT8_ARRAY(pio0_data, SgiHpc3State, 0x100),
+        VMSTATE_UINT8_ARRAY(pio1_data, SgiHpc3State, 0x100),
+        VMSTATE_UINT8_ARRAY(pio8_data, SgiHpc3State, 0x100),
         VMSTATE_UINT8(pio8_latch33, SgiHpc3State),
         VMSTATE_UINT8_ARRAY(pio8_rx_fifo, SgiHpc3State, 256),
         VMSTATE_UINT32(pio8_rx_head, SgiHpc3State),
@@ -1083,12 +1162,20 @@ static void sgi_hpc3_reset(DeviceState *device)
     state->mouse_sample_rate = 100;
     state->last_kbd_resp = 0;
     state->last_aux_resp = 0;
-    state->mouse_x = 0;
-    state->mouse_y = 0;
+    state->mouse_x = 0;    state->mouse_y = 0;
     state->mouse_have_pos = false;
     state->mouse_div_rem_x = 0;
     state->mouse_div_rem_y = 0;
     state->mouse_buttons = 0;
+    /*
+     * NOTE: do NOT pre-queue BAT bytes here. A queued BAT keeps the
+     * PIO0+0x0b mirror set, which the PROM menu-input loop waits on
+     * forever (nothing consumes it headless), aborting autoboot to a
+     * stuck menu. MAME's virtual keyboard BAT works there because its
+     * PROM consumes it via PIO6+0x10 polling; QEMU's PROM never touches
+     * PIO6, so a queued byte can only wedge the mirror. Presence will
+     * have to come from the ARCS/keyboard path, not the data queue.
+     */
 }
 
 /* NVRAM seed resolution + write-back, so PROM env survives relaunch. */

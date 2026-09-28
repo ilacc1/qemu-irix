@@ -79,6 +79,10 @@ static void main_cpu_reset(void *opaque)
 
 static uint32_t sgi_hpc3_intstat;
 static uint32_t sgi_hpc3_misc;
+/* MAME hpc3 dma_complete_int_cb: PBUS/SCSI descriptor-done (bit 29)
+ * asserts IOC2 Local1 0x10; the line drops when no intstat bits remain.
+ * Fed through the dma_or gate below alongside the WD dma-done lines. */
+static qemu_irq sgi_hpc3_pbus_done_irq;
 
 typedef struct SgiHpc3EthernetDma {
     uint32_t cbp;
@@ -171,6 +175,8 @@ static void sgi_hpc3_pbus_tick(void *opaque)
     if (!dma->bytes_left) {
         if (dma->flags & 0x20000000) {
             sgi_hpc3_intstat |= 1U << channel;
+            /* MAME do_pbus_dma: bit 29 raises dma_complete (Local1). */
+            qemu_set_irq(sgi_hpc3_pbus_done_irq, 1);
         }
         if (dma->flags & 0x80000000) {
             dma->control &= ~0x10U;
@@ -229,9 +235,23 @@ static uint64_t sgi_hpc3_pbus_dma_read(void *opaque, hwaddr addr,
             return dma->current;
         case 0x0004:
             return dma->descriptor;
-        case 0x1000:
-            return (dma->timer && timer_pending(dma->timer) ? 2 : 0) |
-                   ((sgi_hpc3_intstat >> channel) & 1);
+        case 0x1000: {
+            /*
+             * MAME pbusdma_r control: bit 0 while the channel's intstat
+             * bit is set, bit 1 while the timer runs; reading clears the
+             * intstat bit, and dma_complete drops when no bits remain
+             * (here: deassert this channel's OR input; the gate ORs all
+             * sources exactly like MAME's intstat!=0 level).
+             */
+            uint64_t rv = (dma->timer && timer_pending(dma->timer) ? 2 : 0) |
+                          ((sgi_hpc3_intstat >> channel) & 1);
+
+            if ((sgi_hpc3_intstat >> channel) & 1) {
+                sgi_hpc3_intstat &= ~(1U << channel);
+                qemu_set_irq(sgi_hpc3_pbus_done_irq, 0);
+            }
+            return rv;
+        }
         default:
             break;
         }
@@ -833,6 +853,9 @@ static void mips_sgi_indigo2_init(MachineState *machine)
     MemoryRegion *i8042_alias = g_new(MemoryRegion, 1);
     MemoryRegion *i8042_data_alias = g_new(MemoryRegion, 1);
     MemoryRegion *i8042_status_alias = g_new(MemoryRegion, 1);
+    MemoryRegion *i8042_pio6_data_alias = g_new(MemoryRegion, 1);
+    MemoryRegion *i8042_pio6_status_alias = g_new(MemoryRegion, 1);
+    MemoryRegion *scc_pio6_alias[4];
     MemoryRegion *ioc2_base_alias = g_new(MemoryRegion, 1);
     NICInfo *nd;
     DeviceState *rc4030;
@@ -884,6 +907,8 @@ static void mips_sgi_indigo2_init(MachineState *machine)
     dev = qdev_new(TYPE_SGI_MC);
     object_property_set_link(OBJECT(dev), "ram", OBJECT(machine->ram),
                              &error_fatal);
+    /* Indy (IP24) has no EISA; reprograms MC System ID bit 4 (MAME mc). */
+    qdev_prop_set_bit(dev, "eisa-present", !is_indy);
     sysbus = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(sysbus, &error_fatal);
     mcdev = dev;
@@ -958,7 +983,8 @@ static void mips_sgi_indigo2_init(MachineState *machine)
     sgi_ioc2_enet_hpc_irq = qdev_get_gpio_in(DEVICE(dev), 3);
     ioc2dev = dev;
     /* MAME indy_indigo2.cpp:318: MEMCTL DMA-done to IOC2 local0 0x10. */
-    qdev_connect_gpio_out(mcdev, 0, qdev_get_gpio_in(ioc2dev, 10));
+    qdev_connect_gpio_out(mcdev, 0,
+                            qdev_get_gpio_in(ioc2dev, SGI_IOC2_IN_MC_DMA));
     /* Single GIO64 owner (MAME gio64_device); rc4030 MMIO must not shadow it. */
     dev = qdev_new("sgi-gio64");
     sysbus = SYS_BUS_DEVICE(dev);
@@ -1059,7 +1085,7 @@ static void mips_sgi_indigo2_init(MachineState *machine)
     /* MAME indy_indigo2.cpp:359: HPC3 DMA-done to IOC2 local1 0x10. */
     {
         DeviceState *dma_or = qdev_new(TYPE_OR_IRQ);
-        qdev_prop_set_uint16(dma_or, "num-lines", 2);
+        qdev_prop_set_uint16(dma_or, "num-lines", 3);
         qdev_realize_and_unref(dma_or, NULL, &error_fatal);
         qdev_connect_gpio_out_named(DEVICE(sgi_wd33c93[0]), "dma-done", 0,
                                     qdev_get_gpio_in(dma_or, 0));
@@ -1067,6 +1093,9 @@ static void mips_sgi_indigo2_init(MachineState *machine)
             qdev_connect_gpio_out_named(DEVICE(sgi_wd33c93[1]), "dma-done", 0,
                                         qdev_get_gpio_in(dma_or, 1));
         }
+        /* PBUS (audio) descriptor-done joins the same dma_complete level
+         * (MAME do_pbus_dma bit 29); the OR reproduces intstat!=0. */
+        sgi_hpc3_pbus_done_irq = qdev_get_gpio_in(dma_or, 2);
         qdev_connect_gpio_out(dma_or, 0, qdev_get_gpio_in(ioc2dev, 9));
     }
 
@@ -1116,6 +1145,12 @@ static void mips_sgi_indigo2_init(MachineState *machine)
     i8042 = I8042_MMIO(qdev_new(TYPE_I8042_MMIO));
     qdev_prop_set_uint64(DEVICE(i8042), "mask", 1);
     qdev_prop_set_uint32(DEVICE(i8042), "size", 0x1000);
+    /*
+     * Indy has a keyboard physically attached (like MAME's always-
+     * present virtual keyboard, KEYBOARD_ON=1): report its power-on
+     * BAT so presence detection sees a keyboard, not an empty port.
+     */
+    qdev_prop_set_bit(DEVICE(i8042), "keyboard-bat", is_indy);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(i8042), &error_fatal);
 
     /* MAME ioc2.cpp kbdc_irq merger: kbd+aux IRQs OR into one line. */
@@ -1143,6 +1178,24 @@ static void mips_sgi_indigo2_init(MachineState *machine)
                                             i8042_data_alias, 1000);
         memory_region_add_subregion_overlap(address_space, SGI_HPC3_BASE + 0x59844,
                                             i8042_status_alias, 1000);
+        /*
+         * MAME pio6_map routes 0x10/0x11 to the keyboard controller
+         * (data/status), shadowing the IOC2 base device there.  Mirror it
+         * with higher priority than the IOC2 alias (30) so the kernel's
+         * keyboard polls reach the real 8042 instead of reading 0.
+         */
+        memory_region_init_alias(i8042_pio6_data_alias, NULL,
+                                 "sgi_ip24.i8042_pio6_data",
+                                 sysbus_mmio_get_region(SYS_BUS_DEVICE(i8042), 0),
+                                 0, 1);
+        memory_region_init_alias(i8042_pio6_status_alias, NULL,
+                                 "sgi_ip24.i8042_pio6_status",
+                                 sysbus_mmio_get_region(SYS_BUS_DEVICE(i8042), 0),
+                                 1, 1);
+        memory_region_add_subregion_overlap(address_space, SGI_HPC3_BASE + 0x58610,
+                                            i8042_pio6_data_alias, 40);
+        memory_region_add_subregion_overlap(address_space, SGI_HPC3_BASE + 0x58611,
+                                            i8042_pio6_status_alias, 40);
     } else {
         memory_region_init_alias(i8042_alias, NULL, "sgi_ip22.i8042_pio6",
                                  sysbus_mmio_get_region(SYS_BUS_DEVICE(i8042), 0),
@@ -1167,6 +1220,29 @@ static void mips_sgi_indigo2_init(MachineState *machine)
                                         (is_indy ? 0x59830 : 0x5860c),
                                         sysbus_mmio_get_region(sysbus, 0), 1000);
     sysbus_connect_irq(sysbus, 0, qdev_get_gpio_in(ioc2dev, 7));
+    if (is_indy) {
+        /*
+         * MAME pio6_map routes 0x0c-0x0f to the Z8530 (B ctrl/data,
+         * A ctrl/data), shadowing the IOC2 base device there. Mirror it
+         * with higher priority than the IOC2 alias (30); with it_shift 2
+         * the ESCC registers sit at bytes 0/4/8/12 of its region.
+         */
+        static const char *const scc_names[4] = {
+            "sgi_ip24.scc_pio6_bctl", "sgi_ip24.scc_pio6_bdat",
+            "sgi_ip24.scc_pio6_actl", "sgi_ip24.scc_pio6_adat",
+        };
+        int i;
+
+        for (i = 0; i < 4; i++) {
+            scc_pio6_alias[i] = g_new(MemoryRegion, 1);
+            memory_region_init_alias(scc_pio6_alias[i], NULL, scc_names[i],
+                                     sysbus_mmio_get_region(sysbus, 0),
+                                     i * 4, 1);
+            memory_region_add_subregion_overlap(address_space,
+                                                SGI_HPC3_BASE + 0x5860c + i,
+                                                scc_pio6_alias[i], 40);
+        }
+    }
 
     nd = qemu_find_nic_info("seeq80c03", true, "seeq80c03");
     if (nd) {

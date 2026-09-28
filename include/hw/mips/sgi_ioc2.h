@@ -17,6 +17,8 @@ enum {
     SGI_IOC2_IN_DUART,
     SGI_IOC2_IN_KBD,
     SGI_IOC2_IN_HPC_DMA,
+    SGI_IOC2_IN_MC_DMA,
+    SGI_IOC2_IN_VIDEO,
 };
 
 /* GPIO outputs: CPU interrupts for local channels 0/1. */

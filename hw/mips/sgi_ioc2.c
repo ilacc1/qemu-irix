@@ -79,13 +79,21 @@ struct SgiIoc2State {
     bool pit_timer_latched[2];
     uint64_t pit_c2_last_ns;
     QEMUTimer *pit_timer;
+    /*
+     * MAME has a single enet_int_w input driving Local0 ETHERNET (0x08);
+     * this board splits it into EDLC (gpio 2) and HPC (gpio 3) lines, so
+     * track both levels and OR them: clearing one must not drop the bit
+     * while the other is still asserted.
+     */
+    bool enet_edlc_level;
+    bool enet_hpc_level;
 };
 
 #define SGI_IOC2(obj) OBJECT_CHECK(SgiIoc2State, (obj), TYPE_SGI_IOC2)
 
 static uint64_t sgi_ioc2_int2_reg_read(SgiIoc2State *state, hwaddr reg);
 static void sgi_ioc2_int2_reg_write(SgiIoc2State *state, hwaddr reg,
-                                    uint64_t val);
+                                     uint64_t val);
 static bool sgi_ioc2_trace_enabled(void);
 
 static void sgi_ioc2_update_irq(SgiIoc2State *state, unsigned channel)
@@ -483,7 +491,12 @@ static void sgi_ioc2_gpio_in(void *opaque, int n, int level)
         break;
     case 2:
     case 3:
-        if (level) {
+        if (n == 2) {
+            state->enet_edlc_level = level != 0;
+        } else {
+            state->enet_hpc_level = level != 0;
+        }
+        if (state->enet_edlc_level || state->enet_hpc_level) {
             sgi_ioc2_raise_local(state, 0, 0x08);
         } else {
             sgi_ioc2_lower_local(state, 0, 0x08);
@@ -529,7 +542,7 @@ static void sgi_ioc2_gpio_in(void *opaque, int n, int level)
             sgi_ioc2_lower_local(state, 1, 0x10);
         }
         break;
-    case 11:
+    case SGI_IOC2_IN_VIDEO:
         /* MAME video_int_w: local1 INT3_LOCAL1_VIDEO (0x40). */
         if (level) {
             sgi_ioc2_raise_local(state, 1, 0x40);
@@ -537,7 +550,7 @@ static void sgi_ioc2_gpio_in(void *opaque, int n, int level)
             sgi_ioc2_lower_local(state, 1, 0x40);
         }
         break;
-    case 10:
+    case SGI_IOC2_IN_MC_DMA:
         /* MAME mc_dma_done_w: MEMCTL DMA-done to local0 0x10. */
         if (level) {
             sgi_ioc2_raise_local(state, 0, 0x10);
@@ -743,6 +756,23 @@ static const MemoryRegionOps sgi_ioc2_int2_ops = {
 
 static uint64_t sgi_ioc2_read(void *opaque, hwaddr addr, unsigned size)
 {
+    SgiIoc2State *state = SGI_IOC2(opaque);
+
+    /*
+     * MAME pio6_map umask16(0x00ff): each 16-bit word exposes only its
+     * low-address byte; upper lanes read 0. Assemble wide reads from
+     * the low lane of each word (FullHouse keeps byte-split behavior).
+     */
+    if (state->guinness && size > 1) {
+        uint64_t rv = 0;
+        unsigned i;
+
+        for (i = 0; i < size; i += 2) {
+            rv |= (sgi_ioc2_read_inner(opaque, addr + i, 1) & 0xff) <<
+                  (8 * i);
+        }
+        return rv;
+    }
     return sgi_ioc2_read_inner(opaque, addr, size);
 }
 
@@ -790,6 +820,19 @@ static void sgi_ioc2_write_inner(void *opaque, hwaddr addr, uint64_t val,
 static void sgi_ioc2_write(void *opaque, hwaddr addr, uint64_t val,
                            unsigned size)
 {
+    SgiIoc2State *state = SGI_IOC2(opaque);
+
+    /* MAME umask16: only the low-address byte of each 16-bit word is
+     * significant; upper lanes are dropped (FullHouse keeps byte-split). */
+    if (state->guinness && size > 1) {
+        unsigned i;
+
+        for (i = 0; i < size; i += 2) {
+            sgi_ioc2_write_inner(opaque, addr + i, (val >> (8 * i)) & 0xff,
+                                 1);
+        }
+        return;
+    }
     sgi_ioc2_write_inner(opaque, addr, val, size);
 }
 
@@ -802,24 +845,24 @@ static const MemoryRegionOps sgi_ioc2_ops = {
 };
 
 /*
- * GUINNESS registers live one byte apart in MAME's PIO6 map, so a wide
- * guest access has to be split into per-byte register accesses instead of
- * being folded into the single register at the access address.
+ * GUINNESS registers are word-laned per MAME's PIO6 umask16(0x00ff): wide
+ * accesses resolve to the low-address byte of each 16-bit word (see
+ * sgi_ioc2_read/write above), so impl must accept the full width.
  */
 static const MemoryRegionOps sgi_ioc2_guinness_ops = {
     .read = sgi_ioc2_read,
     .write = sgi_ioc2_write,
     .endianness = DEVICE_NATIVE_ENDIAN,
     .valid.min_access_size = 1,
-    .valid.max_access_size = 1,
+    .valid.max_access_size = 4,
     .impl.min_access_size = 1,
-    .impl.max_access_size = 1,
+    .impl.max_access_size = 4,
 };
 
 static const VMStateDescription vmstate_sgi_ioc2 = {
     .name = TYPE_SGI_IOC2,
-    .version_id = 5,
-    .minimum_version_id = 5,
+    .version_id = 6,
+    .minimum_version_id = 6,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT8_ARRAY(base_regs, SgiIoc2State, 0x20),
         VMSTATE_UINT8_ARRAY(local_status, SgiIoc2State, 2),
@@ -847,6 +890,8 @@ static const VMStateDescription vmstate_sgi_ioc2 = {
         VMSTATE_BOOL_ARRAY(pit_timer_latched, SgiIoc2State, 2),
         VMSTATE_UINT64(pit_c2_last_ns, SgiIoc2State),
         VMSTATE_BOOL(guinness, SgiIoc2State),
+        VMSTATE_BOOL(enet_edlc_level, SgiIoc2State),
+        VMSTATE_BOOL(enet_hpc_level, SgiIoc2State),
         VMSTATE_END_OF_LIST()
     },
 };
@@ -869,6 +914,8 @@ static void sgi_ioc2_reset(DeviceState *device)
     state->dma_select = 0;
     state->reset = 0;
     state->write = 0;
+    state->enet_edlc_level = false;
+    state->enet_hpc_level = false;
     /* MAME pit8253 device_reset: control 0x30, count 0, OUT undetermined
      * (kept low here), null count set. */
     for (i = 0; i < 3; i++) {

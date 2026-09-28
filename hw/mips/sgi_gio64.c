@@ -22,6 +22,34 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGIO64State, SGI_GIO64)
 #define REX3_STATUS_VRINT (1U << 5)
 #define REX3_STATUS_VIDEOINT (1U << 6)
 #define REX3_STATUS_BACKBUSY (1U << 4)
+
+/* Board tracing (off by default; set SGI_TRACE=1 to re-enable). Capped
+ * per offset like the PIO/MC traces: the kernel probes XL24 registers
+ * during console init, and a tight status poll would otherwise flood.
+ * Framebuffer pixels move via the REX3 engine, not MMIO, so MMIO volume
+ * stays small; the cap is a backstop. */
+#define SGI_GIO_TRACE_PER_OFFSET 2000
+static unsigned sgi_gio_trace_count[4096];
+static int sgi_gio_trace_cached = -1;
+
+static bool sgi_gio_trace_enabled(void)
+{
+    if (sgi_gio_trace_cached < 0) {
+        sgi_gio_trace_cached = getenv("SGI_TRACE") ? 1 : 0;
+    }
+    return sgi_gio_trace_cached != 0;
+}
+
+static bool sgi_gio_trace_wanted(hwaddr addr)
+{
+    unsigned idx = addr & 0xfff;
+
+    if (sgi_gio_trace_count[idx] >= SGI_GIO_TRACE_PER_OFFSET) {
+        return false;
+    }
+    sgi_gio_trace_count[idx]++;
+    return true;
+}
 /* DCB slave addresses (MAME newport.h dcb_addr_t). Only the GFX slot card
  * (XL24) is present; EXP0/EXP1 are empty bus timeouts. */
 enum {
@@ -1208,6 +1236,10 @@ static uint64_t sgi_gio64_xl24_read(void *opaque, hwaddr addr, unsigned size)
 {
     uint64_t value = sgi_gio64_xl24_read_reg(opaque, addr, size);
 
+    if (sgi_gio_trace_enabled() && sgi_gio_trace_wanted(addr)) {
+        fprintf(stderr, "GIO-R off=%05x sz=%u val=%016llx\n",
+                (unsigned)addr, size, (unsigned long long)value);
+    }
     if (addr & 0x800) {
         sgi_gio64_rex3_command(opaque);
     }
@@ -1219,6 +1251,11 @@ static void sgi_gio64_xl24_write(void *opaque, hwaddr addr,
 {
     SGIGIO64State *state = opaque;
     hwaddr reg = addr & ~7ULL;
+
+    if (sgi_gio_trace_enabled() && sgi_gio_trace_wanted(addr)) {
+        fprintf(stderr, "GIO-W off=%05x sz=%u val=%016llx\n",
+                (unsigned)addr, size, (unsigned long long)value);
+    }
 
     if (reg < 0x1000) {
         reg &= ~0x800ULL;

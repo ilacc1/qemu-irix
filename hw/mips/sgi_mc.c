@@ -30,6 +30,8 @@ struct SgiMcState {
     SysBusDevice parent_obj;
     MemoryRegion iomem;
     MemoryRegion *ram;
+    /* MAME mc.cpp: sys_id = 0x03 (rev C) | eisa<<4. Indy has no EISA. */
+    bool eisa_present;
     qemu_irq dma_done;
     QEMUTimer *dma_timer;
     uint32_t cpu_control;
@@ -365,7 +367,11 @@ static uint64_t sgi_mc_read_inner(void *opaque, hwaddr addr, unsigned size)
     case 0x001c:
         return 1;
     case 0x0018:
-        return 0x13;
+        /* MAME mc.cpp System ID: rev C 0x03, bit 4 = EISA present
+         * (IP22 only). 0x13 on Indy misidentifies the board as IP22
+         * from the very first PROM probe (wrong HAL2/IOC2 tables,
+         * wrong ARCS inventory, kernel never programs Local masks). */
+        return 0x03 | (state->eisa_present ? 0x10 : 0x00);
     case 0x0028:
     case 0x002c:
         return state->rpss_divider;
@@ -739,6 +745,7 @@ static void sgi_mc_init(Object *object)
 static const Property sgi_mc_properties[] = {
     DEFINE_PROP_LINK("ram", SgiMcState, ram, TYPE_MEMORY_REGION,
                      MemoryRegion *),
+    DEFINE_PROP_BOOL("eisa-present", SgiMcState, eisa_present, true),
 };
 
 static void sgi_mc_class_init(ObjectClass *klass, const void *data)

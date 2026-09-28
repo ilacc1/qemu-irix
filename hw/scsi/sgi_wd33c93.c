@@ -229,8 +229,10 @@ static uint32_t sgi_wd_dma_read32(hwaddr addr)
     /* Descriptors/data below 0x80000000 are already physical (MC bank
      * aliases, exactly like MAME's raw AS_PROGRAM dispatch): use them
      * directly so DMA can never depend on TLB/ASID state.  KSEG
-     * addresses go through the CPU translation (debug, then any-ASID
-     * soft-TLB) with SegCtl masking as the last resort. */
+     * KSEG2 addresses go through the CPU translation (debug, then any-ASID
+     * soft-TLB) with SegCtl masking as the last resort.  KSEG0/1 are
+     * direct-mapped and must never consult the TLB: stale entries from
+     * other address spaces otherwise divert DMA to the wrong page. */
     CPUState *cs = qemu_get_cpu(0);
     if (cs && addr >= 0x80000000U) {
         uint8_t b[4];
@@ -243,7 +245,7 @@ static uint32_t sgi_wd_dma_read32(hwaddr addr)
     uint32_t value = 0;
     hwaddr pa;
 
-    if (cs && addr >= 0x80000000U) {
+    if (cs && addr >= 0xc0000000U) {
         hwaddr tpa = mips_cpu_get_phys_page_any_asid(cs, addr);
 
         if (tpa != (hwaddr)-1) {
@@ -358,10 +360,11 @@ static void sgi_wd_dma_read(void *opaque, uint8_t *buf, int len)
             hwaddr pa;
 
             /*
-             * Same as the descriptor fetch: below 0x80000000 the address
-             * is already physical; only KSEG consults the CPU translation.
+             * Same as the descriptor fetch: below 0xc0000000 the address
+             * is unmapped (KSEG0/1 direct, below 0x80000000 already
+             * physical); only TLB-mapped KSEG2 consults the translation.
              */
-            if (cs && state->dma_current >= 0x80000000U) {
+            if (cs && state->dma_current >= 0xc0000000U) {
                 hwaddr tpa = mips_cpu_get_phys_page_any_asid(
                     cs, sgi_wd_dma_address(state, state->dma_current));
 
@@ -418,12 +421,12 @@ static void sgi_wd_dma_write(void *opaque, uint8_t *buf, int len)
             hwaddr pa;
 
             /*
-             * Below 0x80000000 the address is already physical (MAME
-             * raw-space semantics): use it directly so DMA can never
-             * depend on TLB/ASID state.  Only KSEG consults the CPU
-             * translation first.
+             * Below 0xc0000000 the address is unmapped (KSEG0/1 direct,
+             * below 0x80000000 already physical per MAME raw-space
+             * semantics): use it directly so DMA can never depend on
+             * TLB/ASID state.  Only KSEG2 consults the CPU translation.
              */
-            if (cs && state->dma_current >= 0x80000000U) {
+            if (cs && state->dma_current >= 0xc0000000U) {
                 hwaddr tpa = mips_cpu_get_phys_page_any_asid(
                     cs, sgi_wd_dma_address(state, state->dma_current));
 
@@ -565,8 +568,8 @@ static void sgi_wd_patch_byte(SGIWD33C93State *state, uint32_t va, uint8_t v)
     MemTxResult r;
     hwaddr pa;
 
-    /* Same split as the DMA data paths: physical below 0x80000000. */
-    if (cs && va >= 0x80000000U) {
+    /* Same split as the DMA data paths: unmapped below 0xc0000000. */
+    if (cs && va >= 0xc0000000U) {
         hwaddr tpa = mips_cpu_get_phys_page_any_asid(cs, a);
 
         if (tpa != (hwaddr)-1) {
