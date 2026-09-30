@@ -319,6 +319,13 @@ static void do_command_phase(ESPState *s)
 
     s->current_req = scsi_req_new(current_lun, 0, s->lun, buf, cmdlen, s);
     datalen = scsi_req_enqueue(s->current_req);
+    if (getenv("SGI_ESP_TRACE")) {
+        fprintf(stderr, "ESPCMD op=%02x cdb=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x datalen=%d mode=%d xfer=%lld blk=%d\n",
+                buf[0], buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6],
+                buf[7], buf[8], buf[9], datalen,
+                s->current_req->cmd.mode, (long long)s->current_req->cmd.xfer,
+                (int)s->current_dev->blocksize);
+    }
     s->ti_size = datalen;
     fifo8_reset(&s->cmdfifo);
     s->data_ready = false;

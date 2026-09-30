@@ -227,6 +227,9 @@ static uint64_t sgi_hpc3_pbus_dma_read(void *opaque, hwaddr addr,
     unsigned channel;
     unsigned reg;
 
+    if (sgi_ip22_trace_enabled() && addr >= 0x31000 && addr < 0x40000) {
+        fprintf(stderr, "HPC3GAP-R off=0x%05x size=%u\n", (unsigned)addr, size);
+    }
     if (sgi_hpc3_pbus_access(addr, &channel, &reg)) {
         SgiHpc3PbusDma *dma = &sgi_hpc3_pbus_dma[channel];
 
@@ -290,6 +293,10 @@ static uint64_t sgi_hpc3_pbus_dma_read(void *opaque, hwaddr addr,
     }
     if (addr == 0x2f004) {
         return sgi_hpc3_misc;
+    }
+    if (sgi_ip22_trace_enabled() && addr >= 0x31000 && addr < 0x40000) {
+        fprintf(stderr, "HPC3GAP-R off=0x%05x -> 0xff (default)\n",
+                (unsigned)addr);
     }
     return 0xff;
 }
@@ -840,7 +847,6 @@ static void mips_sgi_indigo2_init(MachineState *machine)
     MemoryRegion *isa_mem = g_new(MemoryRegion, 1);
     MemoryRegion *isa_io = g_new(MemoryRegion, 1);
     MemoryRegion *bios = g_new(MemoryRegion, 1);
-    MemoryRegion *bios2 = g_new(MemoryRegion, 1);
     DeviceState *dev;
     DeviceState *ioc2dev;
     DeviceState *mcdev;
@@ -851,12 +857,6 @@ static void mips_sgi_indigo2_init(MachineState *machine)
     MemoryRegion *eisa_io = g_new(MemoryRegion, 1);
     MemoryRegion *vino_stub = g_new(MemoryRegion, 1);
     MemoryRegion *i8042_alias = g_new(MemoryRegion, 1);
-    MemoryRegion *i8042_data_alias = g_new(MemoryRegion, 1);
-    MemoryRegion *i8042_status_alias = g_new(MemoryRegion, 1);
-    MemoryRegion *i8042_pio6_data_alias = g_new(MemoryRegion, 1);
-    MemoryRegion *i8042_pio6_status_alias = g_new(MemoryRegion, 1);
-    MemoryRegion *scc_pio6_alias[4];
-    MemoryRegion *ioc2_base_alias = g_new(MemoryRegion, 1);
     NICInfo *nd;
     DeviceState *rc4030;
     rc4030_dma *dmas;
@@ -915,14 +915,18 @@ static void mips_sgi_indigo2_init(MachineState *machine)
     memory_region_add_subregion(address_space, SGI_MC_BASE,
                                 sysbus_mmio_get_region(sysbus, 0));
 
+    /*
+     * PROM at 0x1fc00000 only (MAME ip24_base_map:234 maps user1 once,
+     * read-only, there). The old 0xfff00000 mirror let the CPU execute
+     * the PROM from a second address, so the PROM's own relocation and
+     * pointer patching diverged from MAME.
+     */
     memory_region_init_rom(bios, NULL, "sgi_indigo2.bios", INDIGO2_BIOS_SIZE, &error_fatal);
-    memory_region_init_alias(bios2, NULL, "sgi_indigo2.bios", bios, 0, INDIGO2_BIOS_SIZE);
     memory_region_add_subregion(address_space, 0x1fc00000ULL, bios);
-    memory_region_add_subregion(address_space, 0xfff00000ULL, bios2);
 
     filename = qemu_find_file(QEMU_FILE_TYPE_BIOS, machine->firmware ?: bios_name);
     if (filename) {
-        bios_size = load_image_targphys(filename, 0xfff00000ULL, INDIGO2_BIOS_SIZE, NULL);
+        bios_size = load_image_targphys(filename, 0x1fc00000ULL, INDIGO2_BIOS_SIZE, NULL);
         g_free(filename);
     } else {
         bios_size = -1;
@@ -950,24 +954,24 @@ static void mips_sgi_indigo2_init(MachineState *machine)
     qdev_prop_set_bit(dev, "guinness", is_indy);
     sysbus = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(sysbus, &error_fatal);
-    if (is_indy) {
-        /* MAME indy_indigo2.cpp:258-261 pio6_map:
-         *   map(0x00, 0x2f).m("ioc2", ioc2_guinness_device::map)
-         *                    .umask16(0x00ff);
-         * installed on AS_PIO6 (indy_indigo2.cpp:378), and MAME
-         * hpc3.cpp:713-734 decodes PIO data as channel=(offset>>8)&15 with
-         * the register index at byte offset (offset & 0xff).  Channel 6 of
-         * the 0x58000 PIO window is HPC3+0x58600, so the GUINNESS window
-         * is HPC3+0x58600-0x5862f. */
-        memory_region_init_alias(ioc2_base_alias, NULL, "sgi_ip24.ioc2_pio6",
-                                 sysbus_mmio_get_region(sysbus, 0), 0, 0x30);
-        memory_region_add_subregion_overlap(address_space, SGI_HPC3_BASE + 0x58600,
-                                            ioc2_base_alias, 30);
-    } else {
+    /*
+     * MAME indy_indigo2.cpp:258-261 pio6_map:
+     *   map(0x00, 0x2f).m("ioc2", ioc2_guinness_device::map)
+     *                    .umask16(0x00ff);
+     * installed on AS_PIO6 (indy_indigo2.cpp:381).  MAME reaches the
+     * device through AS_PIO6, which hpc3.cpp's 32-bit pio_data_r() drives
+     * as `read_word(offset & 0xff, 0x00ff) & 0xff`; QEMU has no separate
+     * pio6 address space, so the PIO window dispatcher decodes the same
+     * dword index and calls into the IOC2 device itself.  Handing that
+     * device to the dispatcher (rather than mapping sub-windows on top
+     * of it) is what keeps the register index and the byte lanes
+     * consistent: MAME's window is dword-indexed, and the value only
+     * ever lives in the low lane of each dword.
+     */
+    sgi_hpc3_set_ioc2(DEVICE(dev));
+    if (!is_indy) {
         memory_region_add_subregion_overlap(address_space, SGI_HPC3_BASE + 0x58614,
                                             sysbus_mmio_get_region(sysbus, 0), 5);
-    }
-    if (!is_indy) {
         memory_region_add_subregion_overlap(address_space, SGI_HPC3_BASE + 0x58400,
                                             sysbus_mmio_get_region(sysbus, 1), 5);
     }
@@ -1167,36 +1171,15 @@ static void mips_sgi_indigo2_init(MachineState *machine)
 
     memory_region_add_subregion(address_space, 0x80005000,
                                  sysbus_mmio_get_region(SYS_BUS_DEVICE(i8042), 0));
-    if (is_indy) {
-        memory_region_init_alias(i8042_data_alias, NULL, "sgi_ip24.i8042_data",
-                                 sysbus_mmio_get_region(SYS_BUS_DEVICE(i8042), 0),
-                                 0, 1);
-        memory_region_init_alias(i8042_status_alias, NULL, "sgi_ip24.i8042_status",
-                                 sysbus_mmio_get_region(SYS_BUS_DEVICE(i8042), 0),
-                                 1, 1);
-        memory_region_add_subregion_overlap(address_space, SGI_HPC3_BASE + 0x59840,
-                                            i8042_data_alias, 1000);
-        memory_region_add_subregion_overlap(address_space, SGI_HPC3_BASE + 0x59844,
-                                            i8042_status_alias, 1000);
-        /*
-         * MAME pio6_map routes 0x10/0x11 to the keyboard controller
-         * (data/status), shadowing the IOC2 base device there.  Mirror it
-         * with higher priority than the IOC2 alias (30) so the kernel's
-         * keyboard polls reach the real 8042 instead of reading 0.
-         */
-        memory_region_init_alias(i8042_pio6_data_alias, NULL,
-                                 "sgi_ip24.i8042_pio6_data",
-                                 sysbus_mmio_get_region(SYS_BUS_DEVICE(i8042), 0),
-                                 0, 1);
-        memory_region_init_alias(i8042_pio6_status_alias, NULL,
-                                 "sgi_ip24.i8042_pio6_status",
-                                 sysbus_mmio_get_region(SYS_BUS_DEVICE(i8042), 0),
-                                 1, 1);
-        memory_region_add_subregion_overlap(address_space, SGI_HPC3_BASE + 0x58610,
-                                            i8042_pio6_data_alias, 40);
-        memory_region_add_subregion_overlap(address_space, SGI_HPC3_BASE + 0x58611,
-                                            i8042_pio6_status_alias, 40);
-    } else {
+    /*
+     * PIO6 0x10/0x11 reach the controller through the window dispatcher
+     * (sgi_hpc3_set_pio6_kbd), not through region aliases: the guest polls
+     * these registers from byte lane 3, which a byte-sized alias misses and
+     * a wider one cannot express because pckbd.c derives data-vs-status from
+     * `addr & mask`.  See sgi_hpc3_pio6_kbd_reg().
+     */
+    sgi_hpc3_set_pio6_kbd(DEVICE(i8042));
+    if (!is_indy) {
         memory_region_init_alias(i8042_alias, NULL, "sgi_ip22.i8042_pio6",
                                  sysbus_mmio_get_region(SYS_BUS_DEVICE(i8042), 0),
                                  0, 2);
@@ -1220,29 +1203,6 @@ static void mips_sgi_indigo2_init(MachineState *machine)
                                         (is_indy ? 0x59830 : 0x5860c),
                                         sysbus_mmio_get_region(sysbus, 0), 1000);
     sysbus_connect_irq(sysbus, 0, qdev_get_gpio_in(ioc2dev, 7));
-    if (is_indy) {
-        /*
-         * MAME pio6_map routes 0x0c-0x0f to the Z8530 (B ctrl/data,
-         * A ctrl/data), shadowing the IOC2 base device there. Mirror it
-         * with higher priority than the IOC2 alias (30); with it_shift 2
-         * the ESCC registers sit at bytes 0/4/8/12 of its region.
-         */
-        static const char *const scc_names[4] = {
-            "sgi_ip24.scc_pio6_bctl", "sgi_ip24.scc_pio6_bdat",
-            "sgi_ip24.scc_pio6_actl", "sgi_ip24.scc_pio6_adat",
-        };
-        int i;
-
-        for (i = 0; i < 4; i++) {
-            scc_pio6_alias[i] = g_new(MemoryRegion, 1);
-            memory_region_init_alias(scc_pio6_alias[i], NULL, scc_names[i],
-                                     sysbus_mmio_get_region(sysbus, 0),
-                                     i * 4, 1);
-            memory_region_add_subregion_overlap(address_space,
-                                                SGI_HPC3_BASE + 0x5860c + i,
-                                                scc_pio6_alias[i], 40);
-        }
-    }
 
     nd = qemu_find_nic_info("seeq80c03", true, "seeq80c03");
     if (nd) {

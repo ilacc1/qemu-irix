@@ -15,6 +15,8 @@
 #include "hw/core/qdev-properties-system.h"
 #include "hw/nvram/eeprom93xx.h"
 #include "hw/mips/sgi_hpc3.h"
+#include "hw/mips/sgi_ioc2.h"
+#include "target/mips/cpu.h"
 #include "hw/core/sysbus.h"
 #include "migration/vmstate.h"
 #include "qapi/error.h"
@@ -88,6 +90,7 @@ struct SgiHpc3State {
     char *nvram_dir;
     uint64_t bbram_clock_base_ns;
     time_t bbram_clock_base_time;
+    QEMUTimer *bbram_timer;
     eeprom_t *eeprom;
     uint8_t eeprom_ctrl;
 };
@@ -690,14 +693,16 @@ static uint64_t sgi_hpc3_pio8_read(SgiHpc3State *state, unsigned offset)
     }
     if (offset == 0x58) {
         /*
-         * Board ID: MAME leaves PIO8 unmapped (all-ones). That sets
-         * is_fullhouse=1, takes the DA4/PIO0-window PROM path, and
-         * (critically) yields class-6 IOC eminors from ubusmap so the
-         * kernel maps PIO6 (kbdc/Local0 programming at t=12.5s). The
-         * DA4 serial-config caller loop needs PIO0 status cooperation
-         * too (see the 0x3b hard-0 note); both halves are required.
+         * Board ID peek (head byte if queued, else 0). MAME leaves
+         * PIO8 unmapped and its unmapped reads return 0x00
+         * (addrmap m_unmapval defaults to 0), so 0x00 here IS MAME
+         * parity (an earlier all-ones experiment was based on a
+         * misread MAME trace and wrongly set is_fullhouse=1).
          */
-        return 0xff;
+        if (state->out_count > 0) {
+            return (uint64_t)(state->out_data[state->out_head] & 0xff);
+        }
+        return 0;
     }
     return state->pio8_data[offset];
 }
@@ -721,11 +726,103 @@ static bool sgi_pio_trace_wanted(unsigned channel, unsigned offset)
     return true;
 }
 
-static uint64_t sgi_hpc3_pio_read(void *opaque, hwaddr addr, unsigned size)
+/* TEMP DEBUG (SGI_TRACE_PIO=1): log PIO window accesses in the same shape as
+ * the MAME hpc3.cpp trace, so the two early boot sequences can be diffed
+ * directly and the first divergence located. */
+static bool sgi_mamepio_trace_on(void)
+{
+    static int cached = -1;
+
+    if (cached < 0) {
+        cached = getenv("SGI_TRACE_PIO") ? 1 : 0;
+    }
+    return cached != 0;
+}
+
+/*
+ * PIO channel 6 is the IOC2.  MAME keeps the device behind its own
+ * AS_PIO6 address space, which pio_data_r()/pio_data_w() drive with a
+ * dword register index; QEMU has no such space, so the window dispatcher
+ * decodes the same index and calls the device directly.  The board hands
+ * the device over with sgi_hpc3_set_ioc2() once it has realized it.
+ */
+static DeviceState *sgi_hpc3_ioc2;
+static DeviceState *sgi_hpc3_pio6_kbd;
+
+void sgi_hpc3_set_ioc2(DeviceState *ioc2)
+{
+    sgi_hpc3_ioc2 = ioc2;
+}
+
+void sgi_hpc3_set_pio6_kbd(DeviceState *kbd)
+{
+    sgi_hpc3_pio6_kbd = kbd;
+}
+
+/*
+ * MAME's ioc2_device::base_map(), which the GUINNESS map includes, routes
+ * PIO6 0x10/0x11 to the PS/2 keyboard controller (m_kbdc).  MAME selects
+ * the sub-device by register index, because hpc3.cpp hands the device a
+ * dword index and umask16(0x00ff) keeps only the low lane.
+ *
+ * The guest really does poll these registers from an arbitrary byte lane -
+ * the IP24 kernel uses lane 3 - so a region alias cannot express it: a
+ * one-byte alias only covers lane 0, and widening it breaks the controller's
+ * own offset decode (hw/input/pckbd.c picks data vs status with
+ * `addr & mask`, so a wider alias makes lane 3 read status).  Miss both and
+ * the status register returns 0 forever, the kernel's PS/2 timeout fires and
+ * it reports "PC keyboard/mouse controller diagnostic *FATLED*".  Route the
+ * registers by index instead, which is what MAME does.
+ */
+static bool sgi_hpc3_pio6_kbd_reg(unsigned reg, hwaddr *dev_off)
+{
+    if (!sgi_hpc3_pio6_kbd || (reg != 0x10 && reg != 0x11)) {
+        return false;
+    }
+    *dev_off = reg - 0x10;         /* 0 = data, 1 = status/command */
+    return true;
+}
+
+static uint64_t sgi_hpc3_pio6_read_reg(unsigned reg)
+{
+    hwaddr dev_off;
+    uint64_t v = 0;
+
+    if (sgi_hpc3_pio6_kbd_reg(reg, &dev_off)) {
+        memory_region_dispatch_read(
+            sysbus_mmio_get_region(SYS_BUS_DEVICE(sgi_hpc3_pio6_kbd), 0),
+            dev_off, &v, size_memop(1), MEMTXATTRS_UNSPECIFIED);
+        return v;
+    }
+    return sgi_ioc2_pio6_read_byte(sgi_hpc3_ioc2, reg);
+}
+
+static void sgi_hpc3_pio6_write_reg(unsigned reg, uint8_t val)
+{
+    hwaddr dev_off;
+
+    if (sgi_hpc3_pio6_kbd_reg(reg, &dev_off)) {
+        memory_region_dispatch_write(
+            sysbus_mmio_get_region(SYS_BUS_DEVICE(sgi_hpc3_pio6_kbd), 0),
+            dev_off, val, size_memop(1), MEMTXATTRS_UNSPECIFIED);
+        return;
+    }
+    sgi_ioc2_pio6_write_byte(sgi_hpc3_ioc2, reg, val);
+}
+
+static uint64_t sgi_hpc3_pio_read_do(void *opaque, hwaddr addr, unsigned size)
 {
     SgiHpc3State *state = SGI_HPC3(opaque);
-    unsigned channel = (addr >> 8) & 15;
-    unsigned offset = addr & 0xff;
+    /*
+     * MAME hpc3.cpp:715 pio_data_r(offs_t offset) is a 32-bit handler
+     * over map(0x58000, 0x5bfff), so MAME passes a DWORD index: channel
+     * = (offset >> 8) & 15, register = offset & 0xff.  The window is
+     * therefore channel N = byte 0x400*N .. 0x400*N+0x3ff, NOT byte
+     * 0x100*N.  QEMU is handed byte addresses, so convert first.
+     */
+    unsigned dword = addr >> 2;
+    unsigned channel = (dword >> 8) & 15;
+    unsigned offset = dword & 0xff;
     uint64_t rv;
 
     if (sgi_ip22_trace_enabled() && sgi_pio_trace_wanted(channel, offset)) {
@@ -735,28 +832,58 @@ static uint64_t sgi_hpc3_pio_read(void *opaque, hwaddr addr, unsigned size)
         channel = (channel & 1) ? 9 : 8;
     }
 
-    /* Channel 6 (IOC2) is owned by the sgi-ioc2 device and the ESCC. */
+    /* Channel 6 is IOC2, reached by the board through MAME's AS_PIO6.
+     * MAME's window is dword-indexed and only the low lane of each dword
+     * carries data (see sgi_ioc2_pio6_read_byte()), so build the result
+     * one byte at a time: a register is touched only at lane 0. */
     if (channel == 6) {
-        return 0;
+        uint64_t pio6 = 0;
+        unsigned i;
+
+        /* MAME hands the whole DWORD offset to pio_data_r(), which drives
+         * the IOC2 with the register index in offset & 0xff and returns
+         * the byte in bits 7:0; the lanes above it are the umask16(0x00ff)
+         * filler.  A narrow guest access can land in any lane of the dword
+         * and still selects that register, so honour it for a single-byte
+         * access; for a wider access only lane 0 is unmasked.
+         */
+        for (i = 0; i < size; i++) {
+            if (size == 1) {
+                pio6 = sgi_hpc3_pio6_read_reg(((addr + i) >> 2) & 0xff);
+            } else if (i == 0) {
+                pio6 |= (uint64_t)sgi_hpc3_pio6_read_reg(
+                            ((addr + i) >> 2) & 0xff) << (8 * i);
+            }
+        }
+        return pio6;
     }
     if (channel == 8) {
         rv = sgi_hpc3_pio8_read(state, offset);
         return rv;
     }
     if (channel == 0) {
-        if (offset == 0x08 || offset == 0x20) {
-            /*
-             * MAME hal2.cpp REVISION_REG (0x4010): the PROM's HAL2
-             * probe lands on byte-offset 0x20 in this window
-             * (empirical MAME-off x4 mapping, value-matched on the
-             * 0x18/0x10a/0x1304 init sequence); 0x08 kept for the
-             * direct-mapped view. 0 makes the PROM skip all PIO6/IOC2
-             * probing (wrong ARCS inventory, kernel never programs
-             * Local masks -> SCSI stall).
-             */
+        /* MAME indy_indigo2.cpp:245 pio0_map is the HAL2:
+         *   map(0x00, 0xff).rw(m_hal2, hal2_device::read/write)
+         * and hal2.h numbers its registers in dwords
+         * (STATUS_REG = 0x0010/4 = 4, REVISION_REG = 0x0020/4 = 8), so
+         * `offset` is the register index, not a byte address.  Only
+         * REVISION_REG is read-only and hard-wired; everything else is
+         * the ISR/indirect-register backing store below.
+         */
+        if (offset == 0x08) {
+            /* MAME hal2.cpp: hal2_device::read(REVISION_REG) -> 0x4010. */
             return 0x4010;
         }
-        if (offset == 0x3b) {
+        /* The two shims below are not MAME-derived: they stand in for
+         * status bytes the guest polls, which MAME reaches through devices
+         * this board does not wire up.  They are keyed on the raw byte
+         * address, so with the dword decode they now fire only at that one
+         * address (the pre-decode byte-offset test also caught 0x13b/0x23b/
+         * 0x33b).  Neither is hit in practice - a full early-boot trace shows
+         * the only channel 0 reads are byte 0x0010 (register 4) and byte
+         * 0x0020 (REVISION_REG) - so keep them as a fallback rather than
+         * relying on them. */
+        if (addr == 0x3b) {
             /*
              * Serial-console status (PROM 0x31490 autobaud/configure):
              * bit 5 = TX ready so its transmit/wait loops proceed
@@ -766,7 +893,7 @@ static uint64_t sgi_hpc3_pio_read(void *opaque, hwaddr addr, unsigned size)
              */
             return 0x20;
         }
-        if (offset == 0x0b) {
+        if (addr == 0x0b) {
             /* Kbd/mouse status mirror: bit 0 = keyboard byte waits,
              * bit 5 = mouse byte waits; 0 when idle. */
             uint64_t v = 0;
@@ -792,19 +919,35 @@ static void sgi_hpc3_pio_write(void *opaque, hwaddr addr, uint64_t val,
                                unsigned size)
 {
     SgiHpc3State *state = SGI_HPC3(opaque);
-    unsigned channel = (addr >> 8) & 15;
-    unsigned offset = addr & 0xff;
+    /* See sgi_hpc3_pio_read_do(): MAME decodes on a DWORD index. */
+    unsigned dword = addr >> 2;
+    unsigned channel = (dword >> 8) & 15;
+    unsigned offset = dword & 0xff;
 
     if (sgi_ip22_trace_enabled() && sgi_pio_trace_wanted(channel, offset)) {
         fprintf(stderr, "PIO-DISP-W ch=%u off=%02x val=%x\n",
                 channel, offset, (unsigned)val);
+    }
+    if (sgi_mamepio_trace_on()) {
+        fprintf(stderr, "QEMU-PIO-W ch=%u off=%02x addr=%04x size=%u val=%08x\n",
+                channel, offset, (unsigned)addr, size, (unsigned)val);
     }
 
     if (channel >= 10) {
         channel = (channel & 1) ? 9 : 8;
     }
 
+    /* Channel 6 is IOC2; same dword/lane rules as the read path, and
+     * MAME's pio_data_w() case 0 writes `data & 0x00ff` to the register. */
     if (channel == 6) {
+        unsigned i;
+
+        for (i = 0; i < size; i++) {
+            if (size == 1 || i == 0) {
+                sgi_hpc3_pio6_write_reg(((addr + i) >> 2) & 0xff,
+                                       (val >> (8 * i)) & 0xff);
+            }
+        }
         return;
     }
     if (channel == 8) {
@@ -848,6 +991,25 @@ static void sgi_hpc3_pio_write(void *opaque, hwaddr addr, uint64_t val,
     }
 }
 
+static uint64_t sgi_hpc3_pio_read(void *opaque, hwaddr addr, unsigned size)
+{
+    uint64_t rv = sgi_hpc3_pio_read_do(opaque, addr, size);
+
+    if (sgi_mamepio_trace_on()) {
+        uint32_t pc = 0;
+
+        if (current_cpu) {
+            pc = (uint32_t)((ArchCPU *)current_cpu)->env.active_tc.PC;
+        }
+        unsigned dword = addr >> 2;
+
+        fprintf(stderr, "QEMU-PIO-R ch=%u off=%02x addr=%04x size=%u ret=%08x pc=%08x\n",
+                (unsigned)((dword >> 8) & 15), (unsigned)(dword & 0xff),
+                (unsigned)addr, size, (unsigned)rv, pc);
+    }
+    return rv;
+}
+
 static const MemoryRegionOps sgi_hpc3_pio_ops = {
     .read = sgi_hpc3_pio_read,
     .write = sgi_hpc3_pio_write,
@@ -856,71 +1018,206 @@ static const MemoryRegionOps sgi_hpc3_pio_ops = {
     .valid.max_access_size = 4,
 };
 
-static uint8_t sgi_hpc3_bcd(unsigned value)
+/* MAME time_helper::to_bcd() / from_bcd(), used by ds1386.cpp for its BCD
+ * clock registers. */
+static uint8_t time_helper_to_bcd(uint8_t value)
 {
-    return (value / 10) * 16 + value % 10;
+    return ((value / 10) << 4) | (value % 10);
 }
 
-static uint64_t sgi_hpc3_bbram_reg(SgiHpc3State *state, struct tm *current,
-                                   hwaddr reg);
+static uint8_t time_helper_from_bcd(uint8_t value)
+{
+    return (value >> 4) * 10 + (value & 0x0f);
+}
+
+/* DS1386 timekeeper advance rate: 100Hz, per MAME ds1386.cpp:77. */
+#define SGI_BBRAM_TICK_NS 10000000ULL
+
+static void sgi_hpc3_bbram_tick(void *opaque);
+
+static uint64_t sgi_bbram_trace_n;
+
+/* TEMPORARY DEBUG (SGI_TRACE_BBRAM=1): log every DS1386 window access so we
+ * can see the offsets/sizes the PROM uses for its env image. */
+static bool sgi_bbram_trace_on(void)
+{
+    static int cached = -1;
+
+    if (cached < 0) {
+        cached = getenv("SGI_TRACE_BBRAM") ? 1 : 0;
+    }
+    return cached != 0;
+}
 
 static uint64_t sgi_hpc3_bbram_read(void *opaque, hwaddr addr, unsigned size)
 {
     SgiHpc3State *state = SGI_HPC3(opaque);
-    uint64_t clock_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
-    time_t now;
-    struct tm current;
+    unsigned reg;
+    uint8_t v;
 
-    if (!state->bbram_clock_base_ns) {
-        state->bbram_clock_base_ns = clock_ns;
-        state->bbram_clock_base_time = g_get_real_time() / G_USEC_PER_SEC;
-    }
-    now = state->bbram_clock_base_time +
-            (clock_ns - state->bbram_clock_base_ns) / 1000000000ULL;
-    localtime_r(&now, &current);
-    /* MAME ds1386.h REGISTER_*: 0-0x0d clock/alarms/command/watchdog,
-     * 0x0e+ user NVRAM; DS1286 is 64 bytes, DS1386_8K is 8KiB (MAME
-     * ds1386.cpp data_r falls back to RAM below m_ram_size).
-     * NOTE (correctness debt): multi-byte accesses should assemble
-     * consecutive registers BE, but the BE-correct form makes the PROM's
-     * RTC-tick calibration wait an hour (it reads the hours word and
-     * waits for change) while MAME-form (and old QEMU single-lane)
-     * returns fast-ticking seconds and calibrates in ~1s. MAME itself
-     * never runs that calibration (graphics console skips it); until
-     * the console-select gate is MAME-faithful, keep the fast form so
-     * boot proceeds. Revisit post-boot (NVRAM env reads want BE). */
-    if (size == 1) {
-        return sgi_hpc3_bbram_reg(state, &current, addr);
-    } else {
-        return sgi_hpc3_bbram_reg(state, &current, addr >> 2);
-    }
-}
-
-static uint64_t sgi_hpc3_bbram_reg(SgiHpc3State *state, struct tm *current,
-                                   hwaddr reg)
-{
+    /* MAME hpc3.cpp:201 registers bbram_r/bbram_w as 32-bit handlers over
+     * the whole 128K window, so the devcb_read8 -> ds1386::data_r callback
+     * is handed the *DWORD* index, not a byte offset.  ds1386.cpp:
+     *   uint8_t ds1386_device::data_r(offs_t offset)
+     *   {
+     *       if (offset >= m_ram_size) return 0;
+     *       return m_ram[offset];
+     *   }
+     * i.e. one byte, zero-extended, regardless of access width.
+     *
+     * Getting this wrong is not cosmetic: with byte offsets the IP24 PROM's
+     * 32-bit read of 0x1fbe0004 landed on ds1386 register 4 (hours) instead
+     * of register 1 (seconds), and its "wait for the clock to change" loop at
+     * PROM 0xbfc31248 then spun until the hour field rolled over - an
+     * apparent hang.  Confirmed against MAME's own trace, whose offsets are
+     * exactly one quarter of ours (QEMU 0x00fb/0x00ff == MAME 0x003e/0x003f).
+     */
+    reg = addr >> 2;
     if (reg >= state->bbram_size) {
         return 0;
     }
-    switch (reg) {
-    case 0x00:
-        return sgi_hpc3_bcd((g_get_real_time() / 10000) % 100);    case 0x01:
-        return sgi_hpc3_bcd(current->tm_sec);
-    case 0x02:
-        return sgi_hpc3_bcd(current->tm_min);
-    case 0x04:
-        return sgi_hpc3_bcd(current->tm_hour);
-    case 0x06:
-        return sgi_hpc3_bcd(current->tm_wday + 1);
-    case 0x08:
-        return sgi_hpc3_bcd(current->tm_mday);
-    case 0x09:
-        return sgi_hpc3_bcd(current->tm_mon + 1);
-    case 0x0a:
-        return sgi_hpc3_bcd(current->tm_year % 100);
-    default:
-        /* Alarms/command/watchdog/user: stored RAM, not live time. */
-        return state->bbram[reg];
+    v = state->bbram[reg];
+
+    if (sgi_bbram_trace_on() && sgi_bbram_trace_n < 4000) {
+        sgi_bbram_trace_n++;
+        fprintf(stderr, "BBRAM R off=0x%04x size=%u -> 0x%02x\n",
+                (unsigned)reg, size, (unsigned)v);
+    }
+    return v;
+}
+
+static uint8_t sgi_hpc3_inc_bcd(uint8_t *v, uint8_t max, uint8_t min_value,
+                                uint8_t max_value)
+{
+    uint8_t value = time_helper_from_bcd(*v) + 1;
+    uint8_t limit = time_helper_from_bcd(max_value);
+
+    if (value > limit) {
+        *v = time_helper_to_bcd(min_value);
+        return 1;
+    }
+    *v = time_helper_to_bcd(value);
+    return 0;
+}
+
+/* Mirror of MAME ds1386_device::advance_hundredths() (ds1386.cpp:200). */
+static void sgi_hpc3_bbram_tick(void *opaque)
+{
+    SgiHpc3State *state = SGI_HPC3(opaque);
+    static const uint8_t daysinmonth[] = {
+        0x31, 0x28, 0x31, 0x30, 0x31, 0x30,
+        0x31, 0x31, 0x30, 0x31, 0x30, 0x31
+    };
+    uint8_t carry, month, year, maxdays;
+
+    /* Keep the 100Hz cadence MAME ds1386.cpp:77 gets from its repeating
+     * timer; this timer API has no period argument. */
+    timer_mod_ns(state->bbram_timer,
+                 qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + SGI_BBRAM_TICK_NS);
+
+    if (state->bbram_size < 0x0b) {
+        return;
+    }
+
+    carry = sgi_hpc3_inc_bcd(&state->bbram[0x00], 0xff, 0x00, 0x99);
+    if (carry) {
+        carry = sgi_hpc3_inc_bcd(&state->bbram[0x01], 0x7f, 0x00, 0x59);
+    }
+    if (carry) {
+        carry = sgi_hpc3_inc_bcd(&state->bbram[0x02], 0x7f, 0x00, 0x59);
+    }
+    if (carry) {
+        uint8_t value = 0, min_value = 0, max_value = 0;
+        if (state->bbram[0x04] & 0x40) {       /* HOURS_12_24 */
+            value = state->bbram[0x04] & 0x1f;
+            min_value = 0x01;
+            max_value = 0x12;
+        } else {
+            value = state->bbram[0x04] & 0x3f;
+            min_value = 0x00;
+            max_value = 0x23;
+        }
+        carry = sgi_hpc3_inc_bcd(&value, 0x1f, min_value, max_value);
+        state->bbram[0x04] &= ~0x1f;
+        if (carry) {
+            if (state->bbram[0x04] & 0x40) {   /* HOURS_12_24 */
+                carry = (state->bbram[0x04] & 0x80) ? 1 : 0;
+                state->bbram[0x04] ^= 0x80;
+            } else {
+                state->bbram[0x04] &= ~0x3f;
+            }
+        } else {
+            if ((state->bbram[0x04] & 0x40) == 0) {
+                state->bbram[0x04] &= ~0x3f;
+            }
+        }
+        state->bbram[0x04] |= value;
+    }
+    if (carry) {
+        sgi_hpc3_inc_bcd(&state->bbram[0x06], 0x07, 0x01, 0x07);
+        month = time_helper_from_bcd(state->bbram[0x09]);
+        year = time_helper_from_bcd(state->bbram[0x0a]);
+        if (month == 2 && (year % 4) == 0) {
+            maxdays = 0x29;
+        } else if (month >= 1 && month <= 12) {
+            maxdays = daysinmonth[month - 1];
+        } else {
+            maxdays = 0x31;
+        }
+        carry = sgi_hpc3_inc_bcd(&state->bbram[0x08], 0x3f, 0x01, maxdays);
+    }
+    if (carry) {
+        uint8_t enables = state->bbram[0x09] & 0xc0;
+        sgi_hpc3_inc_bcd(&state->bbram[0x09], 0x1f, 0x01, 0x12);
+        state->bbram[0x09] &= 0x3f;
+        state->bbram[0x09] |= enables;
+    }
+    if (carry) {
+        sgi_hpc3_inc_bcd(&state->bbram[0x0a], 0xff, 0x00, 0x99);
+    }
+}
+
+static void sgi_hpc3_bbram_write_byte(SgiHpc3State *state, hwaddr addr,
+                                      uint8_t data)
+{
+    if (addr >= state->bbram_size) {
+        return;
+    }
+    if (addr >= 0x0e) {
+        state->bbram[addr] = data;
+        return;
+    }
+    /* MAME ds1386.cpp data_w: read-only-reserved bits in the clock bytes. */
+    switch (addr) {
+    case 0x00:                 /* hundredths */
+    case 0x03:                 /* minutes alarm */
+    case 0x05:                 /* hours alarm */
+    case 0x0a:                 /* years */
+        state->bbram[addr] = data;
+        break;
+    case 0x01:                 /* seconds */
+    case 0x02:                 /* minutes */
+    case 0x04:                 /* hours */
+        state->bbram[addr] = data & 0x7f;
+        break;
+    case 0x06:                 /* days */
+        state->bbram[addr] = data & 0x07;
+        break;
+    case 0x07:                 /* days alarm */
+        state->bbram[addr] = data & 0x87;
+        break;
+    case 0x08:                 /* date */
+        state->bbram[addr] = data & 0x3f;
+        break;
+    case 0x09:                 /* months */
+        state->bbram[addr] = data & 0xdf;
+        break;
+    case 0x0b:                 /* command */
+        state->bbram[addr] = data & 0xfc;
+        break;
+    default:                    /* 0x0c/0x0d watchdog, others */
+        state->bbram[addr] = data;
+        break;
     }
 }
 
@@ -928,17 +1225,18 @@ static void sgi_hpc3_bbram_write(void *opaque, hwaddr addr,
                                   uint64_t val, unsigned size)
 {
     SgiHpc3State *state = SGI_HPC3(opaque);
-    unsigned i;
+    unsigned reg = addr >> 2;
+    uint8_t b = (uint8_t)val;
 
-    /* MAME ds1386.cpp data_w: byte granular, ignore lanes beyond size. */
-    for (i = 0; i < size; i++) {
-        hwaddr reg = addr + i;
-
-        if (reg >= state->bbram_size) {
-            continue;
-        }
-        state->bbram[reg] = (val >> (8 * (size - 1 - i))) & 0xff;
+    /* Mirror of the read side: MAME's bbram_w is a 32-bit handler, so the
+     * devcb_write8 -> ds1386::data_w callback sees the DWORD index and the
+     * low byte of the guest's data. */
+    if (sgi_bbram_trace_on() && sgi_bbram_trace_n < 4000) {
+        sgi_bbram_trace_n++;
+        fprintf(stderr, "BBRAM W off=0x%04x size=%u val=0x%02x\n",
+                (unsigned)reg, size, (unsigned)b);
     }
+    sgi_hpc3_bbram_write_byte(state, reg, b);
 }
 
 static const MemoryRegionOps sgi_hpc3_bbram_ops = {
@@ -1037,6 +1335,19 @@ static void sgi_hpc3_realize(DeviceState *device, Error **errp)
     char rtc_path[4096];
     FILE *eeprom_file;
     FILE *rtc_file;
+
+    /* MAME ds1386.cpp:70 runs advance_hundredths() at 100Hz for the life of
+     * the machine, which is what keeps the BCD clock bytes in m_ram live
+     * (and what the PROM's clock-running calibration loop watches). */
+    state->bbram_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                      sgi_hpc3_bbram_tick, state);
+    /* MAME ds1386.cpp:77 runs advance_hundredths from a *repeating* 100Hz
+     * timer.  Arming this once as a one-shot left the BCD clock frozen
+     * after a single tick, so the PROM's wait-for-the-clock-to-change loop
+     * at PROM 0xbfc31248 never completed; sgi_hpc3_bbram_tick() re-arms it.
+     */
+    timer_mod_ns(state->bbram_timer,
+                 qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + SGI_BBRAM_TICK_NS);
 
     qemu_chr_fe_set_handlers(&state->console,
                              sgi_hpc3_console_can_receive,

@@ -27,4 +27,16 @@ enum {
     SGI_IOC2_OUT_CPU1,
 };
 
+/*
+ * MAME never maps the IOC2 registers into a flat byte window: hpc3.cpp's
+ * pio_data_r() is a 32-bit handler whose offs_t is a DWORD index, and it
+ * reaches the device through AS_PIO6 as
+ *     read_word(dword & 0xff, 0x00ff) & 0xff
+ * so register N is the dword at channel offset N and only its low byte
+ * carries data.  The PIO window dispatcher uses these two helpers to do
+ * exactly one register access per dword.
+ */
+uint8_t sgi_ioc2_pio6_read_byte(DeviceState *ioc2, unsigned reg);
+void sgi_ioc2_pio6_write_byte(DeviceState *ioc2, unsigned reg, uint8_t val);
+
 #endif

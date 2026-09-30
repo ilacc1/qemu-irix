@@ -836,6 +836,22 @@ static void sgi_ioc2_write(void *opaque, hwaddr addr, uint64_t val,
     sgi_ioc2_write_inner(opaque, addr, val, size);
 }
 
+uint8_t sgi_ioc2_pio6_read_byte(DeviceState *ioc2, unsigned reg)
+{
+    SgiIoc2State *state = SGI_IOC2(ioc2);
+    hwaddr addr = state->guinness ? reg : reg + SGI_IOC2_MMIO_BASE;
+
+    return sgi_ioc2_read_inner(state, addr, 1) & 0xff;
+}
+
+void sgi_ioc2_pio6_write_byte(DeviceState *ioc2, unsigned reg, uint8_t val)
+{
+    SgiIoc2State *state = SGI_IOC2(ioc2);
+    hwaddr addr = state->guinness ? reg : reg + SGI_IOC2_MMIO_BASE;
+
+    sgi_ioc2_write_inner(state, addr, val, 1);
+}
+
 static const MemoryRegionOps sgi_ioc2_ops = {
     .read = sgi_ioc2_read,
     .write = sgi_ioc2_write,

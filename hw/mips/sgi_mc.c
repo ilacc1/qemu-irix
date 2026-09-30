@@ -235,23 +235,43 @@ static void sgi_mc_unmap_banks(SgiMcState *state, unsigned reg)
 }
 
 /*
- * Installed RAM per MC bank from the machine's `-m` size (MAME mc.cpp reads
- * the SIMM inputs the same way). Banks past the installed size are empty;
- * a full 128MB bank is dual-rank, smaller tails single-rank.
+ * Installed RAM per MC bank, from the SIMM nibbles the PROM probes.
+ *
+ * MAME mc.cpp:778/797-798 derives every bank from m_simms:
+ *   inst_rank = BIT(simms, bank * 4 + 3)
+ *   inst_size = 1U << (BIT(simms, bank * 4, 3) + 21 - inst_rank)
+ * ip24_mc pins that port to 0x03 (indy_indigo2.cpp:312), so bank A is a
+ * single-rank 16MB SIMM and banks B/C/D are empty. The machine's `-m` size
+ * only bounds the backing store; it does not describe the SIMM layout, and
+ * the PROM sizes memory and relocates from these registers.
  */
+#define SGI_MC_SIMMS 0x03
+
 static void sgi_mc_installed_bank(unsigned bank, hwaddr ram_size,
                                   hwaddr *start, hwaddr *size,
                                   unsigned *rank)
 {
-    hwaddr bank_start = (hwaddr)bank * 128 * MiB;
-    hwaddr avail = bank_start < ram_size ? ram_size - bank_start : 0;
+    uint32_t simms = SGI_MC_SIMMS;
+    unsigned field = (simms >> (bank * 4)) & 0x7;
+    unsigned inst_rank = (simms >> (bank * 4 + 3)) & 1;
+    hwaddr inst_size = 1ULL << (field + 21 - inst_rank);
 
-    if (avail > 128 * MiB) {
-        avail = 128 * MiB;
+    /* MAME: an empty SIMM nibble resets the bank, so it stays unmapped. */
+    if (!field) {
+        *start = 0;
+        *size = 0;
+        *rank = 0;
+        return;
     }
-    *start = bank_start;
-    *size = avail;
-    *rank = avail > 64 * MiB ? 1 : 0;
+
+    *start = (hwaddr)bank * 128 * MiB;
+    *size = inst_size;
+    *rank = inst_rank;
+
+    /* The backing store is still -m sized; clamp to what it can hold. */
+    if (*start + *size > ram_size) {
+        *size = *start < ram_size ? ram_size - *start : 0;
+    }
 }
 
 static void sgi_mc_map_banks(SgiMcState *state, unsigned reg, uint32_t data)

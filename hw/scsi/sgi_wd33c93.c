@@ -37,6 +37,9 @@ struct SGIWD33C93State {
     uint8_t scsi_status;
     bool command_active;
     bool selection_status_pending;
+    bool dma_armed;
+    bool kick_traced;
+    uint32_t dma_moved;
     uint8_t completion_phase;
     uint8_t irq_fifo[8];
     uint8_t irq_fifo_pos;
@@ -147,6 +150,7 @@ static void sgi_wd_reset_state(SGIWD33C93State *state)
     state->scsi_status = SGI_WD_STATUS_SELECT_TRANSFER_SUCCESS;
     state->command_active = false;
     state->selection_status_pending = false;
+    state->dma_armed = false;
     state->completion_phase = 0;
     state->dma_next_desc = 0;
     state->dma_current = 0;
@@ -400,6 +404,30 @@ static void sgi_wd_dma_write(void *opaque, uint8_t *buf, int len)
     SGIWD33C93State *state = opaque;
     CPUState *cs = qemu_get_cpu(0);
 
+    /*
+     * The ESP is the bus master during its data-in phase: the guest has
+     * already armed the WD transfer count (registers 0x12-0x14, 24 bit) for
+     * the whole command and the ESP drives REQ/ACK for each chunk itself.
+     *
+     * dma_count, by contrast, is the HPC3 channel the *guest's own* copy
+     * engine uses.  It reaches us stale: sgi_wd_start_transfer() only clears
+     * it when the channel is idle, the guest rarely reprograms the 14 bit
+     * 0x1000 register for the SCSI path, and when it uses the SGI descriptor
+     * chain the count is a per-descriptor slice.  Gating the ESP's bytes on
+     * it via sgi_wd_dma_next() therefore truncates every transfer that is
+     * bigger than one chunk: the loop stops at the descriptor boundary, the
+     * ESP's TC never reaches zero, no function-complete is ever raised, and
+     * the command hangs until the driver gives up.  That was every READ(10)
+     * after the first 512 byte one, which is what left the kernel unable to
+     * find its root filesystem.
+     *
+     * So let the ESP's request stand: top the count up to what it is asking
+     * for, and keep walking the chain as before for the guest's own DMA.
+     */
+    if (len > state->dma_count) {
+        state->dma_count = len;
+    }
+    state->dma_moved += len;
     while (len > 0 && sgi_wd_dma_next(state)) {
         uint8_t v = *buf++;
         bool ok = false;
@@ -557,6 +585,51 @@ static unsigned sgi_wd_cdb_length(uint8_t opcode)
 }
 
 static void sgi_wd_update_status(SGIWD33C93State *state);
+
+/*
+ * MAME wd33c9x.cpp:735 sets BSY for every command above DISCONNECT, and
+ * :799-806 gives SELECT (0x07) / SELECT_ATN (0x06) the selection state
+ * machine.  This model has no SCSI bus phases, so resolve the selection
+ * against the target list directly: a device matching DESTINATION_ID
+ * answers SELECT_TRANSFER_SUCCESS, a missing one SELECTION_TIMEOUT.
+ *
+ * The kernel only uses SELECT_ATN_TRANSFER (0x08, see sgi_wd_start_transfer)
+ * for the *first* command after reset; every later command is preceded by
+ * SELECT_ATN.  With that command unhandled the auxiliary status never leaves
+ * 0x00, the driver's wait for BSY/INT never ends, and every subsequent
+ * command dies on its 60 second timeout ("SCSI cmd=0x28 timeout after
+ * 60 sec. Resetting SCSI bus").  BSY is held by command_active, because
+ * sgi_wd_update_status() drops BSY whenever no command is in flight.
+ */
+static void sgi_wd_start_select(SGIWD33C93State *state)
+{
+    uint8_t dest = state->wd_regs[0x15] & BUSID_DID;
+    bool present = scsi_device_find(&state->esp->bus, 0, dest, 0) != NULL;
+    uint8_t status = present ? SGI_WD_STATUS_SELECT_TRANSFER_SUCCESS
+                             : SGI_WD_STATUS_SELECTION_TIMEOUT;
+
+    state->command_active = true;
+    state->dma_armed = false;
+    state->irq_initiator = true;
+    state->auxiliary_status |= 0x20;            /* BSY */
+    state->completion_phase = 0;
+    sgi_wd_irq_fifo_reset(state);
+    sgi_wd_irq_fifo_push(state, status);
+    state->scsi_status = status;
+    state->selection_status_pending = present;
+
+    if (sgi_wd_trace_enabled()) {
+        fprintf(stderr, "SGIWDSEL dest=%u %s -> %02x aux=%02x\n",
+                dest, present ? "found" : "missing", status,
+                state->auxiliary_status);
+    }
+    sgi_wd_update_irq(state);
+    if (state->progress_timer) {
+        timer_mod_ns(state->progress_timer,
+                     qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100000);
+    }
+}
+
 static void sgi_wd_patch_byte(SGIWD33C93State *state, uint32_t va, uint8_t v)
 {
     CPUState *cs = qemu_get_cpu(0);
@@ -629,6 +702,9 @@ static void sgi_wd_start_transfer(SGIWD33C93State *state)
 
     esp_hard_reset(state->esp);
     state->command_active = true;
+    state->dma_armed = false;
+    state->dma_moved = 0;
+    state->kick_traced = false;
     /* MAME wd33c9x.cpp:1051: SELECT enters initiator mode. */
     state->irq_initiator = true;
     /* MAME wd33c9x.cpp:733-735: Level II commands set BSY. */
@@ -661,9 +737,29 @@ static void sgi_wd_start_transfer(SGIWD33C93State *state)
                 transfer_count, state->dma_current);
     }
 
-    esp_reg_write(state->esp, ESP_TCLO, transfer_count);
-    esp_reg_write(state->esp, ESP_TCMID, transfer_count >> 8);
-    esp_reg_write(state->esp, ESP_TCHI, transfer_count >> 16);
+    /*
+     * Latch the transfer count directly.  esp.c:1303 esp_reg_write() drops
+     * ESP_TCLO/TCMID/TCHI on the floor: it only clears STAT_TC and never
+     * stores the value into either rregs or wregs, so esp_get_tc()
+     * (esp.c:208) and esp_get_stc() (esp.c:225) both read 0 afterwards.
+     * The ESP then has no idea how many bytes it is supposed to move:
+     * esp_dma_ti_check()'s "defer until data is available" checks
+     * (esp.c:628) are skipped, the DMA path is never taken for a read whose
+     * data arrives late, and the command is completed by the esp.c:1024
+     * CMD_SELATN branch with INTR_FC set and zero bytes transferred.
+     *
+     * wregs is what esp_get_stc() reads, so esp_run_cmd()'s DMA reload
+     * (esp.c:1173) picks the count up when TI|DMA is written; rregs is what
+     * the guest-visible read path and the decrement logic use.
+     */
+    state->esp->wregs[ESP_TCLO] = transfer_count;
+    state->esp->wregs[ESP_TCMID] = transfer_count >> 8;
+    state->esp->wregs[ESP_TCHI] = transfer_count >> 16;
+    state->esp->rregs[ESP_TCLO] = transfer_count;
+    state->esp->rregs[ESP_TCMID] = transfer_count >> 8;
+    state->esp->rregs[ESP_TCHI] = transfer_count >> 16;
+    state->esp->tchi_written = true;
+    state->esp->rregs[ESP_RSTAT] &= ~STAT_TC;
     state->esp->wregs[ESP_WBUSID] = state->wd_regs[0x15] & BUSID_DID;
     /* MAME wd33c9x.cpp:1761-1763: IDENTIFY with ER bit from SOURCE_ID. */
     esp_reg_write(state->esp, ESP_FIFO, (state->wd_regs[0x0f] & 7) | 0x80 |
@@ -674,6 +770,7 @@ static void sgi_wd_start_transfer(SGIWD33C93State *state)
     esp_reg_write(state->esp, ESP_CMD, CMD_SELATN);
     if (sgi_wd_wd_dma_mode(state) && state->dma_count && state->esp->async_len) {
         esp_reg_write(state->esp, ESP_CMD, CMD_TI | CMD_DMA);
+        state->dma_armed = true;
     }
     /*
      * Progress WD/ESP via timer as well as polls: the QEMU equivalent of
@@ -700,6 +797,21 @@ static void sgi_wd_update_status(SGIWD33C93State *state)
      * before returning. Bulk READs still gate on FC below.
      */
     for (int iter = 0; iter < 4; iter++) {
+    if (sgi_wd_trace_enabled() && !state->kick_traced &&
+        state->command_active) {
+        state->kick_traced = true;
+        fprintf(stderr,
+                "WDGATE dmac=%u moved=%u async=%u ti_size=%d armed=%d mode=%d cmd=%02x rintr=%02x tc=%u descf=%08x dctl=%02x dact=%d op=%02x\n",
+                state->dma_count, state->dma_moved, state->esp->async_len,
+                state->esp->ti_size, state->dma_armed,
+                sgi_wd_wd_dma_mode(state), state->esp->rregs[ESP_CMD],
+                state->esp->rregs[ESP_RINTR],
+                (state->esp->rregs[ESP_TCHI] << 16) |
+                (state->esp->rregs[ESP_TCMID] << 8) |
+                state->esp->rregs[ESP_TCLO],
+                state->dma_desc_flags, state->dma_control, state->dma_active,
+                state->wd_regs[3]);
+    }
     /* For probe opcodes, run pending BH work inline so a single guest poll
      * that finds async==0 still completes in one pass. */
     {
@@ -713,17 +825,66 @@ static void sgi_wd_update_status(SGIWD33C93State *state)
      * the fifo and blocked the STATUS collect, hanging bulk READs.
      * Completion is reported exactly once, below, after the ESP raises it.
      */
-    if (state->dma_count && state->esp->async_len &&
-        state->esp->rregs[ESP_CMD] != (CMD_TI | CMD_DMA)) {
+    if (state->dma_count && state->esp->async_len && !state->dma_armed) {
         /*
-         * Kick the ESP transfer once (MAME INIT_XFR); do not re-kick while in
-         * TI|DMA (it reloads the count and discards multi-chunk progress).
+         * Kick the ESP transfer once per command (MAME INIT_XFR) to cover the
+         * case where the target's data only arrives *after* the command was
+         * issued.  QEMU's esp.c runs the DMA path in esp_transfer_data()
+         * (esp.c:1062) only when ESP_CMD already reads CMD_TI|CMDDMA when the
+         * data lands; with a plain CMD_SELATN left in place it instead takes
+         * the esp.c:1024 branch, sets INTR_BS|INTR_FC and the command
+         * "completes" without moving a byte -- which is what made the kernel
+         * get good statuses for reads that transferred nothing and then panic
+         * with "vfs_mountroot: no root found".
+         *
+         * The kick must be latched in the model: ESP_CMD is write-only, so its
+         * readback stays CMD_TI|CMDDMA forever and the old
+         * `rregs[ESP_CMD] != (CMD_TI|CMD_DMA)` guard could never re-open once
+         * the ESP had been kicked, dead-ending every later chunk.  One kick
+         * per command is also what the original comment wanted (a second one
+         * reloads TC and discards multi-chunk progress).
+         *
          * No IRQ is pushed for DATA_IN: in DMA mode the chip asserts DRQ,
          * never an IRQ, and completion is reported exactly once below.
          * Polled CONTROL stays on the PIO DATA path (MAME wd33c9x RECV).
          */
         if (!sgi_wd_wd_dma_mode(state)) {
             break;
+        }
+        state->dma_armed = true;
+        /*
+         * Make the ESP's transfer count agree with what the target is really
+         * going to hand over.  We seeded TC from the WD transfer count
+         * registers (0x12-0x14), but esp.c's do_command_phase() (esp.c:982)
+         * sets ti_size to the length the SCSI layer actually negotiated for
+         * the CDB, and esp_dma_ti_check() only ends the transfer on
+         * `async_len == 0 && ti_size == 0 && esp_get_tc(s)` (esp.c:667).
+         *
+         * When the two disagree, TC drains first and the predicate can never
+         * become true again: the tail is never fetched, no function-complete
+         * is ever raised and the driver waits forever.  One READ(10) of 512
+         * blocks does exactly this -- the guest programs 0x3f000 for the WD
+         * count while the CDB asks for 0x40000, a 4096 byte shortfall that
+         * hangs the whole boot.  ti_size is the authoritative length (it is
+         * what the ESP decrements against TC), so drive TC from it.  wregs
+         * has to be updated too: esp_run_cmd() reloads TC from wregs for any
+         * command carrying CMD_DMA.
+         */
+        if (state->esp->ti_size) {
+            state->esp->wregs[ESP_TCLO] = state->esp->ti_size;
+            state->esp->wregs[ESP_TCMID] = state->esp->ti_size >> 8;
+            state->esp->wregs[ESP_TCHI] = state->esp->ti_size >> 16;
+        }
+        if (sgi_wd_trace_enabled()) {
+            fprintf(stderr,
+                    "WDKICK tc=%u ti_size=%d async=%u phase=%02x rseq=%02x rintr=%02x\n",
+                    (state->esp->rregs[ESP_TCHI] << 16) |
+                    (state->esp->rregs[ESP_TCMID] << 8) |
+                    state->esp->rregs[ESP_TCLO],
+                    state->esp->ti_size, state->esp->async_len,
+                    state->esp->rregs[ESP_RSTAT],
+                    state->esp->rregs[ESP_RSEQ],
+                    state->esp->rregs[ESP_RINTR]);
         }
         esp_reg_write(state->esp, ESP_CMD, CMD_TI | CMD_DMA);
         continue;
@@ -783,9 +944,10 @@ static void sgi_wd_update_status(SGIWD33C93State *state)
             /* Board trace: completion state at COMMAND_COMPLETE */
             if (sgi_wd_trace_enabled()) {
                 fprintf(stderr,
-                        "WDCOMP t=%llu resid=%.6x dma_count=%u flags=%08x ctl=%02x aux=%02x act=%d\n",
+                        "WDCOMP t=%llu resid=%.6x dma_count=%u moved=%u flags=%08x ctl=%02x aux=%02x act=%d\n",
                         (unsigned long long)qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
-                        residCk, state->dma_count, state->dma_desc_flags,
+                        residCk, state->dma_count, state->dma_moved,
+                        state->dma_desc_flags,
                         state->dma_control, state->auxiliary_status,
                         state->command_active);
             }
@@ -1117,6 +1279,11 @@ static uint64_t sgi_wd_read(void *opaque, hwaddr addr, unsigned size)
             uint8_t value = state->wd_regs[state->register_select];
 
             state->register_select = (state->register_select + 1) & 0x1f;
+            if (sgi_wd_trace_enabled() &&
+                sgi_wd_trace_wanted(2, state->register_select)) {
+                fprintf(stderr, "WD33 REG RV addr=%02x val=%02x\n",
+                        (state->register_select - 1) & 0x1f, value);
+            }
             return value;
         }
         return 0;
@@ -1146,6 +1313,9 @@ static void sgi_wd_write(void *opaque, hwaddr addr, uint64_t value,
                 sgi_wd_reset_state(state);
             } else if ((value & 0x1f) == 8) {
                 sgi_wd_start_transfer(state);
+            } else if ((value & 0x1f) == 6 || (value & 0x1f) == 7) {
+                /* MAME COMMAND_CC_SELECT_ATN / _SELECT. */
+                sgi_wd_start_select(state);
             }
         } else if (reg < 0x18) {
             state->wd_regs[reg] = value;
@@ -1185,7 +1355,8 @@ static const VMStateDescription vmstate_sgi_wd = {
         VMSTATE_BOOL(data_status_queued, SGIWD33C93State),
         VMSTATE_UINT32(dma_next_desc, SGIWD33C93State),
         VMSTATE_UINT32(dma_current, SGIWD33C93State),
-        VMSTATE_UINT32(dma_count, SGIWD33C93State),
+        VMSTATE_BOOL(dma_armed, SGIWD33C93State),
+    VMSTATE_UINT32(dma_count, SGIWD33C93State),
         VMSTATE_UINT32(dma_control, SGIWD33C93State),
         VMSTATE_UINT32(dma_desc_flags, SGIWD33C93State),
         VMSTATE_BOOL(dma_irq, SGIWD33C93State),
