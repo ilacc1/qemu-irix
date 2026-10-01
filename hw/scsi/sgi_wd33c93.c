@@ -768,6 +768,38 @@ static void sgi_wd_start_transfer(SGIWD33C93State *state)
         esp_reg_write(state->esp, ESP_FIFO, state->wd_regs[3 + i]);
     }
     esp_reg_write(state->esp, ESP_CMD, CMD_SELATN);
+    /*
+     * Rebase the ESP transfer count on the length the target actually
+     * negotiated for this CDB (ti_size), not the WD count registers
+     * (0x12-0x14).  The whole SCSI negotiation above ran synchronously
+     * inside the SELATN write, so ti_size is final here and no DMA has
+     * moved yet (TI|DMA is only written below), making TC pristine.
+     *
+     * The WD count is not authoritative: the guest programs 0x3f000 for a
+     * 512-block WRITE(10) whose CDB asks for 0x40000.  With TC 4096 short,
+     * the last buffer arrives with TC < async_len; esp.c then moves a
+     * partial tail, leaves async_len != 0 with TC == 0, never raises the
+     * scsi_req_continue that would return the buffer, and the driver times
+     * out (the same shortfall hung a 512-block READ(10) the other way).
+     * ti_size is what the ESP decrements against TC, so drive TC from its
+     * magnitude (negative for DATA OUT).  wregs must match: esp_run_cmd()
+     * reloads TC from wregs for any command carrying CMD_DMA.
+     */
+    if (state->esp->ti_size) {
+        uint32_t total = state->esp->ti_size < 0 ?
+            (uint32_t)(-state->esp->ti_size) : (uint32_t)state->esp->ti_size;
+        state->esp->wregs[ESP_TCLO] = total;
+        state->esp->wregs[ESP_TCMID] = total >> 8;
+        state->esp->wregs[ESP_TCHI] = total >> 16;
+        state->esp->rregs[ESP_TCLO] = total;
+        state->esp->rregs[ESP_TCMID] = total >> 8;
+        state->esp->rregs[ESP_TCHI] = total >> 16;
+        state->esp->rregs[ESP_RSTAT] &= ~STAT_TC;
+        if (sgi_wd_trace_enabled()) {
+            fprintf(stderr, "WDSYNC tc=%u ti_size=%d op=%02x\n",
+                    total, state->esp->ti_size, state->wd_regs[3]);
+        }
+    }
     if (sgi_wd_wd_dma_mode(state) && state->dma_count && state->esp->async_len) {
         esp_reg_write(state->esp, ESP_CMD, CMD_TI | CMD_DMA);
         state->dma_armed = true;
@@ -852,29 +884,8 @@ static void sgi_wd_update_status(SGIWD33C93State *state)
             break;
         }
         state->dma_armed = true;
-        /*
-         * Make the ESP's transfer count agree with what the target is really
-         * going to hand over.  We seeded TC from the WD transfer count
-         * registers (0x12-0x14), but esp.c's do_command_phase() (esp.c:982)
-         * sets ti_size to the length the SCSI layer actually negotiated for
-         * the CDB, and esp_dma_ti_check() only ends the transfer on
-         * `async_len == 0 && ti_size == 0 && esp_get_tc(s)` (esp.c:667).
-         *
-         * When the two disagree, TC drains first and the predicate can never
-         * become true again: the tail is never fetched, no function-complete
-         * is ever raised and the driver waits forever.  One READ(10) of 512
-         * blocks does exactly this -- the guest programs 0x3f000 for the WD
-         * count while the CDB asks for 0x40000, a 4096 byte shortfall that
-         * hangs the whole boot.  ti_size is the authoritative length (it is
-         * what the ESP decrements against TC), so drive TC from it.  wregs
-         * has to be updated too: esp_run_cmd() reloads TC from wregs for any
-         * command carrying CMD_DMA.
-         */
-        if (state->esp->ti_size) {
-            state->esp->wregs[ESP_TCLO] = state->esp->ti_size;
-            state->esp->wregs[ESP_TCMID] = state->esp->ti_size >> 8;
-            state->esp->wregs[ESP_TCHI] = state->esp->ti_size >> 16;
-        }
+        /* TC was already rebased on |ti_size| at issue time (see WDSYNC);
+         * the kick only writes TI|DMA so esp_run_cmd() reloads it. */
         if (sgi_wd_trace_enabled()) {
             fprintf(stderr,
                     "WDKICK tc=%u ti_size=%d async=%u phase=%02x rseq=%02x rintr=%02x\n",

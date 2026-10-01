@@ -84,7 +84,6 @@ struct SgiHpc3State {
     int mouse_div_rem_x;
     int mouse_div_rem_y;
     uint8_t mouse_buttons;
-    QemuInputHandlerState *kbd_hs;
     uint8_t bbram[0x2000];
     uint32_t bbram_size;
     char *nvram_dir;
@@ -277,39 +276,6 @@ static void sgi_hpc3_mouse_packet(SgiHpc3State *state, int dx, int dy)
     sgi_hpc3_mouse_enqueue(state, b0);
     sgi_hpc3_mouse_enqueue(state, (uint8_t)dx);
     sgi_hpc3_mouse_enqueue(state, (uint8_t)dy);
-}
-
-static void sgi_hpc3_mouse_move(SgiHpc3State *state, int dx, int dy)
-{
-    /* The PROM doubles PS/2 motion, so divide host motion by 60 with a
-     * 5-point deadzone; remainders carry so slow drifts still arrive.
-     * Packets split at 127 like a real mouse, only while streaming is
-     * enabled (F4). The ABS/REL baseline lives with the caller so later
-     * absolute reports do not jump. */
-    int sum_x, sum_y;
-
-    if (!state->mouse_reporting) {
-        return;
-    }
-    sum_x = dx + state->mouse_div_rem_x;
-    sum_y = dy + state->mouse_div_rem_y;
-    state->mouse_div_rem_x = sum_x;
-    state->mouse_div_rem_y = sum_y;
-    if (abs(sum_x) <= 5 && abs(sum_y) <= 5) {
-        return;
-    }
-    dx = sum_x / 60;
-    dy = sum_y / 60;
-    state->mouse_div_rem_x = sum_x % 60;
-    state->mouse_div_rem_y = sum_y % 60;
-    while (dx != 0 || dy != 0) {
-        int step_x = dx < -128 ? -128 : dx > 127 ? 127 : dx;
-        int step_y = dy < -128 ? -128 : dy > 127 ? 127 : dy;
-
-        sgi_hpc3_mouse_packet(state, step_x, step_y);
-        dx -= step_x;
-        dy -= step_y;
-    }
 }
 
 /*
@@ -530,96 +496,6 @@ static void sgi_hpc3_data_write(SgiHpc3State *state, uint8_t val)
     }
     sgi_hpc3_kbd_command(state, val);
 }
-
-static void sgi_hpc3_kbd_event(DeviceState *dev, QemuConsole *src,
-                               QemuInputEvent *evt)
-{
-    SgiHpc3State *state = SGI_HPC3(dev);
-    uint16_t keycode = 0;
-
-    if (evt->type == INPUT_EVENT_KIND_KEY) {
-        /* PROM keymap is AT Set 2 indexed; high byte is the 0xe0 prefix. */
-        if (evt->key.key < qemu_input_map_linux_to_atset2_len) {
-            keycode = qemu_input_map_linux_to_atset2[evt->key.key];
-        }
-        if (!keycode) {
-            return;
-        }
-        if (keycode & 0xff00) {
-            sgi_hpc3_kbd_enqueue(state, keycode >> 8);
-        }
-        if (!evt->key.down) {
-            sgi_hpc3_kbd_enqueue(state, 0xf0);
-        }
-        sgi_hpc3_kbd_enqueue(state, keycode & 0xff);
-        return;
-    }
-    if (evt->type == INPUT_EVENT_KIND_ABS) {
-        /* Absolute position in screen pixels; negate Y (PS/2 is up-positive). */
-        if (evt->abs.axis == INPUT_AXIS_X) {
-            if (state->mouse_have_pos) {
-                sgi_hpc3_mouse_move(state,
-                                    evt->abs.value - state->mouse_x, 0);
-            }
-            state->mouse_x = evt->abs.value;
-            state->mouse_have_pos = true;
-        } else if (evt->abs.axis == INPUT_AXIS_Y) {
-            if (state->mouse_have_pos) {
-                sgi_hpc3_mouse_move(state, 0,
-                                    state->mouse_y - evt->abs.value);
-            }
-            state->mouse_y = evt->abs.value;
-            state->mouse_have_pos = true;
-        }
-        return;
-    }
-    if (evt->type == INPUT_EVENT_KIND_REL) {
-        /* Track REL motion in the ABS baseline so mixed sequences do not jump. */
-        if (evt->rel.axis == INPUT_AXIS_X) {
-            sgi_hpc3_mouse_move(state, evt->rel.value, 0);
-            state->mouse_x += evt->rel.value;
-            state->mouse_have_pos = true;
-        } else if (evt->rel.axis == INPUT_AXIS_Y) {
-            sgi_hpc3_mouse_move(state, 0, -evt->rel.value);
-            state->mouse_y += evt->rel.value;
-            state->mouse_have_pos = true;
-        }
-        return;
-    }
-    if (evt->type == INPUT_EVENT_KIND_BTN) {
-        unsigned bit = 0;
-
-        switch (evt->btn.button) {
-        case INPUT_BUTTON_LEFT:
-            bit = 0x01;
-            break;
-        case INPUT_BUTTON_MIDDLE:
-            bit = 0x04;
-            break;
-        case INPUT_BUTTON_RIGHT:
-            bit = 0x02;
-            break;
-        default:
-            return;
-        }
-        if (evt->btn.down) {
-            state->mouse_buttons |= bit;
-        } else {
-            state->mouse_buttons &= ~bit;
-        }
-        /* Latch buttons always; the packet goes out only while reporting. */
-        if (state->mouse_reporting) {
-            sgi_hpc3_mouse_packet(state, 0, 0);
-        }
-    }
-}
-
-static const QemuInputHandler sgi_hpc3_kbd_handler = {
-    .name = "SGI HPC3 Keyboard",
-    .mask = INPUT_EVENT_MASK_KEY | INPUT_EVENT_MASK_BTN |
-            INPUT_EVENT_MASK_REL | INPUT_EVENT_MASK_ABS,
-    .event = sgi_hpc3_kbd_event,
-};
 
 static void sgi_hpc3_console_put(SgiHpc3State *state, uint8_t val)
 {
@@ -1353,8 +1229,15 @@ static void sgi_hpc3_realize(DeviceState *device, Error **errp)
                              sgi_hpc3_console_can_receive,
                              sgi_hpc3_console_receive,
                              NULL, NULL, state, NULL, true);
-    state->kbd_hs = qemu_input_handler_register(device,
-                                                &sgi_hpc3_kbd_handler);
+
+    /*
+     * No input handler is registered here on purpose.  QEMU delivers
+     * each input event to the first matching handler only, so an HPC3
+     * handler would shadow the real i8042 keyboard/mouse (whose PIO6
+     * registers the PROM actually polls).  Host input therefore flows
+     * straight to ps2kbd/ps2mouse; the ch8 8042-style pair stays as an
+     * un-driven diagnostic window.
+     */
 
     /* The seed dir is the MAME machine name set by the board (my guest
      * NVRAM path resolution uses this global). */
@@ -1398,13 +1281,6 @@ static void sgi_hpc3_realize(DeviceState *device, Error **errp)
         sgi_hpc3_note_nvram_paths(NULL, rtc_path);
     }
     sgi_hpc3_note_nvram_state(state);
-}
-
-static void sgi_hpc3_unrealize(DeviceState *device)
-{
-    SgiHpc3State *state = SGI_HPC3(device);
-
-    g_clear_pointer(&state->kbd_hs, qemu_input_handler_unregister);
 }
 
 static const VMStateDescription vmstate_sgi_hpc3 = {
@@ -1722,7 +1598,6 @@ static void sgi_hpc3_class_init(ObjectClass *klass, const void *data)
     device_class_set_legacy_reset(device_class, sgi_hpc3_reset);
     device_class_set_props(device_class, sgi_hpc3_properties);
     device_class->realize = sgi_hpc3_realize;
-    device_class->unrealize = sgi_hpc3_unrealize;
 }
 
 static const TypeInfo sgi_hpc3_type = {

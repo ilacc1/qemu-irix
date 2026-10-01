@@ -27,6 +27,7 @@
 #include "hw/core/irq.h"
 #include "hw/core/sysbus.h"
 #include "hw/input/ps2.h"
+#include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "standard-headers/linux/input-event-codes.h"
 #include "ui/console.h"
@@ -1024,6 +1025,15 @@ static void ps2_reset_exit(Object *obj, ResetType type)
     PS2State *s = PS2_DEVICE(obj);
 
     ps2_lower_irq(s);
+    /*
+     * Reassert when bytes remain queued (e.g. a power-on BAT queued in
+     * hold): exiting reset with the line low strands them with no
+     * pending/OBF, and the guest's presence wait times out.  Mirrors
+     * the read path, which likewise reasserts while data is left.
+     */
+    if (s->queue.count) {
+        ps2_raise_irq(s);
+    }
 }
 
 static void ps2_common_post_load(PS2State *s)
@@ -1091,6 +1101,18 @@ static void ps2_mouse_reset_hold(Object *obj, ResetType type)
     s->mouse_dz = 0;
     s->mouse_dw = 0;
     s->mouse_buttons = 0;
+    if (s->mouse_bat) {
+        /*
+         * MAME hle_mouse.cpp parity: a physical mouse reports BAT
+         * completion (0xAA plus device ID 0x00) on its own after
+         * power-on/reset, before any host command.  Queue it like the
+         * 0xFF-reset reply so presence detection that waits for BAT
+         * (status OBF+AUX) succeeds instead of timing out.
+         */
+        ps2_reset_queue(PS2_DEVICE(s));
+        ps2_queue(PS2_DEVICE(s), 0xaa);
+        ps2_queue(PS2_DEVICE(s), 0x00);
+    }
 }
 
 static const VMStateDescription vmstate_ps2_common = {
@@ -1296,6 +1318,10 @@ static const TypeInfo ps2_kbd_info = {
     .class_init    = ps2_kbd_class_init
 };
 
+static const Property ps2_mouse_properties[] = {
+    DEFINE_PROP_BOOL("mouse-bat", PS2MouseState, mouse_bat, false),
+};
+
 static void ps2_mouse_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -1306,6 +1332,7 @@ static void ps2_mouse_class_init(ObjectClass *klass, const void *data)
     dc->unrealize = ps2_mouse_unrealize;
     resettable_class_set_parent_phases(rc, NULL, ps2_mouse_reset_hold, NULL,
                                        &ps2dc->parent_phases);
+    device_class_set_props(dc, ps2_mouse_properties);
     dc->vmsd = &vmstate_ps2_mouse;
 }
 

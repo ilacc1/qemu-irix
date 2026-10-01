@@ -484,6 +484,22 @@ static void kbd_reset(void *opaque)
          * always-present virtual keyboard and real HW. */
         kbd_queue(s, 0xAA, 0);
     }
+    /*
+     * Resync pending with the device queues: child ps2kbd/ps2mouse
+     * resets can run before this controller reset and queue bytes
+     * (notably the mouse power-on BAT); the pending = 0 above would
+     * otherwise strand them with OBF never surfacing, and the guest's
+     * presence wait (status OBF+AUX) times out after ~500K polls.
+     */
+    if (!ps2_queue_empty(PS2_DEVICE(&s->ps2kbd))) {
+        s->pending |= KBD_PENDING_KBD;
+    }
+    if (!ps2_queue_empty(PS2_DEVICE(&s->ps2mouse))) {
+        s->pending |= KBD_PENDING_AUX;
+    }
+    if (s->pending) {
+        kbd_update_irq(s);
+    }
     if (s->throttle_timer) {
         timer_del(s->throttle_timer);
     }
@@ -705,6 +721,9 @@ static void i8042_mmio_realize(DeviceState *dev, Error **errp)
 
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->region);
 
+    object_property_set_bool(OBJECT(&ks->ps2mouse), "mouse-bat",
+                             s->mouse_bat, &error_abort);
+
     if (!sysbus_realize(SYS_BUS_DEVICE(&ks->ps2kbd), errp)) {
         return;
     }
@@ -744,6 +763,7 @@ static const Property i8042_mmio_properties[] = {
     DEFINE_PROP_UINT64("mask", MMIOKBDState, kbd.mask, UINT64_MAX),
     DEFINE_PROP_UINT32("size", MMIOKBDState, size, -1),
     DEFINE_PROP_BOOL("keyboard-bat", MMIOKBDState, kbd.keyboard_bat, false),
+    DEFINE_PROP_BOOL("mouse-bat", MMIOKBDState, mouse_bat, false),
 };
 
 static const VMStateDescription vmstate_kbd_mmio = {

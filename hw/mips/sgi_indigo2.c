@@ -1153,8 +1153,12 @@ static void mips_sgi_indigo2_init(MachineState *machine)
      * Indy has a keyboard physically attached (like MAME's always-
      * present virtual keyboard, KEYBOARD_ON=1): report its power-on
      * BAT so presence detection sees a keyboard, not an empty port.
+     * Same for the PS/2 mouse (MAME hle_mouse.cpp enqueues BAT
+     * 0xAA/0x00 at reset): the PROM waits for mouse BAT with status
+     * OBF+AUX and declares no mouse after ~500K polls without it.
      */
     qdev_prop_set_bit(DEVICE(i8042), "keyboard-bat", is_indy);
+    qdev_prop_set_bit(DEVICE(i8042), "mouse-bat", is_indy);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(i8042), &error_fatal);
 
     /* MAME ioc2.cpp kbdc_irq merger: kbd+aux IRQs OR into one line. */

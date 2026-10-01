@@ -94,6 +94,14 @@ struct PS2MouseState {
     int mouse_dz;
     int mouse_dw;
     uint8_t mouse_buttons;
+    /*
+     * Local experiment (MAME/real-HW parity): a physical PS/2 mouse
+     * transmits BAT completion (0xAA, device ID 0x00) unsolicited after
+     * power-on/reset. QEMU leaves this false (BAT only answers an 0xFF
+     * reset command); boards with an attached mouse set it so presence
+     * detection that waits for BAT does not time out.
+     */
+    bool mouse_bat;
 };
 
 #define TYPE_PS2_MOUSE_DEVICE "ps2-mouse"

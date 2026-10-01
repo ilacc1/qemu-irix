@@ -90,6 +90,8 @@ struct MMIOKBDState {
     KBDState kbd;
     uint32_t size;
     MemoryRegion region;
+    /* Forwarded to the child ps2-mouse device (see "mouse-bat"). */
+    bool mouse_bat;
 };
 
 #define I8042_A20_LINE "a20"
