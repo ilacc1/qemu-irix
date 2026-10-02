@@ -284,7 +284,17 @@ static void kbd_queue(KBDState *s, int b, int aux)
         s->cbdata = b;
         s->pending &= ~KBD_PENDING_CTRL_KBD & ~KBD_PENDING_CTRL_AUX;
         s->pending |= aux ? KBD_PENDING_CTRL_AUX : KBD_PENDING_CTRL_KBD;
-        kbd_safe_update_irq(s);
+        /*
+         * MAME parity: the controller has a single output buffer, so a
+         * controller reply takes the place of whatever a PS/2 device had
+         * pending and is what the next data read returns.  kbd_safe_update_irq()
+         * would skip the recompute while KBD_STAT_OBF is still set, leaving
+         * s->obsrc on the stale device byte.  The SGI PROM reads exactly one
+         * byte per command, so a pending mouse BAT byte left ahead of the
+         * 0xAA self-test reply made it see 0x00 instead of 0x55 and fail the
+         * "PC keyboard/mouse controller diagnostic".
+         */
+        kbd_update_irq(s);
     } else {
         ps2_queue(aux ? PS2_DEVICE(&s->ps2mouse) : PS2_DEVICE(&s->ps2kbd), b);
     }
