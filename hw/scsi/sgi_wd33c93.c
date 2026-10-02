@@ -17,14 +17,27 @@ extern hwaddr mips_cpu_get_phys_addr_debug(CPUState *cpu, vaddr addr);
 extern hwaddr mips_cpu_get_phys_page_any_asid(CPUState *cs, vaddr addr);
 void mips_dump_tlb_match(CPUState *cs, vaddr addr);
 
+#define SGI_WD_STATUS_SELECT_SUCCESS 0x11
 #define SGI_WD_STATUS_SELECT_TRANSFER_SUCCESS 0x16
 #define SGI_WD_STATUS_TRANSFER_SUCCESS 0x18
 #define SGI_WD_STATUS_SELECTION_TIMEOUT 0x42
 #define SGI_WD_STATUS_REQ 0x88
 #define SGI_WD_PHASE_DATA_IN 0x01
+#define SGI_WD_PHASE_STATUS 0x03
+#define SGI_WD_PHASE_MSG_OUT 0x06
 #define SGI_WD_PHASE_RECEIVE_STATUS 0x47
 #define SGI_WD_PHASE_STATUS_RECEIVED 0x50
 #define SGI_WD_PHASE_COMMAND_COMPLETE 0x60
+
+/* MAME wd33c9x.cpp:207-232: COMMAND_CC masks seven bits; SBT is bit 7. */
+#define SGI_WD_COMMAND_CC 0x7f
+#define SGI_WD_COMMAND_CC_RESET 0x00
+#define SGI_WD_COMMAND_CC_SELECT_ATN 0x06
+#define SGI_WD_COMMAND_CC_SELECT 0x07
+#define SGI_WD_COMMAND_CC_SELECT_ATN_TRANSFER 0x08
+#define SGI_WD_COMMAND_CC_SELECT_TRANSFER 0x09
+#define SGI_WD_COMMAND_CC_TRANSFER_INFO 0x20
+#define SGI_WD_COMMAND_SBT 0x80
 struct SGIWD33C93State {
     SysBusDevice parent_obj;
     MemoryRegion regs;
@@ -37,6 +50,8 @@ struct SGIWD33C93State {
     uint8_t scsi_status;
     bool command_active;
     bool selection_status_pending;
+    bool message_phase;
+    uint32_t message_remaining;
     bool dma_armed;
     bool kick_traced;
     uint32_t dma_moved;
@@ -93,6 +108,26 @@ static void sgi_wd_irq_fifo_pop(SGIWD33C93State *state)
     }
 }
 
+/*
+ * MAME wd33c9x.cpp decrement_transfer_count(): after any completed transfer
+ * (including a single-byte message transfer) the count registers read back 0.
+ */
+static void sgi_wd_decrement_transfer_count(SGIWD33C93State *state)
+{
+    uint32_t count;
+
+    if (!state->wd_regs[0x12] && !state->wd_regs[0x13] && !state->wd_regs[0x14]) {
+        return;
+    }
+    count = ((uint32_t)state->wd_regs[0x12] << 16) |
+            ((uint32_t)state->wd_regs[0x13] << 8) |
+            state->wd_regs[0x14];
+    count--;
+    state->wd_regs[0x12] = count >> 16;
+    state->wd_regs[0x13] = count >> 8;
+    state->wd_regs[0x14] = count;
+}
+
 static void sgi_wd_update_irq(SGIWD33C93State *state)
 {
     bool level = false;
@@ -110,8 +145,10 @@ static void sgi_wd_update_irq(SGIWD33C93State *state)
         /* MAME wd33c9x.cpp:1643: EDI/IDI silence SELECT phases mid-transfer. */
         level = true;
         if (state->irq_initiator &&
-            ((state->wd_regs[0x18] & 0x1f) == 8 ||
-             (state->wd_regs[0x18] & 0x1f) == 9)) {
+            ((state->wd_regs[0x18] & SGI_WD_COMMAND_CC) ==
+             SGI_WD_COMMAND_CC_SELECT_ATN_TRANSFER ||
+             (state->wd_regs[0x18] & SGI_WD_COMMAND_CC) ==
+             SGI_WD_COMMAND_CC_SELECT_TRANSFER)) {
             if (state->scsi_status == 0x85 &&
                 !(state->wd_regs[0x01] & 0x04)) {
                 level = false;
@@ -150,6 +187,8 @@ static void sgi_wd_reset_state(SGIWD33C93State *state)
     state->scsi_status = SGI_WD_STATUS_SELECT_TRANSFER_SUCCESS;
     state->command_active = false;
     state->selection_status_pending = false;
+    state->message_phase = false;
+    state->message_remaining = 0;
     state->dma_armed = false;
     state->completion_phase = 0;
     state->dma_next_desc = 0;
@@ -601,11 +640,22 @@ static void sgi_wd_update_status(SGIWD33C93State *state);
  * 60 sec. Resetting SCSI bus").  BSY is held by command_active, because
  * sgi_wd_update_status() drops BSY whenever no command is in flight.
  */
+/*
+ * MAME wd33c9x.cpp:1169-1180, DISC_SEL_ARBITRATION: a plain SELECT_ATN or
+ * SELECT arbitrates and then waits for the target to assert REQ, so the
+ * controller reports selection success *and* the phase the target wants next
+ * as two separate interrupts.  Both must be queued: reading the SCSI Status
+ * Register pops the IRQ FIFO entry (MAME indir_reg_r calls update_irq()), and
+ * the PROM's wait loop only leaves via aux & INT.  With a single entry queued
+ * the FIFO empties on the first read, INT drops, and the SGI PROM's poll
+ * (0xfc1f320, returning status|0x1000 on timeout) makes 0xfc1f24c report the
+ * selection as failed -- the "SYNC negotiation error" on screen.
+ */
 static void sgi_wd_start_select(SGIWD33C93State *state)
 {
     uint8_t dest = state->wd_regs[0x15] & BUSID_DID;
     bool present = scsi_device_find(&state->esp->bus, 0, dest, 0) != NULL;
-    uint8_t status = present ? SGI_WD_STATUS_SELECT_TRANSFER_SUCCESS
+    uint8_t status = present ? SGI_WD_STATUS_SELECT_SUCCESS
                              : SGI_WD_STATUS_SELECTION_TIMEOUT;
 
     state->command_active = true;
@@ -613,21 +663,107 @@ static void sgi_wd_start_select(SGIWD33C93State *state)
     state->irq_initiator = true;
     state->auxiliary_status |= 0x20;            /* BSY */
     state->completion_phase = 0;
+    state->message_phase = false;
+    state->message_remaining = 0;
     sgi_wd_irq_fifo_reset(state);
     sgi_wd_irq_fifo_push(state, status);
+    if (present) {
+        /* Target answers an ATN selection with MESSAGE OUT (IDENTIFY). */
+        sgi_wd_irq_fifo_push(state,
+                             SGI_WD_STATUS_REQ | SGI_WD_PHASE_MSG_OUT);
+    }
     state->scsi_status = status;
-    state->selection_status_pending = present;
+    state->selection_status_pending = false;
 
     if (sgi_wd_trace_enabled()) {
         fprintf(stderr, "SGIWDSEL dest=%u %s -> %02x aux=%02x\n",
                 dest, present ? "found" : "missing", status,
                 state->auxiliary_status);
     }
+    /* MAME FINISHED clears CIP and BSY before the interrupts are reported. */
+    state->auxiliary_status &= ~0x20;
     sgi_wd_update_irq(state);
     if (state->progress_timer) {
         timer_mod_ns(state->progress_timer,
                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100000);
     }
+}
+
+/*
+ * MAME wd33c9x.cpp COMMAND_CC_TRANSFER_INFO (0x20): run one message/data
+ * transfer over the connection a previous SELECT_ATN left open.  The SGI PROM
+ * uses this to push its six-byte WD sync request
+ * (80 01 03 01 <period> <offset>) to the target and to receive the reply.
+ * MAME samples the live bus phase and sets DBR when the data FIFO is empty
+ * (wd33c9x.cpp INIT_XFR / S_PHASE_MSG_OUT); the target then changes phase to
+ * STATUS, which ends the transfer with
+ * TRANSFER_SUCCESS | S_PHASE_STATUS (0x18 | 0x03) and the target status byte
+ * in TARGET_LUN.
+ */
+static void sgi_wd_start_message_xfer(SGIWD33C93State *state)
+{
+    uint32_t count = ((uint32_t)state->wd_regs[0x12] << 16) |
+                     ((uint32_t)state->wd_regs[0x13] << 8) |
+                     state->wd_regs[0x14];
+
+    /* MAME load_transfer_count(): SBT forces 1, a zero count means 1. */
+    if (state->wd_regs[0x18] & SGI_WD_COMMAND_SBT) {
+        count = 1;
+    } else if (!count) {
+        count = 1;
+    }
+    if (!state->command_active) {
+        /* MAME fatalerror(): TRANSFER_INFO requires initiator mode. */
+        return;
+    }
+    state->message_phase = true;
+    state->message_remaining = count;
+    state->auxiliary_status &= ~0x01;           /* DBR */
+    state->auxiliary_status |= 0x20;            /* BSY */
+    state->auxiliary_status |= 0x01;            /* DBR: FIFO empty */
+
+    if (sgi_wd_trace_enabled()) {
+        fprintf(stderr, "SGIWDMSG start count=%u aux=%02x\n",
+                count, state->auxiliary_status);
+    }
+    if (state->progress_timer) {
+        timer_mod_ns(state->progress_timer,
+                     qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100000);
+    }
+}
+
+static void sgi_wd_message_xfer_progress(SGIWD33C93State *state, uint8_t byte)
+{
+    if (sgi_wd_trace_enabled()) {
+        fprintf(stderr, "SGIWDMSG byte=%02x remaining=%u\n",
+                byte, state->message_remaining);
+    }
+    if (state->message_remaining) {
+        state->message_remaining--;
+    }
+    sgi_wd_decrement_transfer_count(state);
+
+    if (state->message_remaining) {
+        return;
+    }
+    /*
+     * Target switched to STATUS: report the phase and the target's status
+     * byte.  A message-only transfer carries no command, so the target's
+     * answer is GOOD unless it failed selection.
+     */
+    state->message_phase = false;
+    state->auxiliary_status &= ~0x01;           /* DBR */
+    state->auxiliary_status &= ~0x20;           /* BSY */
+    state->wd_regs[0x0f] = 0;                   /* status byte: GOOD */
+    state->wd_regs[0x10] = SGI_WD_PHASE_STATUS_RECEIVED;
+    sgi_wd_irq_fifo_push(state, SGI_WD_STATUS_TRANSFER_SUCCESS |
+                                  SGI_WD_PHASE_STATUS);
+    state->scsi_status = sgi_wd_irq_fifo_peek(state);
+    if (sgi_wd_trace_enabled()) {
+        fprintf(stderr, "SGIWDMSG done -> %02x aux=%02x\n",
+                state->scsi_status, state->auxiliary_status);
+    }
+    sgi_wd_update_irq(state);
 }
 
 static void sgi_wd_patch_byte(SGIWD33C93State *state, uint32_t va, uint8_t v)
@@ -711,6 +847,8 @@ static void sgi_wd_start_transfer(SGIWD33C93State *state)
     state->auxiliary_status = 0x80 | 0x20;
     sgi_wd_irq_fifo_reset(state);
     state->selection_status_pending = false;
+    state->message_phase = false;
+    state->message_remaining = 0;
     state->completion_phase = 0;
     state->scsi_status = 0;
     state->wd_regs[0x10] = 0x10;
@@ -820,6 +958,16 @@ static void sgi_wd_update_status(SGIWD33C93State *state)
     if (!state->command_active) {
         /* MAME wd33c9x.cpp:968-972: FINISHED clears BSY. */
         state->auxiliary_status &= ~0x20;
+        return;
+    }
+    if (state->message_phase) {
+        /*
+         * A TRANSFER_INFO message transfer never reaches the ESP: MAME drives
+         * the bus directly from step() and only sets DBR, so leave the ESP
+         * alone and keep DBR asserted while the guest still owes bytes.
+         */
+        state->auxiliary_status |= 0x01;
+        sgi_wd_update_irq(state);
         return;
     }
     /*
@@ -1248,16 +1396,7 @@ static uint64_t sgi_wd_read(void *opaque, hwaddr addr, unsigned size)
         if (fifo8_is_empty(&state->esp->fifo)) {
             state->auxiliary_status &= ~0x01;
         }
-        if (state->wd_regs[0x14] || state->wd_regs[0x13] ||
-            state->wd_regs[0x12]) {
-            uint32_t count = (state->wd_regs[0x12] << 16) |
-                             (state->wd_regs[0x13] << 8) |
-                             state->wd_regs[0x14];
-            count--;
-            state->wd_regs[0x12] = count >> 16;
-            state->wd_regs[0x13] = count >> 8;
-            state->wd_regs[0x14] = count;
-        }
+        sgi_wd_decrement_transfer_count(state);
         if (state->esp->async_len && !state->dma_count &&
             (state->wd_regs[0x12] | state->wd_regs[0x13] |
              state->wd_regs[0x14])) {
@@ -1319,14 +1458,29 @@ static void sgi_wd_write(void *opaque, hwaddr addr, uint64_t value,
                     reg, (unsigned)(value & 0xff));
         }
         if (reg == 0x18) {
+            uint8_t cc = value & SGI_WD_COMMAND_CC;
+
             state->wd_regs[reg] = value;
-            if ((value & 0x1f) == 0) {
+            if (cc == SGI_WD_COMMAND_CC_RESET) {
                 sgi_wd_reset_state(state);
-            } else if ((value & 0x1f) == 8) {
+            } else if (cc == SGI_WD_COMMAND_CC_SELECT_ATN_TRANSFER ||
+                       cc == SGI_WD_COMMAND_CC_SELECT_TRANSFER) {
                 sgi_wd_start_transfer(state);
-            } else if ((value & 0x1f) == 6 || (value & 0x1f) == 7) {
-                /* MAME COMMAND_CC_SELECT_ATN / _SELECT. */
+            } else if (cc == SGI_WD_COMMAND_CC_SELECT_ATN ||
+                       cc == SGI_WD_COMMAND_CC_SELECT) {
                 sgi_wd_start_select(state);
+            } else if (cc == SGI_WD_COMMAND_CC_TRANSFER_INFO) {
+                sgi_wd_start_message_xfer(state);
+            }
+        } else if (reg == 0x19) {
+            /*
+             * MAME indir_reg_w DATA: push the byte and decrement the
+             * transfer count.  Only meaningful while a TRANSFER_INFO
+             * message transfer is open; the ESP-fronted data paths are
+             * driven from the CDB and the HPC3 DMA engine instead.
+             */
+            if (state->message_phase) {
+                sgi_wd_message_xfer_progress(state, value);
             }
         } else if (reg < 0x18) {
             state->wd_regs[reg] = value;
@@ -1359,6 +1513,8 @@ static const VMStateDescription vmstate_sgi_wd = {
         VMSTATE_UINT8(scsi_status, SGIWD33C93State),
         VMSTATE_BOOL(command_active, SGIWD33C93State),
         VMSTATE_BOOL(selection_status_pending, SGIWD33C93State),
+        VMSTATE_BOOL(message_phase, SGIWD33C93State),
+        VMSTATE_UINT32(message_remaining, SGIWD33C93State),
         VMSTATE_UINT8(completion_phase, SGIWD33C93State),
         VMSTATE_UINT8_ARRAY(irq_fifo, SGIWD33C93State, 8),
         VMSTATE_UINT8(irq_fifo_pos, SGIWD33C93State),
