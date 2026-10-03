@@ -430,8 +430,10 @@ static void sgi_wd_dma_read(void *opaque, uint8_t *buf, int len)
              * physical); only TLB-mapped KSEG2 consults the translation.
              */
             if (cs && state->dma_current >= 0xc0000000U) {
+                /* Raw VA: the lane swizzle applies once, to the physical
+                 * result below (MAME hpc3 do_scsi_dma). */
                 hwaddr tpa = mips_cpu_get_phys_page_any_asid(
-                    cs, sgi_wd_dma_address(state, state->dma_current));
+                    cs, state->dma_current);
 
                 if (tpa != (hwaddr)-1) {
                     pa = tpa;
@@ -519,8 +521,9 @@ static void sgi_wd_dma_write(void *opaque, uint8_t *buf, int len)
              * TLB/ASID state.  Only KSEG2 consults the CPU translation.
              */
             if (cs && state->dma_current >= 0xc0000000U) {
+                /* Raw VA: single post-translation swizzle, as above. */
                 hwaddr tpa = mips_cpu_get_phys_page_any_asid(
-                    cs, sgi_wd_dma_address(state, state->dma_current));
+                    cs, state->dma_current);
 
                 if (tpa != (hwaddr)-1) {
                     pa = tpa;
@@ -807,7 +810,8 @@ static void sgi_wd_patch_byte(SGIWD33C93State *state, uint32_t va, uint8_t v)
 
     /* Same split as the DMA data paths: unmapped below 0xc0000000. */
     if (cs && va >= 0xc0000000U) {
-        hwaddr tpa = mips_cpu_get_phys_page_any_asid(cs, a);
+        /* Raw VA: single post-translation swizzle, as in the DMA loops. */
+        hwaddr tpa = mips_cpu_get_phys_page_any_asid(cs, va);
 
         if (tpa != (hwaddr)-1) {
             pa = tpa;
