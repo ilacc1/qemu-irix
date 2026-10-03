@@ -1029,14 +1029,6 @@ static void sgi_wd_update_status(SGIWD33C93State *state)
                 state->dma_desc_flags, state->dma_control, state->dma_active,
                 state->wd_regs[3]);
     }
-    /* For probe opcodes, run pending BH work inline so a single guest poll
-     * that finds async==0 still completes in one pass. */
-    {
-        uint8_t poll_op = state->wd_regs[3];
-        if (poll_op == 0x12 || poll_op == 0x1a || poll_op == 0x03) {
-            aio_poll(qemu_get_aio_context(), false);
-        }
-    }
     /*
      * No completion is pushed on DMA drain alone: the spare status re-armed
      * the fifo and blocked the STATUS collect, hanging bulk READs.
