@@ -596,6 +596,7 @@ static void sgi_wd_dma_write(void *opaque, uint8_t *buf, int len)
 }
 
 static void sgi_wd_update_status(SGIWD33C93State *state);
+static void sgi_wd_drop_reset_ua(SGIWD33C93State *state);
 
 void sgi_wd33c93_dma_reg_write(SGIWD33C93State *state, hwaddr addr,
                                uint32_t value)
@@ -736,6 +737,7 @@ static void sgi_wd_start_select(SGIWD33C93State *state)
     bool present = scsi_device_find(&state->esp->bus, 0, dest, 0) != NULL;
     uint8_t status = present ? SGI_WD_STATUS_SELECT_SUCCESS
                              : SGI_WD_STATUS_SELECTION_TIMEOUT;
+    sgi_wd_drop_reset_ua(state);
 
     state->command_active = true;
     state->dma_armed = false;
@@ -931,6 +933,24 @@ static void sgi_wd_patch_inquiry(SGIWD33C93State *state)
     state->inq_patch_pending = false;
 }
 
+/*
+ * MAME's disk never reports power-on unit attention (its reset sets none;
+ * only medium-change does, impossible with fixed media). QEMU latches
+ * UA(RESET) at machine reset, so the first command would CHECK CONDITION
+ * where MAME succeeds. Drop it on every command issue: both the split
+ * SELECT path and the combined SELECT_ATN_TRANSFER path must clear it,
+ * since the PROM uses the combined form.
+ */
+static void sgi_wd_drop_reset_ua(SGIWD33C93State *state)
+{
+    uint8_t dest = state->wd_regs[0x15] & BUSID_DID;
+    SCSIDevice *dev = scsi_device_find(&state->esp->bus, 0, dest, 0);
+
+    if (dev) {
+        dev->unit_attention = SENSE_CODE(NO_SENSE);
+    }
+}
+
 static void sgi_wd_start_transfer(SGIWD33C93State *state)
 {
     unsigned cdb_length = sgi_wd_cdb_length(state->wd_regs[3]);
@@ -972,6 +992,7 @@ static void sgi_wd_start_transfer(SGIWD33C93State *state)
                 transfer_count, state->dma_current, state->dma_count);
     }
 
+    sgi_wd_drop_reset_ua(state);
     esp_hard_reset(state->esp);
     state->command_active = true;
     state->dma_armed = false;
