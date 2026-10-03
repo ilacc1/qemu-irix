@@ -961,9 +961,10 @@ static void sgi_wd_start_transfer(SGIWD33C93State *state)
     }
 
     if (sgi_wd_trace_enabled()) {
-        fprintf(stderr, "Sending command t=%llu:%02x:%d:",
+        fprintf(stderr, "Sending command t=%llu:%02x:%d:tgt=%u:",
                 (unsigned long long)qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
-                state->wd_regs[3], cdb_length);
+                state->wd_regs[3], cdb_length,
+                state->wd_regs[0x15] & BUSID_DID);
         for (i = 0; i < cdb_length; i++) {
             fprintf(stderr, " %02x", state->wd_regs[3 + i]);
         }
@@ -1139,7 +1140,8 @@ static void sgi_wd_update_status(SGIWD33C93State *state)
         state->command_active) {
         state->kick_traced = true;
         fprintf(stderr,
-                "WDGATE dmac=%u moved=%u async=%u ti_size=%d armed=%d mode=%d cmd=%02x rintr=%02x tc=%u descf=%08x dctl=%02x dact=%d op=%02x\n",
+                "WDGATE t=%llu dmac=%u moved=%u async=%u ti_size=%d armed=%d mode=%d cmd=%02x rintr=%02x tc=%u descf=%08x dctl=%02x dact=%d op=%02x\n",
+                (unsigned long long)qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
                 state->dma_count, state->dma_moved, state->esp->async_len,
                 state->esp->ti_size, state->dma_armed,
                 sgi_wd_wd_dma_mode(state), state->esp->rregs[ESP_CMD],
