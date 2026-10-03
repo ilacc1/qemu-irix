@@ -1296,11 +1296,11 @@ static void sgi_wd_progress_tick(void *opaque)
     SGIWD33C93State *state = opaque;
 
     sgi_wd_update_status(state);
-    /* Single-shot: re-arming on a wall-clock period reintroduces
-     * host-timed nondeterminism (MAME has no periodic SCSI timer).
-     * Every guest that wants a result polls for it, and each poll
-     * drives progress; the DMACTRL-write kick covers enable-and-park.
-     */
+    if (state->command_active && state->completion_phase != 3 &&
+        state->progress_timer) {
+        timer_mod_ns(state->progress_timer,
+                     qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100000);
+    }
 }
 
 static uint64_t sgi_wd_read(void *opaque, hwaddr addr, unsigned size)
