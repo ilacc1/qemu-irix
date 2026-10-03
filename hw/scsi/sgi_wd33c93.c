@@ -554,6 +554,8 @@ static void sgi_wd_dma_write(void *opaque, uint8_t *buf, int len)
     state->dma_dropped += len;
 }
 
+static void sgi_wd_update_status(SGIWD33C93State *state);
+
 void sgi_wd33c93_dma_reg_write(SGIWD33C93State *state, hwaddr addr,
                                uint32_t value)
 {
@@ -594,6 +596,13 @@ void sgi_wd33c93_dma_reg_write(SGIWD33C93State *state, hwaddr addr,
         if (!was_active && state->dma_active) {
             sgi_wd_dma_fetch_descriptor(state);
         }
+        /*
+         * MAME hpc3.cpp:438 drives DMA at the end of this write when DRQ is
+         * already asserted. Drive one status poll too, so a program that
+         * enables DMA and then parks without further reads still kicks
+         * TI|DMA instead of waiting out the backstop timer.
+         */
+        sgi_wd_update_status(state);
         break;
     }
     }
@@ -653,8 +662,6 @@ static unsigned sgi_wd_cdb_length(uint8_t opcode)
         return 6;
     }
 }
-
-static void sgi_wd_update_status(SGIWD33C93State *state);
 
 /*
  * MAME wd33c9x.cpp:735 sets BSY for every command above DISCONNECT, and
