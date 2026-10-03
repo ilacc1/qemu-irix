@@ -55,6 +55,8 @@ struct SGIWD33C93State {
     bool dma_armed;
     bool kick_traced;
     uint32_t dma_moved;
+    uint32_t dma_got;
+    uint32_t dma_dropped;
     uint8_t completion_phase;
     uint8_t irq_fifo[8];
     uint8_t irq_fifo_pos;
@@ -194,6 +196,9 @@ static void sgi_wd_reset_state(SGIWD33C93State *state)
     state->dma_next_desc = 0;
     state->dma_current = 0;
     state->dma_count = 0;
+    state->dma_moved = 0;
+    state->dma_got = 0;
+    state->dma_dropped = 0;
     state->dma_control = 0;
     state->dma_desc_flags = 0;
     state->dma_irq = false;
@@ -354,6 +359,23 @@ static bool sgi_wd_wd_dma_mode(SGIWD33C93State *state)
     return (state->wd_regs[0x01] & 0xe0) != 0;
 }
 
+/*
+ * One residual test for both completion sites (the FC poll and the live
+ * status-register read).  Bulk transfers wait for every byte before GOOD is
+ * reported; INQUIRY/MODE SENSE/REQUEST SENSE may legitimately under-fill.
+ * A dropped tail is counted (dma_dropped) but never refuses completion:
+ * MAME completes such commands normally, and withholding GOOD wedged the
+ * driver into a bus-reset loop in testing.
+ */
+static bool sgi_wd_bulk_residual(SGIWD33C93State *state, uint8_t op)
+{
+    if (op == 0x12 || op == 0x1a || op == 0x03) {
+        return false;
+    }
+    return state->dma_count ||
+        state->wd_regs[0x12] || state->wd_regs[0x13] || state->wd_regs[0x14];
+}
+
 /* MAME hpc3.cpp:985-1000: flush raises IRQ on bit 29, drops ENABLE. */
 static void sgi_wd_dma_flush(SGIWD33C93State *state)
 {
@@ -433,9 +455,12 @@ static void sgi_wd_dma_read(void *opaque, uint8_t *buf, int len)
         *buf++ = v;
         state->dma_current++;
         state->dma_count--;
+        state->dma_got++;
         len--;
         sgi_wd_dma_bump_wd_count(state);
     }
+    /* Bytes the ESP asked for but the chain could not place. */
+    state->dma_dropped += len;
 }
 
 static void sgi_wd_dma_write(void *opaque, uint8_t *buf, int len)
@@ -518,9 +543,12 @@ static void sgi_wd_dma_write(void *opaque, uint8_t *buf, int len)
         }
         state->dma_current++;
         state->dma_count--;
+        state->dma_got++;
         len--;
         sgi_wd_dma_bump_wd_count(state);
     }
+    /* Bytes the ESP asked for but the chain could not place. */
+    state->dma_dropped += len;
 }
 
 void sgi_wd33c93_dma_reg_write(SGIWD33C93State *state, hwaddr addr,
@@ -840,6 +868,8 @@ static void sgi_wd_start_transfer(SGIWD33C93State *state)
     state->command_active = true;
     state->dma_armed = false;
     state->dma_moved = 0;
+    state->dma_got = 0;
+    state->dma_dropped = 0;
     state->kick_traced = false;
     /* MAME wd33c9x.cpp:1051: SELECT enters initiator mode. */
     state->irq_initiator = true;
@@ -926,6 +956,13 @@ static void sgi_wd_start_transfer(SGIWD33C93State *state)
     if (state->esp->ti_size) {
         uint32_t total = state->esp->ti_size < 0 ?
             (uint32_t)(-state->esp->ti_size) : (uint32_t)state->esp->ti_size;
+        /*
+         * TC stays on the negotiated length even when the WD count is
+         * shorter: esp.c wedges with async_len left over when TC runs out
+         * first (verified: capping TC hung the driver into a bus reset),
+         * and MAME completes such commands normally, so a shortfall is
+         * measured (dma_dropped) rather than manufactured or refused.
+         */
         state->esp->wregs[ESP_TCLO] = total;
         state->esp->wregs[ESP_TCMID] = total >> 8;
         state->esp->wregs[ESP_TCHI] = total >> 16;
@@ -1090,8 +1127,7 @@ static void sgi_wd_update_status(SGIWD33C93State *state)
                                ((uint32_t)state->wd_regs[0x13] << 8) |
                                state->wd_regs[0x14];
             uint8_t opCk = state->wd_regs[3];
-            bool overAlloc = (opCk == 0x12 || opCk == 0x1a || opCk == 0x03);
-            if (!overAlloc && (state->dma_count || residCk)) {
+            if (sgi_wd_bulk_residual(state, opCk)) {
             /* Bulk with residual pending: more DATA to come, do not report
              * GOOD yet; completion re-raises with drained residual. */
             } else {
@@ -1103,9 +1139,10 @@ static void sgi_wd_update_status(SGIWD33C93State *state)
             /* Board trace: completion state at COMMAND_COMPLETE */
             if (sgi_wd_trace_enabled()) {
                 fprintf(stderr,
-                        "WDCOMP t=%llu resid=%.6x dma_count=%u moved=%u flags=%08x ctl=%02x aux=%02x act=%d\n",
+                        "WDCOMP t=%llu resid=%.6x dma_count=%u moved=%u got=%u drop=%u flags=%08x ctl=%02x aux=%02x act=%d\n",
                         (unsigned long long)qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
                         residCk, state->dma_count, state->dma_moved,
+                        state->dma_got, state->dma_dropped,
                         state->dma_desc_flags,
                         state->dma_control, state->auxiliary_status,
                         state->command_active);
@@ -1290,13 +1327,8 @@ static uint64_t sgi_wd_read(void *opaque, hwaddr addr, unsigned size)
              * residual gating as the FC path: probes may complete with
              * residual, bulk READs must drain.
              */
-            uint32_t residLive = ((uint32_t)state->wd_regs[0x12] << 16) |
-                                 ((uint32_t)state->wd_regs[0x13] << 8) |
-                                 state->wd_regs[0x14];
             uint8_t opLive = state->wd_regs[3];
-            bool overLive = (opLive == 0x12 || opLive == 0x1a ||
-                             opLive == 0x03);
-            if (!overLive && (state->dma_count || residLive)) {
+            if (sgi_wd_bulk_residual(state, opLive)) {
                 /* Bulk with residual pending: fall through to normal
                  * fifo consume below; completion will report via the FC
                  * path once drained. */
