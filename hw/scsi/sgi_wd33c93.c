@@ -7,6 +7,8 @@
 #include "hw/core/sysbus.h"
 #include "hw/scsi/sgi_wd33c93.h"
 #include "hw/scsi/esp.h"
+#include "hw/scsi/scsi.h"
+#include "scsi/constants.h"
 #include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "qapi/error.h"
@@ -73,6 +75,9 @@ struct SGIWD33C93State {
     bool irq_initiator;
     QEMUTimer *progress_timer;
     uint32_t inq_patch_va;
+    uint32_t inq_patch_alloc;
+    bool inq_patch_is_cd;
+    bool inq_patch_have_va;
     bool inq_patch_pending;
 };
 
@@ -204,6 +209,9 @@ static void sgi_wd_reset_state(SGIWD33C93State *state)
     state->dma_irq = false;
     state->dma_active = false;
     state->inq_patch_va = 0;
+    state->inq_patch_alloc = 0;
+    state->inq_patch_is_cd = false;
+    state->inq_patch_have_va = false;
     state->inq_patch_pending = false;
     if (state->progress_timer) {
         timer_del(state->progress_timer);
@@ -515,6 +523,16 @@ static void sgi_wd_dma_write(void *opaque, uint8_t *buf, int len)
      */
     if (len > state->dma_count) {
         state->dma_count = len;
+    }
+    /*
+     * Latch the INQUIRY buffer start: the first DMA write of the command
+     * runs at the buffer start by construction, so this VA cannot be stale
+     * the way a start-of-command sample can.
+     */
+    if (state->inq_patch_pending && !state->inq_patch_have_va &&
+        state->wd_regs[3] == 0x12 && len > 0) {
+        state->inq_patch_va = state->dma_current;
+        state->inq_patch_have_va = true;
     }
     state->dma_moved += len;
     while (len > 0 && sgi_wd_dma_next(state)) {
@@ -855,6 +873,64 @@ static void sgi_wd_patch_byte(SGIWD33C93State *state, uint32_t va, uint8_t v)
                       MEMTXATTRS_UNSPECIFIED, &r);
 }
 
+/*
+ * Standard INQUIRY page 0 identity, as MAME returns it for indy_4020.
+ * Disk: MAME nscsi hd.cpp built-in Seagate defaults (vendor " SEAGATE",
+ * product "          ST225N", revision "1.00", response format 1/CCS).
+ * CD: indy attaches NSCSI_CDROM_SGI (indy_indigo2.cpp), Sony "CDU-76S"
+ * revision "1.0", response format 2 (SPC-3). Bounded by the initiator's
+ * allocation so short allocations cannot scribble past the buffer.
+ */
+typedef struct SGIWDInquiryIdentity {
+    uint8_t format;
+    uint8_t id[28];
+} SGIWDInquiryIdentity;
+
+static const SGIWDInquiryIdentity sgi_wd_mame_inq_hd = {
+    .format = 0x01,
+    .id = {
+        0x20, 0x53, 0x45, 0x41, 0x47, 0x41, 0x54, 0x45,
+        0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
+        0x20, 0x20, 0x53, 0x54, 0x32, 0x32, 0x35, 0x4e,
+        0x31, 0x2e, 0x30, 0x30,
+    },
+};
+
+static const SGIWDInquiryIdentity sgi_wd_mame_inq_cd = {
+    .format = 0x02,
+    .id = {
+        0x53, 0x6f, 0x6e, 0x79, 0x20, 0x20, 0x20, 0x20,
+        0x43, 0x44, 0x55, 0x2d, 0x37, 0x36, 0x53, 0x20,
+        0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
+        0x31, 0x2e, 0x30, 0x20,
+    },
+};
+
+static void sgi_wd_patch_inquiry(SGIWD33C93State *state)
+{
+    const SGIWDInquiryIdentity *inq;
+    uint32_t limit = state->inq_patch_alloc;
+    uint32_t i;
+
+    if (!state->inq_patch_pending || !state->inq_patch_have_va) {
+        return;
+    }
+    inq = state->inq_patch_is_cd ? &sgi_wd_mame_inq_cd : &sgi_wd_mame_inq_hd;
+    if (limit > 36) {
+        limit = 36;
+    }
+    if (limit > 3) {
+        sgi_wd_patch_byte(state, state->inq_patch_va + 3, inq->format);
+    }
+    if (limit > 7) {
+        sgi_wd_patch_byte(state, state->inq_patch_va + 7, 0x00);
+    }
+    for (i = 0; i < 28 && 8 + i < limit; i++) {
+        sgi_wd_patch_byte(state, state->inq_patch_va + 8 + i, inq->id[i]);
+    }
+    state->inq_patch_pending = false;
+}
+
 static void sgi_wd_start_transfer(SGIWD33C93State *state)
 {
     unsigned cdb_length = sgi_wd_cdb_length(state->wd_regs[3]);
@@ -914,17 +990,31 @@ static void sgi_wd_start_transfer(SGIWD33C93State *state)
     state->scsi_status = 0;
     state->wd_regs[0x10] = 0x10;
     state->inq_patch_pending = false;
-    if (state->wd_regs[3] == 0x12 && ((state->wd_regs[4] >> 5) & 0x7) == 0 &&
-        state->wd_regs[5] == 0 && transfer_count == 64) {
-        state->inq_patch_va = state->dma_current;
+    state->inq_patch_have_va = false;
+    /*
+     * Standard INQUIRY page 0, LUN 0, any allocation (hinv and the kernel
+     * use less than 64). Bit 0 of CDB byte 1 is EVPD: a VPD request must
+     * keep its vital-product-data payload. The buffer address is NOT
+     * captured here (dma_current may be stale for this command); it is
+     * latched from the first DMA write callback, which runs at the
+     * buffer start by construction.
+     */
+    if (state->wd_regs[3] == 0x12 && (state->wd_regs[4] & 0x01) == 0 &&
+        ((state->wd_regs[4] >> 5) & 0x7) == 0 && state->wd_regs[5] == 0) {
+        state->inq_patch_alloc = transfer_count;
+        {
+            uint8_t target_id = state->wd_regs[0x15] & BUSID_DID;
+            SCSIDevice *dev = scsi_device_find(&state->esp->bus, 0,
+                                               target_id, 0);
+            state->inq_patch_is_cd = dev && dev->type == TYPE_ROM;
+        }
         state->inq_patch_pending = true;
-        /* Board trace: standard INQUIRY LUN0 alloc-64 start */
         if (sgi_wd_trace_enabled()) {
             fprintf(stderr,
-                    "INQ-START CDB %02x %02x %02x %02x %02x %02x alloc=%u copy_va=0x%x dmac=%u\n",
+                    "INQ-START CDB %02x %02x %02x %02x %02x %02x alloc=%u\n",
                     state->wd_regs[3], state->wd_regs[4], state->wd_regs[5],
                     state->wd_regs[6], state->wd_regs[7], state->wd_regs[8],
-                    transfer_count, state->dma_current, state->dma_count);
+                    transfer_count);
         }
     }
     /* Board trace: all INQUIRY starts (incl VPD) */
@@ -1172,22 +1262,7 @@ static void sgi_wd_update_status(SGIWD33C93State *state)
             }
             /* MAME hd.cpp leaves INQUIRY byte7 0; QEMU Sync 0x10 fails IRIX length check. */
             if (state->inq_patch_pending && state->esp->status == 0) {
-                static const uint8_t mame_vpd[28] = {
-                    0x20, 0x53, 0x45, 0x41, 0x47, 0x41, 0x54, 0x45,
-                    0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
-                    0x20, 0x20, 0x53, 0x54, 0x32, 0x32, 0x35, 0x4e,
-                    0x31, 0x2e, 0x30, 0x30,
-                };
-                int pi;
-                sgi_wd_patch_byte(state, state->inq_patch_va + 7, 0x00);
-                /* EXP: MAME hd returns response-format 1 (CCS); QEMU 2. */
-                sgi_wd_patch_byte(state, state->inq_patch_va + 3, 0x01);
-                /* EXP: MAME default vendor/product/revision strings. */
-                for (pi = 0; pi < 28; pi++) {
-                    sgi_wd_patch_byte(state, state->inq_patch_va + 8 + pi,
-                                      mame_vpd[pi]);
-                }
-                state->inq_patch_pending = false;
+                sgi_wd_patch_inquiry(state);
                 /* Board trace: dump COPY after byte7 patch */
                 if (sgi_wd_trace_enabled()) {
                     CPUState *cs = qemu_get_cpu(0);
@@ -1364,22 +1439,7 @@ static uint64_t sgi_wd_read(void *opaque, hwaddr addr, unsigned size)
             state->wd_regs[0x0f] = state->esp->status;
             state->wd_regs[0x10] = SGI_WD_PHASE_COMMAND_COMPLETE;
             if (state->inq_patch_pending && state->esp->status == 0) {
-                static const uint8_t mame_vpd[28] = {
-                    0x20, 0x53, 0x45, 0x41, 0x47, 0x41, 0x54, 0x45,
-                    0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
-                    0x20, 0x20, 0x53, 0x54, 0x32, 0x32, 0x35, 0x4e,
-                    0x31, 0x2e, 0x30, 0x30,
-                };
-                int pi;
-                sgi_wd_patch_byte(state, state->inq_patch_va + 7, 0x00);
-                /* EXP: MAME hd returns response-format 1 (CCS); QEMU 2. */
-                sgi_wd_patch_byte(state, state->inq_patch_va + 3, 0x01);
-                /* EXP: MAME default vendor/product/revision strings. */
-                for (pi = 0; pi < 28; pi++) {
-                    sgi_wd_patch_byte(state, state->inq_patch_va + 8 + pi,
-                                      mame_vpd[pi]);
-                }
-                state->inq_patch_pending = false;
+                sgi_wd_patch_inquiry(state);
             }
             if (state->dma_desc_flags & (1U << 29)) {
                 state->dma_irq = true;
