@@ -363,17 +363,19 @@ static bool sgi_wd_wd_dma_mode(SGIWD33C93State *state)
  * One residual test for both completion sites (the FC poll and the live
  * status-register read).  Bulk transfers wait for every byte before GOOD is
  * reported; INQUIRY/MODE SENSE/REQUEST SENSE may legitimately under-fill.
- * A dropped tail is counted (dma_dropped) but never refuses completion:
- * MAME completes such commands normally, and withholding GOOD wedged the
- * driver into a bus-reset loop in testing.
+ * Only the WD count gates: MAME completes off the SCSI state machine and
+ * never consults the HPC3 chain count, which is legitimately nonzero at
+ * completion time under 16-bit underflow semantics.  A dropped tail is
+ * counted (dma_dropped) but never refuses completion: MAME completes such
+ * commands normally, and withholding GOOD wedged the driver into a
+ * bus-reset loop in testing.
  */
 static bool sgi_wd_bulk_residual(SGIWD33C93State *state, uint8_t op)
 {
     if (op == 0x12 || op == 0x1a || op == 0x03) {
         return false;
     }
-    return state->dma_count ||
-        state->wd_regs[0x12] || state->wd_regs[0x13] || state->wd_regs[0x14];
+    return state->wd_regs[0x12] || state->wd_regs[0x13] || state->wd_regs[0x14];
 }
 
 /* MAME hpc3.cpp:985-1000: flush raises IRQ on bit 29, drops ENABLE. */
@@ -411,7 +413,14 @@ static void sgi_wd_dma_read(void *opaque, uint8_t *buf, int len)
     SGIWD33C93State *state = opaque;
     CPUState *cs = qemu_get_cpu(0);
 
-    while (len > 0 && sgi_wd_dma_next(state)) {
+    /*
+     * MAME hpc3 do_scsi_dma/decrement_chain order: move the byte first,
+     * then decrement the 16-bit count and act when it reaches zero.  A
+     * freshly fetched zero count therefore underflows to 0xffff and keeps
+     * moving instead of ending the chain a descriptor early; only EOX
+     * (bit 31) seen at a zero crossing stops the walk.
+     */
+    while (len > 0) {
         uint8_t v = 0;
         bool ok = false;
         if (cs && state->dma_current >= 0x80000000U) {
@@ -456,10 +465,24 @@ static void sgi_wd_dma_read(void *opaque, uint8_t *buf, int len)
         }
         *buf++ = v;
         state->dma_current++;
-        state->dma_count--;
         state->dma_got++;
         len--;
         sgi_wd_dma_bump_wd_count(state);
+        /* 16-bit count like MAME's m_count: 0 underflows to 0xffff. */
+        state->dma_count = (state->dma_count - 1) & 0xffff;
+        if (state->dma_count == 0) {
+            /* MAME hpc3.cpp:967-972: IRQ on bit 29 at chain end. */
+            if (state->dma_desc_flags & (1U << 29)) {
+                state->dma_irq = true;
+                sgi_wd_update_dma_irq(state);
+            }
+            if (state->dma_desc_flags & (1U << 31)) {
+                state->dma_control &= ~0x10U;
+                state->dma_active = false;
+                break;
+            }
+            sgi_wd_dma_fetch_descriptor(state);
+        }
     }
     /* Bytes the ESP asked for but the chain could not place. */
     state->dma_dropped += len;
