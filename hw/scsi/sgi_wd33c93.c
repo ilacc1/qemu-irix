@@ -744,10 +744,9 @@ static void sgi_wd_start_select(SGIWD33C93State *state)
     /* MAME FINISHED clears CIP and BSY before the interrupts are reported. */
     state->auxiliary_status &= ~0x20;
     sgi_wd_update_irq(state);
-    if (state->progress_timer) {
-        timer_mod_ns(state->progress_timer,
-                     qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100000);
-    }
+    /* No timer: selection already completed synchronously above, and the
+     * message/data phases progress on guest reads and the transfer timer.
+     */
 }
 
 /*
@@ -787,10 +786,8 @@ static void sgi_wd_start_message_xfer(SGIWD33C93State *state)
         fprintf(stderr, "SGIWDMSG start count=%u aux=%02x\n",
                 count, state->auxiliary_status);
     }
-    if (state->progress_timer) {
-        timer_mod_ns(state->progress_timer,
-                     qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100000);
-    }
+    /* No timer: a TRANSFER_INFO transfer only moves on guest DATA writes,
+     * which drive progress themselves; a tick here is a no-op. */
 }
 
 static void sgi_wd_message_xfer_progress(SGIWD33C93State *state, uint8_t byte)
@@ -1393,20 +1390,30 @@ static uint64_t sgi_wd_read(void *opaque, hwaddr addr, unsigned size)
             if (state->esp->rregs[ESP_RINTR]) {
                 esp_reg_read(state->esp, ESP_RINTR);
             }
-            if (state->irq_fifo_size) {
-                sgi_wd_irq_fifo_pop(state);
+            /*
+             * MAME holds a completion status with INT asserted until a
+             * later SCSI Status read acks it. Consuming the entry in the
+             * same handler that reports it collapses the pulse below what
+             * the CPU samples, so hold it instead: the next 0x17 read
+             * pops it through the normal path.
+             */
+            if (!state->irq_fifo_size) {
+                sgi_wd_irq_fifo_push(state, status);
             }
             if (state->selection_status_pending &&
                 status == SGI_WD_STATUS_SELECT_TRANSFER_SUCCESS) {
                 state->selection_status_pending = false;
             }
-            if (status == SGI_WD_STATUS_SELECTION_TIMEOUT) {
-                state->command_active = false;
-            }
             if (state->completion_phase == 3) {
                 state->command_active = false;
             }
-            sgi_wd_update_status(state);
+            if ((state->scsi_status & SGI_WD_STATUS_REQ) &&
+                !fifo8_is_empty(&state->esp->fifo)) {
+                state->auxiliary_status |= 0x01;
+            } else {
+                state->auxiliary_status &= ~0x01;
+            }
+            sgi_wd_update_irq(state);
             state->register_select = 0x18;
             if (sgi_wd_trace_enabled() && sgi_wd_trace_wanted(2, 0x17)) {
                 fprintf(stderr, "WD33 REG R addr=17 val=%02x\n", status);
@@ -1441,6 +1448,11 @@ static uint64_t sgi_wd_read(void *opaque, hwaddr addr, unsigned size)
             state->auxiliary_status &= ~0x20;
         }
         sgi_wd_update_status(state);
+        if (!state->command_active && !state->irq_fifo_size) {
+            /* Drained by this ack: drop INT even if the poll above
+             * early-returned (MAME: status-read ack empties the FIFO). */
+            sgi_wd_update_irq(state);
+        }
         state->register_select = 0x18;
         return status;
     }
