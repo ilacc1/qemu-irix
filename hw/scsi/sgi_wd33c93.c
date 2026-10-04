@@ -59,6 +59,7 @@ struct SGIWD33C93State {
     uint32_t dma_moved;
     uint32_t dma_got;
     uint32_t dma_dropped;
+    bool selection_timeout_armed;
     uint8_t completion_phase;
     uint8_t irq_fifo[8];
     uint8_t irq_fifo_pos;
@@ -213,6 +214,7 @@ static void sgi_wd_reset_state(SGIWD33C93State *state)
     state->inq_patch_is_cd = false;
     state->inq_patch_have_va = false;
     state->inq_patch_pending = false;
+    state->selection_timeout_armed = false;
     if (state->progress_timer) {
         timer_del(state->progress_timer);
     }
@@ -747,13 +749,24 @@ static void sgi_wd_start_select(SGIWD33C93State *state)
     state->message_phase = false;
     state->message_remaining = 0;
     sgi_wd_irq_fifo_reset(state);
-    sgi_wd_irq_fifo_push(state, status);
     if (present) {
+        sgi_wd_irq_fifo_push(state, status);
         /* Target answers an ATN selection with MESSAGE OUT (IDENTIFY). */
         sgi_wd_irq_fifo_push(state,
                              SGI_WD_STATUS_REQ | SGI_WD_PHASE_MSG_OUT);
+        state->scsi_status = status;
+    } else {
+        /*
+         * MAME ARB_TIMEOUT_BUSY waits ~1000 SCSI cycles before giving up;
+         * reporting the timeout instantly changes how the PROM paces its
+         * missing-device retries. Hold BSY and report on the progress tick.
+         */
+        state->selection_timeout_armed = true;
+        if (state->progress_timer) {
+            timer_mod_ns(state->progress_timer,
+                         qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100000);
+        }
     }
-    state->scsi_status = status;
     state->selection_status_pending = false;
 
     if (sgi_wd_trace_enabled()) {
@@ -761,12 +774,11 @@ static void sgi_wd_start_select(SGIWD33C93State *state)
                 dest, present ? "found" : "missing", status,
                 state->auxiliary_status);
     }
-    /* MAME FINISHED clears CIP and BSY before the interrupts are reported. */
-    state->auxiliary_status &= ~0x20;
-    sgi_wd_update_irq(state);
-    /* No timer: selection already completed synchronously above, and the
-     * message/data phases progress on guest reads and the transfer timer.
-     */
+    if (present) {
+        /* MAME FINISHED clears CIP and BSY before interrupts are reported. */
+        state->auxiliary_status &= ~0x20;
+        sgi_wd_update_irq(state);
+    }
 }
 
 /*
@@ -798,6 +810,7 @@ static void sgi_wd_start_message_xfer(SGIWD33C93State *state)
     }
     state->message_phase = true;
     state->message_remaining = count;
+    state->selection_timeout_armed = false;
     state->auxiliary_status &= ~0x01;           /* DBR */
     state->auxiliary_status |= 0x20;            /* BSY */
     state->auxiliary_status |= 0x01;            /* DBR: FIFO empty */
@@ -965,6 +978,8 @@ static void sgi_wd_start_transfer(SGIWD33C93State *state)
     } else if (!transfer_count) {
         transfer_count = 1;
     }
+    /* A new command supersedes any pending selection timeout. */
+    state->selection_timeout_armed = false;
 
     /*
      * MAME couples the WD controller's data phase to its own transfer
@@ -1393,6 +1408,15 @@ static void sgi_wd_progress_tick(void *opaque)
 {
     SGIWD33C93State *state = opaque;
 
+    if (state->selection_timeout_armed) {
+        /* Deferred missing-target report (MAME ARB_TIMEOUT_BUSY). */
+        state->selection_timeout_armed = false;
+        state->auxiliary_status &= ~0x20;
+        sgi_wd_irq_fifo_push(state, SGI_WD_STATUS_SELECTION_TIMEOUT);
+        state->scsi_status = SGI_WD_STATUS_SELECTION_TIMEOUT;
+        state->command_active = false;
+        sgi_wd_update_irq(state);
+    }
     sgi_wd_update_status(state);
     if (state->command_active && state->completion_phase != 3 &&
         state->progress_timer) {
