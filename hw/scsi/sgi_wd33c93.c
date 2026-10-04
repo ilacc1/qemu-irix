@@ -24,6 +24,7 @@ void mips_dump_tlb_match(CPUState *cs, vaddr addr);
 #define SGI_WD_STATUS_TRANSFER_SUCCESS 0x18
 #define SGI_WD_STATUS_SELECTION_TIMEOUT 0x42
 #define SGI_WD_STATUS_REQ 0x88
+#define SGI_WD_PHASE_COMMAND 0x02
 #define SGI_WD_PHASE_DATA_IN 0x01
 #define SGI_WD_PHASE_STATUS 0x03
 #define SGI_WD_PHASE_MSG_OUT 0x06
@@ -181,13 +182,14 @@ static void sgi_wd_update_dma_irq(SGIWD33C93State *state)
     qemu_set_irq(state->dma_done_irq, state->dma_irq);
 }
 
-static void sgi_wd_reset_state(SGIWD33C93State *state)
+static void sgi_wd_reset_state(SGIWD33C93State *state, bool power_on)
 {
-    uint8_t own_id = state->wd_regs[0];
+    uint8_t own_id = power_on ? 0 : state->wd_regs[0];
     memset(state->wd_regs, 0, sizeof(state->wd_regs));
     /* MAME wd33c9x.cpp:421-424: 0x1a-0x1e read back 0xff. */
     memset(&state->wd_regs[0x1a], 0xff, 5);
-    /* MAME wd33c9x.cpp:738-754: soft reset preserves OWN_ID. */
+    /* MAME wd33c9x.cpp:738-754: soft reset preserves OWN_ID, but a
+     * power-on/MR reset clears it (iris power_on does the same). */
     state->wd_regs[0] = own_id;
     state->register_select = 0;
     state->auxiliary_status = 0x80;
@@ -233,7 +235,7 @@ static void sgi_wd_reset_state(SGIWD33C93State *state)
 
 static void sgi_wd_reset(DeviceState *device)
 {
-    sgi_wd_reset_state(SGI_WD33C93(device));
+    sgi_wd_reset_state(SGI_WD33C93(device), true);
 }
 
 /* Board tracing (off by default; set SGI_TRACE=1 in the environment to
@@ -736,12 +738,13 @@ static unsigned sgi_wd_cdb_length(uint8_t opcode)
  * (0xfc1f320, returning status|0x1000 on timeout) makes 0xfc1f24c report the
  * selection as failed -- the "SYNC negotiation error" on screen.
  */
-static void sgi_wd_start_select(SGIWD33C93State *state)
+static void sgi_wd_start_select(SGIWD33C93State *state, uint8_t cc)
 {
     uint8_t dest = state->wd_regs[0x15] & BUSID_DID;
     bool present = scsi_device_find(&state->esp->bus, 0, dest, 0) != NULL;
     uint8_t status = present ? SGI_WD_STATUS_SELECT_SUCCESS
                              : SGI_WD_STATUS_SELECTION_TIMEOUT;
+    bool atn = cc == SGI_WD_COMMAND_CC_SELECT_ATN;
     sgi_wd_drop_reset_ua(state);
 
     state->command_active = true;
@@ -754,9 +757,14 @@ static void sgi_wd_start_select(SGIWD33C93State *state)
     sgi_wd_irq_fifo_reset(state);
     if (present) {
         sgi_wd_irq_fifo_push(state, status);
-        /* Target answers an ATN selection with MESSAGE OUT (IDENTIFY). */
-        sgi_wd_irq_fifo_push(state,
-                             SGI_WD_STATUS_REQ | SGI_WD_PHASE_MSG_OUT);
+        /*
+         * MAME queues REQ with the live transfer phase: MESSAGE OUT
+         * (IDENTIFY) for ATN selections, COMMAND phase for bare SELECT
+         * (iris branches the same way).
+         */
+        sgi_wd_irq_fifo_push(state, SGI_WD_STATUS_REQ |
+                             (atn ? SGI_WD_PHASE_MSG_OUT
+                                  : SGI_WD_PHASE_COMMAND));
         state->scsi_status = status;
     } else {
         /*
@@ -1665,13 +1673,13 @@ static void sgi_wd_write(void *opaque, hwaddr addr, uint64_t value,
 
             state->wd_regs[reg] = value;
             if (cc == SGI_WD_COMMAND_CC_RESET) {
-                sgi_wd_reset_state(state);
+                sgi_wd_reset_state(state, false);
             } else if (cc == SGI_WD_COMMAND_CC_SELECT_ATN_TRANSFER ||
                        cc == SGI_WD_COMMAND_CC_SELECT_TRANSFER) {
                 sgi_wd_start_transfer(state);
             } else if (cc == SGI_WD_COMMAND_CC_SELECT_ATN ||
                        cc == SGI_WD_COMMAND_CC_SELECT) {
-                sgi_wd_start_select(state);
+                sgi_wd_start_select(state, cc);
             } else if (cc == SGI_WD_COMMAND_CC_TRANSFER_INFO) {
                 sgi_wd_start_message_xfer(state);
             }
@@ -1754,7 +1762,7 @@ static void sgi_wd_realize(DeviceState *device, Error **errp)
     memory_region_init_io(&state->regs, OBJECT(device), &sgi_wd_ops, state,
                           "sgi-wd33c93.regs", 0x8000);
     sysbus_init_mmio(SYS_BUS_DEVICE(device), &state->regs);
-    sgi_wd_reset_state(state);
+    sgi_wd_reset_state(state, true);
 }
 
 static void sgi_wd_class_init(ObjectClass *klass, const void *data)
