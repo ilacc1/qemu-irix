@@ -59,6 +59,8 @@ struct SGIWD33C93State {
     uint32_t dma_moved;
     uint32_t dma_got;
     uint32_t dma_dropped;
+    uint8_t pio_log[512];
+    uint16_t pio_n;
     bool selection_timeout_armed;
     uint8_t completion_phase;
     uint8_t irq_fifo[8];
@@ -205,6 +207,7 @@ static void sgi_wd_reset_state(SGIWD33C93State *state)
     state->dma_moved = 0;
     state->dma_got = 0;
     state->dma_dropped = 0;
+    state->pio_n = 0;
     state->dma_control = 0;
     state->dma_desc_flags = 0;
     state->dma_irq = false;
@@ -1014,6 +1017,7 @@ static void sgi_wd_start_transfer(SGIWD33C93State *state)
     state->dma_moved = 0;
     state->dma_got = 0;
     state->dma_dropped = 0;
+    state->pio_n = 0;
     state->kick_traced = false;
     /* MAME wd33c9x.cpp:1051: SELECT enters initiator mode. */
     state->irq_initiator = true;
@@ -1298,6 +1302,24 @@ static void sgi_wd_update_status(SGIWD33C93State *state)
                         state->dma_control, state->auxiliary_status,
                         state->command_active);
             }
+            /*
+             * Read-only PIO audit: dump what PIO reads returned so the
+             * offline diff covers the non-DMA path too.
+             */
+            if (sgi_wd_trace_enabled() && opCk == 0x28 &&
+                state->pio_n > 0) {
+                uint32_t lba = ((uint32_t)state->wd_regs[5] << 24) |
+                               ((uint32_t)state->wd_regs[6] << 16) |
+                               ((uint32_t)state->wd_regs[7] << 8) |
+                               state->wd_regs[8];
+                uint16_t i;
+                fprintf(stderr, "PIODUMP lba=%u n=%u data=",
+                        lba, state->pio_n);
+                for (i = 0; i < state->pio_n; i++) {
+                    fprintf(stderr, "%02x", state->pio_log[i]);
+                }
+                fprintf(stderr, "\n");
+            }
             /* MAME hd.cpp leaves INQUIRY byte7 0; QEMU Sync 0x10 fails IRIX length check. */
             if (state->inq_patch_pending && state->esp->status == 0) {
                 sgi_wd_patch_inquiry(state);
@@ -1570,6 +1592,10 @@ static uint64_t sgi_wd_read(void *opaque, hwaddr addr, unsigned size)
             return 0;
         }
         value = esp_reg_read(state->esp, ESP_FIFO);
+        /* Read-only PIO audit for offline diff (first sector per command). */
+        if (sgi_wd_trace_enabled() && state->pio_n < sizeof(state->pio_log)) {
+            state->pio_log[state->pio_n++] = value;
+        }
         if (fifo8_is_empty(&state->esp->fifo)) {
             state->auxiliary_status &= ~0x01;
         }
