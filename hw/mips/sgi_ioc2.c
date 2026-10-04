@@ -263,13 +263,14 @@ static void sgi_ioc2_pit_advance(SgiIoc2State *state)
     if (now <= state->pit_c2_last_ns) {
         return;
     }
-    /* Counter 2 runs at 1MHz (MAME set_clk<2>(1000000)). */
+    /* Counter 2 runs at 1MHz (MAME set_clk<2>(1000000)). Never shed
+     * elapsed ticks: lost time makes the PIT run slow against CP0 Count,
+     * which is exactly how the kernel measures 1808Hz for a 1kHz clock.
+     * Edge delivery stays safe: OUT changes latch (no IRQ storm).
+     */
     ticks = (now - state->pit_c2_last_ns) / 1000;
     if (ticks == 0) {
         return;
-    }
-    if (ticks > 1000000) {
-        ticks = 1000000;
     }
     state->pit_c2_last_ns += ticks * 1000;
     if (!state->pit_null[2]) {
