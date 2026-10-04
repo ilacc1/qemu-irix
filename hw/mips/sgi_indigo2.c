@@ -1030,9 +1030,12 @@ static void mips_sgi_indigo2_init(MachineState *machine)
 
     sysbus = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(sysbus, &error_fatal);
-    /* MAME indy_indigo2.cpp:296: the WD33C93 INT (not the ESP backend)
-     * drives IOC2 SCSI0; both OR into the IOC2 input (MAME ioc2.cpp:730). */
-    {
+    /* MAME indy_indigo2.cpp:296: the WD33C93 INT alone drives IOC2 SCSI0.
+     * OR-ing the ESP backend in too holds the level across transfers
+     * (INTR_BS) and can stick it when the WD path never acks the backend,
+     * masking real completions. Indigo2 keeps the old wiring untouched.
+     */
+    if (!is_indy) {
         DeviceState *scsi_or = qdev_new(TYPE_OR_IRQ);
         qdev_prop_set_uint16(scsi_or, "num-lines", 2);
         qdev_realize_and_unref(scsi_or, NULL, &error_fatal);
@@ -1047,8 +1050,13 @@ static void mips_sgi_indigo2_init(MachineState *machine)
     sysbus_realize_and_unref(sysbus, &error_fatal);
     sysbus_mmio_map(sysbus, 0, SGI_SCSI_BASE);
 
-    qdev_connect_gpio_out(DEVICE(sgi_wd33c93[0]), 0,
-                          qdev_get_gpio_in(scsi_ors[0], 1));
+    if (is_indy) {
+        qdev_connect_gpio_out(DEVICE(sgi_wd33c93[0]), 0,
+                              qdev_get_gpio_in(ioc2dev, 0));
+    } else {
+        qdev_connect_gpio_out(DEVICE(sgi_wd33c93[0]), 0,
+                              qdev_get_gpio_in(scsi_ors[0], 1));
+    }
 
     scsi_bus_legacy_handle_cmdline(&esp->bus);
 
