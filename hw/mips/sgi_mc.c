@@ -237,15 +237,15 @@ static void sgi_mc_unmap_banks(SgiMcState *state, unsigned reg)
 /*
  * Installed RAM per MC bank, from the SIMM nibbles the PROM probes.
  *
- * MAME mc.cpp:778/797-798 derives every bank from m_simms:
- *   inst_rank = BIT(simms, bank * 4 + 3)
- *   inst_size = 1U << (BIT(simms, bank * 4, 3) + 21 - inst_rank)
- * ip24_mc pins that port to 0x03 (indy_indigo2.cpp:312), so bank A is a
- * single-rank 16MB SIMM and banks B/C/D are empty. The machine's `-m` size
- * only bounds the backing store; it does not describe the SIMM layout, and
- * the PROM sizes memory and relocates from these registers.
+ * MAME mc.cpp exposes these as the user-configurable SIMMS port (per
+ * bank nibble: 1=4x1M, a=4x2M, 3=4x4M, c=4x8M, 5=4x16M, e=4x32M); the
+ * installed size per rank is 1U << (field + 21 - rank). This machine
+ * carries 4x32M dual-rank SIMMs in banks A+B (128MB each, 256MB total).
+ * (MAME's own default is bank A 4x4M only; its ip24 0x03 default covers
+ * the VALID register, a different port.) The machine's `-m` size only
+ * bounds the backing store; the PROM sizes memory from these registers.
  */
-#define SGI_MC_SIMMS 0x03
+#define SGI_MC_SIMMS 0x00ee
 
 static void sgi_mc_installed_bank(unsigned bank, hwaddr ram_size,
                                   hwaddr *start, hwaddr *size,
@@ -322,7 +322,9 @@ static void sgi_mc_map_banks(SgiMcState *state, unsigned reg, uint32_t data)
         if (!inst_size) {
             continue;
         }
-        inst_rank_size = inst_size >> inst_rank;
+        /* inst_size is already per rank (MAME memcfg inst_size); the extra
+         * shift used to quarter dual-rank banks a second time. */
+        inst_rank_size = inst_size;
         if (!inst_rank_size) {
             continue;
         }
