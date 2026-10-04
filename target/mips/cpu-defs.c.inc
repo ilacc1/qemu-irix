@@ -574,10 +574,14 @@ const mips_def_t mips_defs[] =
         .name = "R4000SC",
         .CP0_PRid = 0x00000400,
         /* SGI Indy R4000SC: match MAME R4000BE identity (PRId Rev 0,
-         * 16K instruction/data caches with 32B lines). */
+         * 16K instruction/data caches with 32B lines). Bits ored below
+         * are MAME's exact R4000BE reset value (compute_config_register):
+         * BE (big-endian CPU), SC (1MB secondary cache present) and SS
+         * exactly as MAME reports them.
+         */
         .CP0_Config0 = (2 << CP0C0_Impl) | (2 << CP0C0_IC) | (2 << CP0C0_DC) |
                        (1 << CP0C0_IB) | (1 << CP0C0_DB) |
-                       (2 << CP0C0_K0),
+                       (2 << CP0C0_K0) | 0x00628000,
         .CP0_Config1 = (1 << CP0C1_FP) | (1 << CP0C1_WR) |
                        (47 << CP0C1_MMU),
         .CP0_LLAddr_rw_bitmask = 0xFFFFFFFF,
