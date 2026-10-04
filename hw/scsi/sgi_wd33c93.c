@@ -386,15 +386,15 @@ static bool sgi_wd_bulk_residual(SGIWD33C93State *state, uint8_t op)
     return state->wd_regs[0x12] || state->wd_regs[0x13] || state->wd_regs[0x14];
 }
 
-/* MAME hpc3.cpp:985-1000: flush raises IRQ on bit 29, drops ENABLE. */
+/* Teardown FLUSH stops the channel but raises no DMA IRQ: IRIX acks the
+ * transfer's real IRQ and writes FLUSH to clean up, so firing here leaves
+ * the bit stuck (IRQ storm). MAME raises on bit 29; the working iris
+ * model deliberately does not.
+ */
 static void sgi_wd_dma_flush(SGIWD33C93State *state)
 {
-if (state->dma_desc_flags & (1U << 29)) {
-                state->dma_irq = true;
-                sgi_wd_update_dma_irq(state);
-            }
-            state->dma_control &= ~0x10U;
-            state->dma_active = false;
+    state->dma_control &= ~0x10U;
+    state->dma_active = false;
     state->dma_control &= ~(0x10U | 0x08U);
 }
 
