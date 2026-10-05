@@ -78,6 +78,7 @@ struct SGIWD33C93State {
     bool irq_level;
     bool irq_initiator;
     QEMUTimer *progress_timer;
+    QEMUBH *complete_bh;
     uint32_t inq_patch_va;
     uint32_t inq_patch_alloc;
     bool inq_patch_is_cd;
@@ -435,6 +436,7 @@ static void sgi_wd_dma_read(void *opaque, uint8_t *buf, int len)
      * moving instead of ending the chain a descriptor early; only EOX
      * (bit 31) seen at a zero crossing stops the walk.
      */
+    int want = len;
     while (len > 0) {
         uint8_t v = 0;
         bool ok = false;
@@ -499,6 +501,16 @@ static void sgi_wd_dma_read(void *opaque, uint8_t *buf, int len)
             sgi_wd_dma_fetch_descriptor(state);
         }
     }
+    /*
+     * Event-driven completion: bytes just moved, so translate completion
+     * in a bottom half instead of waiting for the next poll or timer tick
+     * (MAME drains synchronously on DRQ). Scheduling from here is safe
+     * (the BH runs later, never nested in ESP), and update_status is a
+     * no-op unless ESP shows completion.
+     */
+    if (len != want && state->command_active && state->complete_bh) {
+        qemu_bh_schedule(state->complete_bh);
+    }
     /* Bytes the ESP asked for but the chain could not place. */
     state->dma_dropped += len;
 }
@@ -541,6 +553,7 @@ static void sgi_wd_dma_write(void *opaque, uint8_t *buf, int len)
         state->inq_patch_va = state->dma_current;
         state->inq_patch_have_va = true;
     }
+    int want = len;
     state->dma_moved += len;
     while (len > 0 && sgi_wd_dma_next(state)) {
         uint8_t v = *buf++;
@@ -597,6 +610,16 @@ static void sgi_wd_dma_write(void *opaque, uint8_t *buf, int len)
         state->dma_got++;
         len--;
         sgi_wd_dma_bump_wd_count(state);
+    }
+    /*
+     * Event-driven completion: bytes just moved, so translate completion
+     * in a bottom half instead of waiting for the next poll or timer tick
+     * (MAME drains synchronously on DRQ). Scheduling from here is safe
+     * (the BH runs later, never nested in ESP), and update_status is a
+     * no-op unless ESP shows completion.
+     */
+    if (len != want && state->command_active && state->complete_bh) {
+        qemu_bh_schedule(state->complete_bh);
     }
     /* Bytes the ESP asked for but the chain could not place. */
     state->dma_dropped += len;
@@ -1434,6 +1457,16 @@ void sgi_wd33c93_poll(SGIWD33C93State *state)
     }
 }
 
+static void sgi_wd_complete_bh(void *opaque)
+{
+    SGIWD33C93State *state = opaque;
+
+    if (sgi_wd_trace_enabled()) {
+        fprintf(stderr, "WDBH op=%02x\n", state->wd_regs[3]);
+    }
+    sgi_wd_update_status(state);
+}
+
 static void sgi_wd_progress_tick(void *opaque)
 {
     SGIWD33C93State *state = opaque;
@@ -1759,6 +1792,7 @@ static void sgi_wd_realize(DeviceState *device, Error **errp)
 
     state->progress_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                          sgi_wd_progress_tick, state);
+    state->complete_bh = qemu_bh_new(sgi_wd_complete_bh, state);
     memory_region_init_io(&state->regs, OBJECT(device), &sgi_wd_ops, state,
                           "sgi-wd33c93.regs", 0x8000);
     sysbus_init_mmio(SYS_BUS_DEVICE(device), &state->regs);
