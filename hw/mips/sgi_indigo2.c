@@ -523,7 +523,15 @@ static uint8_t sgi_edlc_read(hwaddr addr)
 {
     switch (addr & 7) {
     case 0 ... 5:
-        return sgi_edlc_station[addr & 7];
+        /*
+         * 80C03 regs 0-5 read back as collision counters/flags regardless
+         * of bank (station address is write-only): coll_xmit 0 (so the
+         * driver identifies an SGI EDLC), coll_total 0, fill 0, and flags
+         * with NO_SQE set (carrier present, normal 10base-T, no SQE
+         * heartbeat).  Returning the station MAC here misidentifies the
+         * chip and, worse, its 0x02 bit reads as NO_CARRIER.
+         */
+        return (addr & 7) == 5 ? 0x01 : 0x00;
     case 6: {
         uint8_t value = sgi_edlc_rx_status;
 

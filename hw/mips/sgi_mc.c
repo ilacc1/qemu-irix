@@ -387,12 +387,14 @@ static uint64_t sgi_mc_read_inner(void *opaque, hwaddr addr, unsigned size)
     case 0x0010:
         return state->watchdog;
     case 0x001c:
-        return 1;
     case 0x0018:
-        /* MAME mc.cpp System ID: rev C 0x03, bit 4 = EISA present
-         * (IP22 only). 0x13 on Indy misidentifies the board as IP22
-         * from the very first PROM probe (wrong HAL2/IOC2 tables,
-         * wrong ARCS inventory, kernel never programs Local masks). */
+        /* System ID: rev C 0x03, bit 4 = EISA present (IP22 only).
+         * Big-endian kernels read it at 0x1c (mc.h SYSID), little-endian
+         * at 0x18; report rev C on both so mc_rev_level is 3 and the
+         * kernel does not warn about pre-rev-C MC with 16M DRAM parts.
+         * 0x13 on Indy misidentifies the board as IP22 from the very
+         * first PROM probe (wrong HAL2/IOC2 tables, wrong ARCS inventory,
+         * kernel never programs Local masks). */
         return 0x03 | (state->eisa_present ? 0x10 : 0x00);
     case 0x0028:
     case 0x002c:
