@@ -271,15 +271,20 @@ static void sgi_wd_reset(DeviceState *device)
     sgi_wd_reset_state(SGI_WD33C93(device), true);
 }
 
-/* Board tracing (off by default; set SGI_TRACE=1 in the environment to
- * re-enable all board-trace lines in this file). */
+/* Board tracing is compiled out by default (zero run-time overhead).
+ * Rebuild with -DSGI_DEBUG to re-enable the SGI_TRACE=1 environment toggle
+ * for offline debugging. */
 static bool sgi_wd_trace_enabled(void)
 {
+#ifdef SGI_DEBUG
     static int cached = -1;
     if (cached < 0) {
         cached = getenv("SGI_TRACE") ? 1 : 0;
     }
     return cached != 0;
+#else
+    return false;
+#endif
 }
 
 /*

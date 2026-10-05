@@ -607,12 +607,16 @@ static bool sgi_pio_trace_wanted(unsigned channel, unsigned offset)
  * directly and the first divergence located. */
 static bool sgi_mamepio_trace_on(void)
 {
+#ifdef SGI_DEBUG
     static int cached = -1;
 
     if (cached < 0) {
         cached = getenv("SGI_TRACE_PIO") ? 1 : 0;
     }
     return cached != 0;
+#else
+    return false;
+#endif
 }
 
 /*
@@ -917,12 +921,16 @@ static uint64_t sgi_bbram_trace_n;
  * can see the offsets/sizes the PROM uses for its env image. */
 static bool sgi_bbram_trace_on(void)
 {
+#ifdef SGI_DEBUG
     static int cached = -1;
 
     if (cached < 0) {
         cached = getenv("SGI_TRACE_BBRAM") ? 1 : 0;
     }
     return cached != 0;
+#else
+    return false;
+#endif
 }
 
 static uint64_t sgi_hpc3_bbram_read(void *opaque, hwaddr addr, unsigned size)

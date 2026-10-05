@@ -383,14 +383,19 @@ static const MemoryRegionOps sgi_hpc3_pbus_dma_ops = {
 static uint32_t sgi_hpc3_dma_cfg[16];
 static uint32_t sgi_hpc3_pio_cfg[16];
 
-/* Board tracing (off by default; set SGI_TRACE=1 to re-enable). */
+/* Board tracing is compiled out by default (zero run-time overhead).
+ * Rebuild with -DSGI_DEBUG to re-enable the SGI_TRACE=1 toggle. */
 bool sgi_ip22_trace_enabled(void)
 {
+#ifdef SGI_DEBUG
     static int cached = -1;
     if (cached < 0) {
         cached = getenv("SGI_TRACE") ? 1 : 0;
     }
     return cached != 0;
+#else
+    return false;
+#endif
 }
 static uint8_t sgi_hpc3_pio_regs[0x1000];
 static uint16_t sgi_hal2_codec[2][2];
