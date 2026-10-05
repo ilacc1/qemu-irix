@@ -32,7 +32,6 @@
 #include "system/system.h"
 #include "hw/core/boards.h"
 #include "net/net.h"
-#include "hw/scsi/esp.h"
 #include "hw/scsi/sgi_wd33c93.h"
 #include "hw/core/loader.h"
 #include "hw/display/vga.h"
@@ -861,9 +860,6 @@ static void mips_sgi_indigo2_init(MachineState *machine)
     DeviceState *rc4030;
     rc4030_dma *dmas;
     IOMMUMemoryRegion *rc4030_dma_mr;
-    SysBusESPState *sysbus_esp;
-    ESPState *esp;
-    ESPState *esp2;
     DeviceState *scsi_ors[2];
     int n;
 
@@ -1018,33 +1014,21 @@ static void mips_sgi_indigo2_init(MachineState *machine)
     memory_region_add_subregion(address_space, SGI_IO_BASE, isa_io);
     memory_region_add_subregion(address_space, SGI_IO_BASE + 0x01000000ULL, isa_mem);
 
-    dev = qdev_new(TYPE_SYSBUS_ESP);
-    sysbus_esp = SYSBUS_ESP(dev);
-    esp = &sysbus_esp->esp;
-    esp->dma_memory_read = rc4030_dma_read;
-    esp->dma_memory_write = rc4030_dma_write;
-    esp->dma_opaque = dmas[0];
-    sysbus_esp->it_shift = 0;
-    /* XXX for now until rc4030 has been changed to use DMA enable signal */
-    esp->dma_enabled = 1;
-
-    sysbus = SYS_BUS_DEVICE(dev);
-    sysbus_realize_and_unref(sysbus, &error_fatal);
-    /* MAME indy_indigo2.cpp:296: the WD33C93 INT alone drives IOC2 SCSI0.
-     * OR-ing the ESP backend in too holds the level across transfers
-     * (INTR_BS) and can stick it when the WD path never acks the backend,
-     * masking real completions. Indigo2 keeps the old wiring untouched.
+    /*
+     * The WD33C93 owns its SCSI bus and drives it itself, so the machine no
+     * longer instantiates a separate ESP backend and links it in.  That also
+     * removes the reason the Indigo2 path had to re-buffer INT (the ESP level
+     * held across transfers); the gate is kept so the IOC2 connection is
+     * unchanged from the wiring that is known to boot.
      */
     if (!is_indy) {
         DeviceState *scsi_or = qdev_new(TYPE_OR_IRQ);
         qdev_prop_set_uint16(scsi_or, "num-lines", 2);
         qdev_realize_and_unref(scsi_or, NULL, &error_fatal);
-        sysbus_connect_irq(sysbus, 0, qdev_get_gpio_in(scsi_or, 0));
         qdev_connect_gpio_out(scsi_or, 0, qdev_get_gpio_in(ioc2dev, 0));
         scsi_ors[0] = scsi_or;
     }
     dev = qdev_new("sgi-wd33c93");
-    object_property_set_link(OBJECT(dev), "esp", OBJECT(esp), &error_abort);
     sgi_wd33c93[0] = SGI_WD33C93(dev);
     sysbus = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(sysbus, &error_fatal);
@@ -1054,36 +1038,25 @@ static void mips_sgi_indigo2_init(MachineState *machine)
         qdev_connect_gpio_out(DEVICE(sgi_wd33c93[0]), 0,
                               qdev_get_gpio_in(ioc2dev, 0));
     } else {
+        /* MAME indy_indigo2.cpp:296: the WD33C93 INT alone drives IOC2 SCSI0. */
         qdev_connect_gpio_out(DEVICE(sgi_wd33c93[0]), 0,
-                              qdev_get_gpio_in(scsi_ors[0], 1));
+                              qdev_get_gpio_in(scsi_ors[0], 0));
     }
 
-    scsi_bus_legacy_handle_cmdline(&esp->bus);
+    sgi_wd33c93_scsi_bus_init(sgi_wd33c93[0]);
 
     /* Indy (IP24) has a single SCSI channel (MAME ip24 has no scsibus2);
      * Indigo2 has a second, initially empty, channel at HPC3 HD1. */
     if (!is_indy) {
-        dev = qdev_new(TYPE_SYSBUS_ESP);
-        sysbus_esp = SYSBUS_ESP(dev);
-        esp2 = &sysbus_esp->esp;
-        esp2->dma_memory_read = rc4030_dma_read;
-        esp2->dma_memory_write = rc4030_dma_write;
-        esp2->dma_opaque = dmas[0];
-        sysbus_esp->it_shift = 0;
-        esp2->dma_enabled = 1;
-        sysbus = SYS_BUS_DEVICE(dev);
-        sysbus_realize_and_unref(sysbus, &error_fatal);
         /* MAME indy_indigo2.cpp:440: WD33C93 INT drives IOC2 SCSI1 (ioc2.cpp:738). */
         {
             DeviceState *scsi_or = qdev_new(TYPE_OR_IRQ);
             qdev_prop_set_uint16(scsi_or, "num-lines", 2);
             qdev_realize_and_unref(scsi_or, NULL, &error_fatal);
-            sysbus_connect_irq(sysbus, 0, qdev_get_gpio_in(scsi_or, 0));
             qdev_connect_gpio_out(scsi_or, 0, qdev_get_gpio_in(ioc2dev, 1));
             scsi_ors[1] = scsi_or;
         }
         dev = qdev_new("sgi-wd33c93");
-        object_property_set_link(OBJECT(dev), "esp", OBJECT(esp2), &error_abort);
         sgi_wd33c93[1] = SGI_WD33C93(dev);
         sysbus = SYS_BUS_DEVICE(dev);
         sysbus_realize_and_unref(sysbus, &error_fatal);
@@ -1091,7 +1064,7 @@ static void mips_sgi_indigo2_init(MachineState *machine)
                                             sysbus_mmio_get_region(sysbus, 0), 2);
 
         qdev_connect_gpio_out(DEVICE(sgi_wd33c93[1]), 0,
-                              qdev_get_gpio_in(scsi_ors[1], 1));
+                              qdev_get_gpio_in(scsi_ors[1], 0));
     }
 
     /* MAME indy_indigo2.cpp:359: HPC3 DMA-done to IOC2 local1 0x10. */
