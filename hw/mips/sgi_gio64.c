@@ -16,6 +16,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGIO64State, SGI_GIO64)
 #define GIO64_BUS_SIZE 0xa00000
 #define XL24_REX3_OFFSET 0x0f0000
 #define XL24_REX3_SIZE 0x2000
+/* Vertical blank interval for the VRINT pulse to the IOC2 (MAME newport.cpp:4477
+ * set_vblank_time 2500us). */
+#define SGI_GIO64_VBLANK_PULSE_NS (2500000ULL)
 #define XL24_WIDTH 1288
 #define XL24_HEIGHT 1024
 #define XL24_STRIDE 1344
@@ -30,14 +33,37 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGIO64State, SGI_GIO64)
  * stays small; the cap is a backstop. */
 #define SGI_GIO_TRACE_PER_OFFSET 2000
 static unsigned sgi_gio_trace_count[4096];
-static int sgi_gio_trace_cached = -1;
 
+/* Diagnostic probes (scanout mode decode + REX3 parameter dumps) are
+ * compiled out by default; see the note on sgi_gio_trace_enabled().
+ * Rebuild with -DSGI_DEBUG and run with SGI_GIO_DBG=1 to enable. */
+static bool sgi_gio_dbg(void)
+{
+#ifdef SGI_DEBUG
+    static int cached = -1;
+    if (cached < 0) {
+        cached = getenv("SGI_GIO_DBG") ? 1 : 0;
+    }
+    return cached != 0;
+#else
+    return false;
+#endif
+}
+
+/* Board tracing is compiled out by default (zero run-time overhead).
+ * Rebuild with -DSGI_DEBUG to re-enable the SGI_TRACE=1 environment toggle
+ * for offline debugging. */
 static bool sgi_gio_trace_enabled(void)
 {
-    if (sgi_gio_trace_cached < 0) {
-        sgi_gio_trace_cached = getenv("SGI_TRACE") ? 1 : 0;
+#ifdef SGI_DEBUG
+    static int cached = -1;
+    if (cached < 0) {
+        cached = getenv("SGI_TRACE") ? 1 : 0;
     }
-    return sgi_gio_trace_cached != 0;
+    return cached != 0;
+#else
+    return false;
+#endif
 }
 
 static bool sgi_gio_trace_wanted(hwaddr addr)
@@ -104,8 +130,13 @@ struct SGIGIO64State {
     QemuConsole *console;
     qemu_irq gio_irq[3];
     /* Frame timer: 60Hz VRINT while VC2 display control bit 0 is set
-     * (MAME screen vblank chain); cleared by the REX3 status read. */
+     * (MAME screen vblank chain). The REX3 status bit is sticky (cleared
+     * by the REX3 status read), but the raw VSYNC line to the IOC2 is a
+     * vertical-blank pulse that deasserts on its own at frame end, so a
+     * masked guest polling LIO_1_ISR&LIO_GIO_2 makes progress (real HW
+     * drops the bit without a status read). */
     QEMUTimer *vblank_timer;
+    QEMUTimer *vblank_pulse_timer;
     /* 1ms DCB timeout: clears BACKBUSY after a PCD access, matching
      * MAME's m_dcb_timeout_timer. */
     QEMUTimer *dcb_timer;
@@ -213,6 +244,11 @@ struct SGIGIO64State {
     uint32_t screenmask_y[5];
     uint32_t clip_mode;
     uint32_t draw_color;
+    /* Set whenever a GIO write or REX3 command can change what is scanned
+     * out. The UI refresh calls gfx_update ~30x/s even when the guest is
+     * idle; skipping the full 1280x1024 re-raster (and the console blit)
+     * when this is clear removes that cost without changing the output. */
+    bool display_dirty;
 };
 
 /* VC2 video-timing decode (MAME vc2_device::decode_vt_line/update_screen_size,
@@ -362,14 +398,25 @@ static void sgi_gio64_vblank(void *opaque)
     SGIGIO64State *state = opaque;
 
     /* Raise VRINT only while VC2 display control bit 0 is set (MAME
-     * newport.cpp:816-824, 1700-1706); the REX3 status read clears it. */
+     * newport.cpp:816-824, 1700-1706). The status bit is sticky until the
+     * REX3 status read clears it (newport.cpp:2151), but the interrupt
+     * line presented to the IOC2 follows the vertical-blank interval and
+     * drops at frame end: schedule that deassert here. */
     if (state->vc2_regs[VC2_REG_DISPLAY_CTRL] & 1) {
         state->rex3_status |= REX3_STATUS_VRINT;
         qemu_set_irq(state->gio_irq[2], 1);
+        timer_mod_ns(state->vblank_pulse_timer,
+                     qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                     SGI_GIO64_VBLANK_PULSE_NS);
     }
     timer_mod_ns(state->vblank_timer,
                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                  1000000000ULL / 60);
+}
+
+static void sgi_gio64_vblank_end(void *opaque)
+{
+    qemu_set_irq(SGI_GIO64(opaque)->gio_irq[2], 0);
 }
 
 static void sgi_gio64_dcb_timeout(void *opaque)
@@ -641,6 +688,10 @@ static void sgi_gio64_put_pixel(SGIGIO64State *state, uint8_t *vram,
                                  int x, int y, uint8_t color, uint8_t mask,
                                  unsigned coverage)
 {
+    /* MAME output_pixel applies the window offset to every write and rejects
+     * pixels outside the framebuffer before any addressing. */
+    x += (int)state->x_window - 0x1000;
+    y += (int)state->y_window - 0x1000;
     if (x < 0 || x >= XL24_WIDTH || y < 0 || y >= XL24_HEIGHT ||
         sgi_gio64_clip_pixel(state, x, y)) {
         return;
@@ -694,6 +745,25 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
         sgi_gio64_rex3_setup(state);
     }
 
+    state->display_dirty = true;
+    if (sgi_gio_dbg()) {
+        static int rex3_rows = 6000;
+
+        if (rex3_rows > 0) {
+            rex3_rows--;
+            fprintf(stderr, "REX3 op=%u m0=0x%08x am=%u col=%u back=%u "
+                    "mask=%02x pat=0x%08x x=%d..%d y=%d..%d win=(%d,%d) "
+                    "move=(%d,%d) pd=%u vm1=0x%08x color_vram=%06x\n",
+                    opcode, mode0, address_mode, state->color_i,
+                    state->color_back, write_mask, pattern,
+                    x_start, y_start, x_end, y_end,
+                    (int)state->x_window - 0x1000,
+                    (int)state->y_window - 0x1000,
+                    state->x_move, state->y_move, state->plane_depth,
+                    state->draw_mode1, state->color_vram);
+        }
+    }
+
     if (opcode == 1) {
         uint64_t data = 0;
 
@@ -734,8 +804,8 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
                     src = copy[(size_t)src_y * XL24_STRIDE + src_x];
                 }
                 sgi_gio64_put_pixel(state, vram,
-                                    start_x + state->x_move + win_x,
-                                    start_y + state->y_move + win_y,
+                                    start_x + state->x_move,
+                                    start_y + state->y_move,
                                     src, write_mask, 255);
                 start_x += x_step;
             } while (start_x != end_x && stop_on_x);
@@ -1252,6 +1322,9 @@ static void sgi_gio64_xl24_write(void *opaque, hwaddr addr,
     SGIGIO64State *state = opaque;
     hwaddr reg = addr & ~7ULL;
 
+    /* Any GIO write may reprogram the scanout (VC2 timing, XMAP/CMAP,
+     * RAMDAC, cursor) or push pixels through the REX3 dataport. */
+    state->display_dirty = true;
     if (sgi_gio_trace_enabled() && sgi_gio_trace_wanted(addr)) {
         fprintf(stderr, "GIO-W off=%05x sz=%u val=%016llx\n",
                 (unsigned)addr, size, (unsigned long long)value);
@@ -1788,6 +1861,15 @@ static void sgi_gio64_xl24_write(void *opaque, hwaddr addr,
                     /* Pens are 0x00RRGGBB (MAME cmap set_pen_color order). */
                     state->cmap_palette[head][state->cmap_index[head]] =
                         state->dcb_data_msw >> 8;
+                    if (state->cmap_index[head] < 0x2000 && sgi_gio_dbg()) {
+                        static unsigned npens;
+                        if (npens++ < 2500) {
+                            fprintf(stderr,
+                                    "PEN h=%d idx=%04x rgba=%08x\n",
+                                    head, state->cmap_index[head],
+                                    state->dcb_data_msw >> 8);
+                        }
+                    }
                 }
             }
             break;
@@ -2111,7 +2193,14 @@ static bool sgi_gio64_update_display(void *opaque)
         surface = qemu_console_surface(state->console);
         pixels = surface_data(surface);
     }
+    /* Nothing has touched the scanout since the last frame: the surface
+     * still holds the last rendered image, so skip both the full-frame
+     * re-raster and the console blit. */
+    if (!state->display_dirty) {
+        return true;
+    }
     stride = surface_stride(surface) / sizeof(*pixels);
+    bool dbg = sgi_gio_dbg();
     /* One byte per pixel (expanded CI); the aux CID plane is not modeled,
      * so aux words read 0 and zero overlays fall through to the main pixel. */
     for (y = 0; y < height; y++) {
@@ -2122,6 +2211,46 @@ static bool sgi_gio64_update_display(void *opaque)
 
         sgi_gio64_decode_xmap(table, &pix_mode, &pix_size, &aux_mode,
                               &aux_msb, &ci_msb);
+        if (dbg && y == 0) {
+            static unsigned frame;
+            uint16_t did500 = sgi_gio64_vc2_begin_did(state, 500);
+            uint32_t table500 = state->xmap_mode[0][did500 & 0x1f];
+            uint8_t pm500, ps500, am500;
+            uint16_t amsb500, cimsb500;
+
+            sgi_gio64_decode_xmap(table500, &pm500, &ps500, &am500,
+                                   &amsb500, &cimsb500);
+            if (frame++ < 900) {
+                fprintf(stderr, "CMAP f=%u did0=%03x tbl0=%08x "
+                        "did500=%03x tbl500=%08x base=%03x "
+                        "[00]=%06x [2e]=%06x [30]=%06x [c1]=%06x\n",
+                        frame, sgi_gio64_vc2_begin_did(state, 0),
+                        state->xmap_mode[0][sgi_gio64_vc2_begin_did(state, 0)
+                                             & 0x1f],
+                        did500, table500, cimsb500,
+                        state->cmap_palette[0][cimsb500],
+                        state->cmap_palette[0][cimsb500 | 0x2e],
+                        state->cmap_palette[0][cimsb500 | 0x30],
+                        state->cmap_palette[0][cimsb500 | 0xc1]);
+            }
+        }
+        if (dbg && (y & 31) == 0) {
+            static uint8_t dpm[32] = { [0 ... 31] = 0xff };
+            static uint8_t dps[32] = { [0 ... 31] = 0xff };
+            static uint8_t dau[32] = { [0 ... 31] = 0xff };
+            unsigned slot = (y >> 5) & 31;
+
+            if (dpm[slot] != pix_mode || dps[slot] != pix_size ||
+                dau[slot] != aux_mode) {
+                dpm[slot] = pix_mode;
+                dps[slot] = pix_size;
+                dau[slot] = aux_mode;
+                fprintf(stderr, "DROW y=%d did=%03x table=%08x pm=%d ps=%d "
+                        "aux=%d auxm=%03x cim=%03x\n",
+                        y, did, table, pix_mode, pix_size, aux_mode,
+                        aux_msb, ci_msb);
+            }
+        }
         did = sgi_gio64_vc2_next_did(state);
         for (x = 0; x < width; x++) {
             uint32_t rgb = 0;
@@ -2132,6 +2261,11 @@ static bool sgi_gio64_update_display(void *opaque)
                 table = state->xmap_mode[0][did & 0x1f];
                 sgi_gio64_decode_xmap(table, &pix_mode, &pix_size,
                                       &aux_mode, &aux_msb, &ci_msb);
+                if (dbg && y == 500) {
+                    fprintf(stderr, "DTBL y=500 x=%d did=%03x table=%08x "
+                            "pm=%d ps=%d cim=%03x\n", x, did & 0x1f,
+                            table, pix_mode, pix_size, ci_msb);
+                }
                 did = sgi_gio64_vc2_next_did(state);
             }
             cursor = sgi_gio64_cursor_pixel(state, x, y);
@@ -2211,10 +2345,28 @@ static bool sgi_gio64_update_display(void *opaque)
                     rgb = 0x00ff00;
                     break;
                 }
+                if (dbg && (y == 320 || y == 500 || y == 832) &&
+                    (x & 7) == 0) {
+                    static uint8_t pbyte[3][160];
+                    unsigned yi = y == 320 ? 0 : (y == 500 ? 1 : 2);
+
+                    if (pbyte[yi][x >> 3] != byte) {
+                        pbyte[yi][x >> 3] = byte;
+                        fprintf(stderr, "DPX y=%d x=%d raw=%02x rgb=%06x\n",
+                                y, x, byte, rgb);
+                    }
+                }
+                if (dbg && y == 500 && x >= 320 && x <= 352) {
+                    fprintf(stderr, "DPF y=500 x=%d raw=%02x\n", x, byte);
+                }
+                if (dbg && y == 832 && x >= 0 && x <= 16) {
+                    fprintf(stderr, "DPF y=832 x=%d raw=%02x\n", x, byte);
+                }
             }
             pixels[y * stride + x] = sgi_gio64_ramdac_remap(state, rgb);
         }
     }
+    state->display_dirty = false;
     /*
      * Push the surface to the UI; without this the window only repaints on
      * resize. Polled at the GUI refresh interval, so no extra timer needed.
@@ -2227,6 +2379,7 @@ static int sgi_gio64_post_load(void *opaque, int version_id)
 {
     SGIGIO64State *state = opaque;
 
+    state->display_dirty = true;
     /* Timers are transient; re-arm them so VRINT IRQs and the DCB
      * timeout resume after migration. */
     if (!state->vblank_timer) {
@@ -2236,6 +2389,11 @@ static int sgi_gio64_post_load(void *opaque, int version_id)
     timer_mod_ns(state->vblank_timer,
                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                  1000000000ULL / 60);
+    if (!state->vblank_pulse_timer) {
+        state->vblank_pulse_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                                 sgi_gio64_vblank_end,
+                                                 state);
+    }
     if (!state->dcb_timer) {
         state->dcb_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                         sgi_gio64_dcb_timeout, state);
@@ -2413,8 +2571,11 @@ static void sgi_gio64_realize(DeviceState *device, Error **errp)
     timer_mod_ns(state->vblank_timer,
                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                  1000000000ULL / 60);
+    state->vblank_pulse_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                             sgi_gio64_vblank_end, state);
     state->dcb_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                     sgi_gio64_dcb_timeout, state);
+    state->display_dirty = true;
     state->console = qemu_graphic_console_create(device, 0,
                                                  &sgi_gio64_graphics_ops,
                                                  state);
@@ -2434,6 +2595,7 @@ static void sgi_gio64_reset(DeviceState *device)
     state->rex3_status = 3;
     memset(state->rex3_regs, 0, sizeof(state->rex3_regs));
     state->host_dataport = 0;
+    state->display_dirty = true;
     state->draw_mode1 = 0x3002f001;
     state->draw_mode0 = 0;
     state->plane_depth = (state->draw_mode1 >> 3) & 3;

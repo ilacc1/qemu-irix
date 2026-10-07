@@ -743,6 +743,18 @@ static void sgi_hpc3_enet_tx_start(void)
     sgi_hpc3_enet_tx_active = false;
     sgi_hpc3_enet_dma.tx_ctrl &= ~0x200U;
     sgi_hpc3_enet_update_irq();
+    if (sgi_hpc3_enet_tx_done) {
+        /*
+         * MAME hpc3 has no latching TX-done level: enet_intr_in_w turns
+         * the EDLC interrupt into a one-shot edge on the HPC3 ENET line
+         * (Local0 0x08), and completion is observed via the descriptor's
+         * BC_TXD flag written above.  Clearing here mirrors that, so a
+         * completed transmission cannot pin the IOC2 line (which would
+         * livelock IRIX in the LIO interrupt dispatcher at boot).
+         */
+        sgi_hpc3_enet_tx_done = false;
+        sgi_hpc3_enet_update_irq();
+    }
 }
 
 static uint64_t sgi_hpc3_misc_read(void *opaque, hwaddr addr, unsigned size)

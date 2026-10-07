@@ -108,6 +108,7 @@ struct SGIWD33C93State {
     bool inq_patch_is_cd;
     bool inq_patch_have_va;
     bool inq_patch_pending;
+    bool inq_patch_phantom;
 };
 
 static void sgi_wd_target_reset(SGIWD33C93State *state);
@@ -246,6 +247,7 @@ static void sgi_wd_reset_state(SGIWD33C93State *state, bool power_on)
     state->inq_patch_is_cd = false;
     state->inq_patch_have_va = false;
     state->inq_patch_pending = false;
+    state->inq_patch_phantom = false;
     state->selection_timeout_armed = false;
     if (state->progress_timer) {
         timer_del(state->progress_timer);
@@ -410,25 +412,6 @@ static bool sgi_wd_dma_next(SGIWD33C93State *state)
 static bool sgi_wd_wd_dma_mode(SGIWD33C93State *state)
 {
     return (state->wd_regs[0x01] & 0xe0) != 0;
-}
-
-/*
- * One residual test for both completion sites (the FC poll and the live
- * status-register read).  Bulk transfers wait for every byte before GOOD is
- * reported; INQUIRY/MODE SENSE/REQUEST SENSE may legitimately under-fill.
- * Only the WD count gates: MAME completes off the SCSI state machine and
- * never consults the HPC3 chain count, which is legitimately nonzero at
- * completion time under 16-bit underflow semantics.  A dropped tail is
- * counted (dma_dropped) but never refuses completion: MAME completes such
- * commands normally, and withholding GOOD wedged the driver into a
- * bus-reset loop in testing.
- */
-static bool sgi_wd_bulk_residual(SGIWD33C93State *state, uint8_t op)
-{
-    if (op == 0x12 || op == 0x1a || op == 0x03) {
-        return false;
-    }
-    return state->wd_regs[0x12] || state->wd_regs[0x13] || state->wd_regs[0x14];
 }
 
 /* Teardown FLUSH stops the channel but raises no DMA IRQ: IRIX acks the
@@ -786,8 +769,24 @@ uint32_t sgi_wd33c93_dma_reg_read(SGIWD33C93State *state, hwaddr addr)
     }
 }
 
-static unsigned sgi_wd_cdb_length(uint8_t opcode)
+static unsigned sgi_wd_cdb_length(const SGIWD33C93State *state,
+                                  uint8_t opcode)
 {
+    /*
+     * MAME wd33c9x.cpp set_command_length: with EAF set (OWN_ID bit 3) a
+     * Select-And-Transfer takes the command length the host just loaded
+     * into OWN_ID; IRIX rewrites it per command (0x06 before 6-byte CDBs,
+     * 0x0a before 10-byte ones).  Datasheet Advanced-Mode rule: "the host
+     * also loads the expected command length into the OWN ID register...
+     * The WD33C93A uses this value."  Without this every undefined-group
+     * opcode (READ TOC 0x43, vendor 0x46) decoded as 6 bytes below and was
+     * truncated on the wire: READ TOC lost its allocation byte, the target
+     * answered with zero data, and the guest's transfer count never
+     * drained.
+     */
+    if (state->wd_regs[0] & 0x08) {
+        return state->wd_regs[0] & 0x0f;
+    }
     /* MAME wd33c9x.cpp:1744-1749: only groups 1 and 5 are long. */
     switch (opcode >> 5) {
     case 1:
@@ -1032,6 +1031,11 @@ static void sgi_wd_patch_inquiry(SGIWD33C93State *state)
     if (limit > 36) {
         limit = 36;
     }
+    if (limit > 0 && state->inq_patch_phantom) {
+        /* MAME nscsi hd.cpp:162-163: peripheral qualifier 3, device type
+         * 0x1f -> byte 0 = 0x7f, "logical unit not present". */
+        sgi_wd_patch_byte(state, state->inq_patch_va + 0, 0x7f);
+    }
     if (limit > 3) {
         sgi_wd_patch_byte(state, state->inq_patch_va + 3, inq->format);
     }
@@ -1042,6 +1046,7 @@ static void sgi_wd_patch_inquiry(SGIWD33C93State *state)
         sgi_wd_patch_byte(state, state->inq_patch_va + 8 + i, inq->id[i]);
     }
     state->inq_patch_pending = false;
+    state->inq_patch_phantom = false;
 }
 
 /*
@@ -1281,7 +1286,7 @@ static const struct SCSIBusInfo sgi_wd33c93_bus_info = {
 static void sgi_wd_target_start(SGIWD33C93State *state)
 {
     uint8_t cdb[16];
-    unsigned cdb_len = sgi_wd_cdb_length(state->wd_regs[3]);
+    unsigned cdb_len = sgi_wd_cdb_length(state, state->wd_regs[3]);
     unsigned i;
     uint8_t tid = state->wd_regs[0x15] & BUSID_DID;
     int datalen;
@@ -1293,6 +1298,16 @@ static void sgi_wd_target_start(SGIWD33C93State *state)
      * source-ID extended-residue bit. */
     state->last_message = (state->wd_regs[0x0f] & 7) | 0x80 |
                           ((state->wd_regs[0x16] & 0x80) ? 0x40 : 0);
+    /*
+     * MAME nscsi hd.cpp/cd.cpp: an INQUIRY against a LUN the device does
+     * not have (only LUN 0 exists here) returns peripheral qualifier 0x7f
+     * ("logical unit not present"), so the IRIX driver skips the phantom
+     * and stops.  Non-zero identify LUN means the guest is probing a LUN
+     * beyond the real one; flag it for the inquiry patch to mask byte 0.
+     * The command itself still runs against the LUN-0 device so QEMU
+     * produces a well-formed standard response to patch.
+     */
+    state->inq_patch_phantom = (state->last_message & 7) != 0;
 
     state->no_target = false;
     state->target = scsi_device_find(&state->bus, 0, tid, 0);
@@ -1353,7 +1368,7 @@ static void sgi_wd_target_start(SGIWD33C93State *state)
 
 static void sgi_wd_start_transfer(SGIWD33C93State *state)
 {
-    unsigned cdb_length = sgi_wd_cdb_length(state->wd_regs[3]);
+    unsigned cdb_length = sgi_wd_cdb_length(state, state->wd_regs[3]);
     uint32_t transfer_count = (state->wd_regs[0x12] << 16) |
                                (state->wd_regs[0x13] << 8) |
                                state->wd_regs[0x14];
@@ -1468,16 +1483,17 @@ static void sgi_wd_start_transfer(SGIWD33C93State *state)
     state->wd_regs[0x10] = 0x10;
     state->inq_patch_pending = false;
     state->inq_patch_have_va = false;
+    state->inq_patch_phantom = false;
     /*
-     * Standard INQUIRY page 0, LUN 0, any allocation (hinv and the kernel
-     * use less than 64). Bit 0 of CDB byte 1 is EVPD: a VPD request must
-     * keep its vital-product-data payload. The buffer address is NOT
-     * captured here (dma_current may be stale for this command); it is
-     * latched from the first DMA write callback, which runs at the
-     * buffer start by construction.
+     * Standard INQUIRY page 0, any LUN (hinv and the kernel use less than
+     * 64). Bit 0 of CDB byte 1 is EVPD: a VPD request must keep its
+     * vital-product-data payload. The buffer address is NOT captured here
+     * (dma_current may be stale for this command); it is latched from the
+     * first DMA write callback, which runs at the buffer start by
+     * construction.
      */
     if (state->wd_regs[3] == 0x12 && (state->wd_regs[4] & 0x01) == 0 &&
-        ((state->wd_regs[4] >> 5) & 0x7) == 0 && state->wd_regs[5] == 0) {
+        state->wd_regs[5] == 0) {
         state->inq_patch_alloc = transfer_count;
         {
             uint8_t target_id = state->wd_regs[0x15] & BUSID_DID;
@@ -1586,23 +1602,26 @@ static void sgi_wd_update_status(SGIWD33C93State *state)
          * The target has reported a final status.  Report the command
          * complete, but only once the engine has no data left to move: a
          * mid-transfer completion would surface to the driver as a short
-         * transfer.  Over-allocatable probes (INQUIRY, MODE SENSE, REQUEST
-         * SENSE) are allowed to complete with a residual because the guest
-         * deliberately allocates more than the target returns.
+         * transfer.  The guest's own transfer count must not gate this:
+         * after final status no more data can ever arrive, so a nonzero
+         * count is a permanent residual -- CHECK CONDITION on an unknown
+         * opcode, an over-allocated probe, a short read -- which hardware
+         * reports alongside completion.  Withholding the completion for
+         * it wedged the engine into 10-second timeouts and bus resets
+         * (READ TOC truncation, vendor 0x46 at boot) that also killed
+         * in-flight commands on other IDs.
          */
         if (state->command_done && !state->irq_fifo_size) {
             uint8_t op = state->wd_regs[3];
             /*
-             * The reply must be fully drained out of the window.  Probes do
-             * not get to skip this: an undrained INQUIRY reply is exactly the
-             * failure that made the PROM report an unresponsive drive.  The
-             * probe exception below applies only to the *residual* measure,
-             * which is about the guest over-allocating its buffer.
+             * The reply must be fully drained out of the window: an
+             * undrained INQUIRY reply is exactly the failure that made
+             * the PROM report an unresponsive drive.
              */
             bool drained = (state->target_xfer == 0 && state->async_len <= 0 &&
                             !state->data_ready);
 
-            if (drained && !sgi_wd_bulk_residual(state, op)) {
+            if (drained) {
                 state->completion_phase = 3;
                 /* The target's status byte was latched by the engine. */
                 sgi_wd_irq_fifo_push(state,
@@ -1642,7 +1661,7 @@ static void sgi_wd_update_status(SGIWD33C93State *state)
                 }
                 /* MAME hd.cpp leaves INQUIRY byte7 0; QEMU Sync 0x10 fails
                  * the IRIX length check. */
-                if (state->inq_patch_pending && state->wd_regs[0x0f] == 0) {
+                if (state->inq_patch_pending) {
                     sgi_wd_patch_inquiry(state);
                 }
                 /*
@@ -1768,23 +1787,18 @@ static uint64_t sgi_wd_read(void *opaque, hwaddr addr, unsigned size)
             !state->data_ready) {
             /*
              * Transfer fully complete (STATUS phase, nothing pending): report
-             * completion live instead of a stale queued data phase. Same
-             * residual gating as the FC path: probes may complete with
-             * residual, bulk READs must drain.
+             * completion live instead of a stale queued data phase.  No
+             * residual gate: after final status the remaining guest count
+             * is permanent and must not withhold completion (see the FC
+             * path above).
              */
-            uint8_t opLive = state->wd_regs[3];
-            if (sgi_wd_bulk_residual(state, opLive)) {
-                /* Bulk with residual pending: fall through to normal
-                 * fifo consume below; completion will report via the FC
-                 * path once drained. */
-            } else {
             status = SGI_WD_STATUS_SELECT_TRANSFER_SUCCESS;
             state->scsi_status = status;
             state->auxiliary_status |= 0x80;
             state->auxiliary_status &= ~0x20;
             state->completion_phase = 3;
             state->wd_regs[0x10] = SGI_WD_PHASE_COMMAND_COMPLETE;
-            if (state->inq_patch_pending && state->wd_regs[0x0f] == 0) {
+            if (state->inq_patch_pending) {
                 sgi_wd_patch_inquiry(state);
             }
             if (state->dma_desc_flags & (1U << 29)) {
@@ -1822,7 +1836,6 @@ static uint64_t sgi_wd_read(void *opaque, hwaddr addr, unsigned size)
                 fprintf(stderr, "WD33 REG R addr=17 val=%02x\n", status);
             }
             return status;
-            }
         }
         if (state->auxiliary_status & 0x80) {
             state->auxiliary_status &= ~0x80;

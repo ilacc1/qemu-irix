@@ -492,6 +492,9 @@ static void sgi_ioc2_gpio_in(void *opaque, int n, int level)
         break;
     case 2:
     case 3:
+        if (sgi_ioc2_trace_enabled()) {
+            fprintf(stderr, "IOC2-IN%d level=%d\n", n, level);
+        }
         if (n == 2) {
             state->enet_edlc_level = level != 0;
         } else {
@@ -578,9 +581,7 @@ static uint64_t sgi_ioc2_read_inner(void *opaque, hwaddr addr, unsigned size)
      */
     hwaddr reg = state->guinness ? addr : addr + SGI_IOC2_MMIO_BASE;
 
-    if (sgi_ioc2_trace_enabled()) {
-        fprintf(stderr, "IOC2N-R reg=%02x\n", (unsigned)reg);
-    }
+    (void)reg;
 
     /* GUINNESS (IP24): interrupt registers at PIO6 0x20-0x2f. */
     if (state->guinness && reg >= 0x20 && reg <= 0x2f) {
@@ -772,9 +773,20 @@ static uint64_t sgi_ioc2_read(void *opaque, hwaddr addr, unsigned size)
             rv |= (sgi_ioc2_read_inner(opaque, addr + i, 1) & 0xff) <<
                   (8 * i);
         }
+        if (sgi_ioc2_trace_enabled()) {
+            fprintf(stderr, "IOC2N-R addr=%04x val=%04x\n",
+                    (unsigned)addr, (unsigned)rv);
+        }
         return rv;
     }
-    return sgi_ioc2_read_inner(opaque, addr, size);
+    {
+        uint64_t rv = sgi_ioc2_read_inner(opaque, addr, size);
+        if (sgi_ioc2_trace_enabled()) {
+            fprintf(stderr, "IOC2N-R addr=%04x val=%02x\n",
+                    (unsigned)addr, (unsigned)rv);
+        }
+        return rv;
+    }
 }
 
 static void sgi_ioc2_write_inner(void *opaque, hwaddr addr, uint64_t val,
@@ -841,8 +853,26 @@ uint8_t sgi_ioc2_pio6_read_byte(DeviceState *ioc2, unsigned reg)
 {
     SgiIoc2State *state = SGI_IOC2(ioc2);
     hwaddr addr = state->guinness ? reg : reg + SGI_IOC2_MMIO_BASE;
+    uint8_t rv = sgi_ioc2_read_inner(state, addr, 1) & 0xff;
 
-    return sgi_ioc2_read_inner(state, addr, 1) & 0xff;
+    /*
+     * Indy reaches every PIO6 register through this helper (the sysbus
+     * MMIO ops are not mapped on IP24), so log values here.  Budgeted:
+     * a guest poll storm would otherwise write gigabytes.
+     */
+    if (sgi_ioc2_trace_enabled()) {
+        static uint64_t budget = 300000;
+
+        if (budget > 0) {
+            budget--;
+            fprintf(stderr, "IOC2N-R reg=%02x val=%02x\n",
+                    reg & 0xff, rv);
+            if (budget == 0) {
+                fprintf(stderr, "IOC2N-R ... read budget exhausted\n");
+            }
+        }
+    }
+    return rv;
 }
 
 void sgi_ioc2_pio6_write_byte(DeviceState *ioc2, unsigned reg, uint8_t val)

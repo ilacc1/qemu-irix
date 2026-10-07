@@ -792,7 +792,13 @@ static uint64_t sgi_hpc3_pio_read_do(void *opaque, hwaddr addr, unsigned size)
     if (channel == 1) {
         return state->pio1_data[offset];
     }
-    return 0;
+    /*
+     * Unmapped PIO channels read as all-ones (floating bus pull-ups, as
+     * MAME's empty PIO spaces do).  Returning 0 wedges drivers polling a
+     * ready bit here (they spin forever on a clear bit); all-ones lets
+     * such polls proceed the way they do under MAME.
+     */
+    return 0xffffffffu;
 }
 
 static void sgi_hpc3_pio_write(void *opaque, hwaddr addr, uint64_t val,
