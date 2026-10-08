@@ -22,6 +22,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGIO64State, SGI_GIO64)
 #define XL24_WIDTH 1288
 #define XL24_HEIGHT 1024
 #define XL24_STRIDE 1344
+/* RB2 pixel store holds one 32-bit RGBCI word per pixel (MAME rb2_device:
+ * 8-bit CI occupies the low byte, 12-bit the low 12 bits, 24-bit direct
+ * the low 24 bits as 0x00BBGGRR). 8MB covers 1344*1024 words. */
+#define XL24_VRAM_SIZE (8 * 1024 * 1024)
+#define XL24_GLOBAL_MASK 0x00ffffff
 #define REX3_STATUS_VRINT (1U << 5)
 #define REX3_STATUS_VIDEOINT (1U << 6)
 #define REX3_STATUS_BACKBUSY (1U << 4)
@@ -530,12 +535,23 @@ static uint8_t sgi_gio64_clamp_color(int32_t value)
     return value < 0 ? 0 : value > 255 ? 255 : value;
 }
 
+/* MAME newport s_host_shifts (dataport shift step per host depth). */
+static unsigned sgi_gio64_host_shift(unsigned host_depth)
+{
+    static const unsigned steps[] = { 8, 8, 16, 32 };
+
+    return steps[host_depth & 3];
+}
+
 static uint32_t sgi_gio64_host_color(SGIGIO64State *state)
 {
-    static const unsigned widths[] = { 4, 8, 12, 32 };
+    /* MAME s_color_masks / s_host_shifts (value mask and shift step per
+     * host depth). */
+    static const uint32_t masks[] = { 0xf, 0xff, 0xfff, 0xffffffff };
+    static const unsigned widths[] = { 8, 8, 16, 32 };
     unsigned width = widths[state->host_depth & 3];
     uint32_t value = (state->host_dataport >> state->host_shift) &
-                     (width == 32 ? UINT32_MAX : ((1U << width) - 1));
+                     masks[state->host_depth & 3];
     uint32_t red;
     uint32_t green;
     uint32_t blue;
@@ -563,6 +579,11 @@ static uint32_t sgi_gio64_host_color(SGIGIO64State *state)
         break;
     }
     state->host_shift = (state->host_shift + 64 - width) & 63;
+    if (state->plane_depth == 3) {
+        /* 24-bit direct: keep the full assembled color (0x00BBGGRR, MAME
+         * get_host_color layout); the store expands/masks per depth. */
+        return (blue << 16) | (green << 8) | red;
+    }
     return (blue & 0xc0) | ((green & 0xe0) >> 2) | ((red & 0xe0) >> 5);
 }
 
@@ -644,13 +665,15 @@ static bool sgi_gio64_clip_pixel(SGIGIO64State *state, int x, int y)
     return true;
 }
 
-static uint8_t sgi_gio64_rop(uint8_t func, uint8_t src, uint8_t dst)
+static uint32_t sgi_gio64_rop(uint8_t func, uint32_t src, uint32_t dst)
 {
     /* 16 raster ops from drawmode1[31:28] (Linux newport.h, same table as
-     * MAME rb2 logic_pixel), applied to 8-bit indexed pixels. */
+     * MAME rb2 logic_pixel), applied to whole 32-bit RGBCI words. The ops
+     * are bitwise, so the low byte of an 8-bit draw matches the old 8-bit
+     * ROP exactly. */
     switch (func & 0xf) {
     case 0x0:
-        return 0x00;
+        return 0x000000;
     case 0x1:
         return src & dst;
     case 0x2:
@@ -680,16 +703,164 @@ static uint8_t sgi_gio64_rop(uint8_t func, uint8_t src, uint8_t dst)
     case 0xe:
         return ~(src & dst);
     default:
-        return 0xff;
+        return 0xffffff;
     }
 }
 
-static void sgi_gio64_put_pixel(SGIGIO64State *state, uint8_t *vram,
-                                 int x, int y, uint8_t color, uint8_t mask,
+static uint32_t sgi_gio64_expand_pixel(SGIGIO64State *state, uint32_t color)
+{
+    /* MAME rb2 expand_to_all_lanes for the RGB/CI plane: replicate the
+     * drawn value across the 32-bit word so 8/12-bit draws fill every
+     * lane a 24-bit scanout reads. 24-bit needs no expansion. */
+    switch (state->plane_depth) {
+    case 0: /* 4bpp */
+        color |= color << 4;
+        color |= color << 8;
+        color |= color << 16;
+        break;
+    case 1: /* 8bpp */
+        color |= color << 8;
+        color |= color << 16;
+        break;
+    case 2: /* 12bpp */
+        color |= color << 12;
+        break;
+    default: /* 24bpp */
+        break;
+    }
+    return color;
+}
+
+static uint32_t sgi_gio64_blend_rgb(uint32_t src, uint32_t dst,
+                                    unsigned coverage)
+{
+    /* Per-channel lerp used for antialiased (coverage<255) 24-bit pixels;
+     * the 8-bit path keeps the legacy byte lerp in put_pixel. */
+    unsigned shi = (src >> 16) & 0xff, mid = (src >> 8) & 0xff;
+    unsigned slo = src & 0xff;
+    unsigned dhi = (dst >> 16) & 0xff, dmg = (dst >> 8) & 0xff;
+    unsigned dlo = dst & 0xff;
+
+    shi = (shi * coverage + dhi * (255 - coverage)) / 255;
+    mid = (mid * coverage + dmg * (255 - coverage)) / 255;
+    slo = (slo * coverage + dlo * (255 - coverage)) / 255;
+    return (shi << 16) | (mid << 8) | slo;
+}
+
+static uint32_t sgi_gio64_blend_rgb24(SGIGIO64State *state, uint32_t src,
+                                      uint32_t dst)
+{
+    /* MAME newport blend_pixel for 24-bit direct pixels (words are
+     * 0x00BBGGRR). Factor selection matches draw_mode1 bits 19-24/27. */
+    float sa = ((src >> 24) & 0xff) / 255.0f;
+    float sb = ((src >> 16) & 0xff) / 255.0f;
+    float sg = ((src >> 8) & 0xff) / 255.0f;
+    float sr = ((src >> 0) & 0xff) / 255.0f;
+    float db, dg, dr;
+
+    if (state->draw_mode1 & (1U << 25)) {
+        db = ((state->color_back >> 16) & 0xff) / 255.0f;
+        dg = ((state->color_back >> 8) & 0xff) / 255.0f;
+        dr = ((state->color_back >> 0) & 0xff) / 255.0f;
+    } else {
+        db = ((dst >> 16) & 0xff) / 255.0f;
+        dg = ((dst >> 8) & 0xff) / 255.0f;
+        dr = ((dst >> 0) & 0xff) / 255.0f;
+    }
+    float sbb = 0.0f, sgb = 0.0f, srb = 0.0f;
+    float dbb = 0.0f, dgb = 0.0f, drb = 0.0f;
+
+    switch ((state->draw_mode1 >> 19) & 7) {
+    case 1:
+        sbb = sb;
+        sgb = sg;
+        srb = sr;
+        break;
+    case 2:
+        sbb = sb * db;
+        sgb = sg * dg;
+        srb = sr * dr;
+        break;
+    case 3:
+        sbb = sb * (1.0f - db);
+        sgb = sg * (1.0f - dg);
+        srb = sr * (1.0f - dr);
+        break;
+    case 4:
+        if (state->draw_mode1 & (1U << 27)) {
+            sbb = sb * sa;
+            sgb = sg * sa;
+            srb = sr * sa;
+        } else {
+            sbb = sb;
+            sgb = sg;
+            srb = sr;
+        }
+        break;
+    case 5:
+        if (state->draw_mode1 & (1U << 27)) {
+            sbb = sb * (1.0f - sa);
+            sgb = sg * (1.0f - sa);
+            srb = sr * (1.0f - sa);
+        }
+        break;
+    default:
+        break;
+    }
+    switch ((state->draw_mode1 >> 22) & 7) {
+    case 1:
+        dbb = db;
+        dgb = dg;
+        drb = dr;
+        break;
+    case 2:
+        dbb = db * sb;
+        dgb = dg * sg;
+        drb = dr * sr;
+        break;
+    case 3:
+        dbb = db * (1.0f - sb);
+        dgb = dg * (1.0f - sg);
+        drb = dr * (1.0f - sr);
+        break;
+    case 4:
+        if (state->draw_mode1 & (1U << 27)) {
+            dbb = db * sa;
+            dgb = dg * sa;
+            drb = dr * sa;
+        } else {
+            dbb = db;
+            dgb = dg;
+            drb = dr;
+        }
+        break;
+    case 5:
+        if (state->draw_mode1 & (1U << 27)) {
+            dbb = db * (1.0f - sa);
+            dgb = dg * (1.0f - sa);
+            drb = dr * (1.0f - sa);
+        }
+        break;
+    default:
+        break;
+    }
+    float b = sbb + dbb, g = sgb + dgb, r = srb + drb;
+    uint32_t bi = b > 1.0f ? 255 : (uint32_t)(b * 255.0f);
+    uint32_t gi = g > 1.0f ? 255 : (uint32_t)(g * 255.0f);
+    uint32_t ri = r > 1.0f ? 255 : (uint32_t)(r * 255.0f);
+
+    return (bi << 16) | (gi << 8) | ri;
+}
+
+static void sgi_gio64_put_pixel(SGIGIO64State *state, uint32_t *vram,
+                                 int x, int y, uint32_t color, uint32_t mask,
                                  unsigned coverage)
 {
     /* MAME output_pixel applies the window offset to every write and rejects
-     * pixels outside the framebuffer before any addressing. */
+     * pixels outside the framebuffer before any addressing. The store is a
+     * 32-bit RGBCI word (MAME rb2): 8-bit draws occupy the low byte and the
+     * masked store preserves the other lanes, so CI scanout (low byte) is
+     * unchanged while 24-bit scanout sees full words. */
     x += (int)state->x_window - 0x1000;
     y += (int)state->y_window - 0x1000;
     if (x < 0 || x >= XL24_WIDTH || y < 0 || y >= XL24_HEIGHT ||
@@ -705,20 +876,36 @@ static void sgi_gio64_put_pixel(SGIGIO64State *state, uint8_t *vram,
             *z = state->z_value;
         }
     }
-    uint8_t *pixel = &vram[y * XL24_STRIDE + x];
+    uint32_t *pixel = &vram[y * XL24_STRIDE + x];
+    uint32_t dst = *pixel;
+    uint32_t expanded = sgi_gio64_expand_pixel(state, color);
+    uint32_t out;
+
     if (state->draw_mode1 & (1U << 18)) {
-        /* Blend enable: alpha/source-dest mix (MAME blend_pixel path). */
-        color = sgi_gio64_blend_index(state, color, *pixel);
+        if (state->plane_depth == 3) {
+            out = sgi_gio64_blend_rgb24(state, expanded, dst);
+        } else {
+            /* Legacy CI blend (palette-based); low byte only, matching the
+             * old 8-bit store exactly. */
+            out = (dst & ~0xffu) |
+                  sgi_gio64_blend_index(state, (uint8_t)expanded,
+                                        (uint8_t)dst);
+        }
     } else {
         /* Raster op from drawmode1[31:28] (MAME logic_pixel path). */
-        color = sgi_gio64_rop((state->draw_mode1 >> 28) & 0xf, color,
-                              *pixel);
+        out = sgi_gio64_rop((state->draw_mode1 >> 28) & 0xf, expanded, dst);
     }
     if (coverage < 255) {
-        color = (uint8_t)(((unsigned)color * coverage +
-                           (unsigned)*pixel * (255 - coverage)) / 255);
+        if (state->plane_depth == 3) {
+            out = sgi_gio64_blend_rgb(out, dst, coverage);
+        } else {
+            out = (dst & ~0xffu) |
+                  (uint8_t)(((out & 0xff) * coverage +
+                             (dst & 0xff) * (255 - coverage)) / 255);
+        }
     }
-    *pixel = (*pixel & ~mask) | (color & mask);
+    mask &= XL24_GLOBAL_MASK;
+    *pixel = (dst & ~mask) | (out & mask);
 }
 
 static void sgi_gio64_rex3_command(SGIGIO64State *state)
@@ -729,10 +916,10 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
     int y_start = state->y_start_i;
     int x_end = state->x_end_i;
     int y_end = state->y_end_i;
-    uint8_t color = state->color_i;
-    uint8_t *vram = memory_region_get_ram_ptr(&state->vram);
+    uint32_t color = state->color_i;
+    uint32_t *vram = memory_region_get_ram_ptr(&state->vram);
     uint8_t address_mode = (mode0 >> 2) & 7;
-    uint8_t write_mask = state->write_mask;
+    uint32_t write_mask = state->write_mask;
     uint32_t pattern = mode0 & (1U << 12) ? state->z_pattern :
                        (mode0 & (1U << 13) ? state->line_stipple_pattern :
                         UINT32_MAX);
@@ -752,7 +939,7 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
         if (rex3_rows > 0) {
             rex3_rows--;
             fprintf(stderr, "REX3 op=%u m0=0x%08x am=%u col=%u back=%u "
-                    "mask=%02x pat=0x%08x x=%d..%d y=%d..%d win=(%d,%d) "
+                    "mask=%06x pat=0x%08x x=%d..%d y=%d..%d win=(%d,%d) "
                     "move=(%d,%d) pd=%u vm1=0x%08x color_vram=%06x\n",
                     opcode, mode0, address_mode, state->color_i,
                     state->color_back, write_mask, pattern,
@@ -767,8 +954,18 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
     if (opcode == 1) {
         uint64_t data = 0;
 
-        for (uint32_t x = x_start; x <= x_end && x < XL24_WIDTH; x++) {
-            data = (data << 8) | vram[y_start * XL24_STRIDE + x];
+        if (state->plane_depth == 3) {
+            /* 24-bit: MAME read_pixel returns whole words (src shift 0 on
+             * the RGB/CI plane). */
+            for (uint32_t x = x_start; x <= x_end && x < XL24_WIDTH; x++) {
+                data = (data << 32) |
+                       vram[y_start * XL24_STRIDE + x];
+            }
+        } else {
+            for (uint32_t x = x_start; x <= x_end && x < XL24_WIDTH; x++) {
+                data = (data << 8) |
+                       (uint8_t)vram[y_start * XL24_STRIDE + x];
+            }
         }
         state->host_dataport = data;
         state->host_shift = 56;
@@ -789,15 +986,16 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
         int start_y = y_start;
         int end_x = x_end + x_step;
         int end_y = y_end + y_step;
-        size_t rb_size = (size_t)XL24_STRIDE * XL24_HEIGHT;
-        uint8_t *copy = g_malloc(rb_size);
+        size_t rb_size = (size_t)XL24_STRIDE * XL24_HEIGHT *
+                         sizeof(*vram);
+        uint32_t *copy = g_malloc(rb_size);
 
         memcpy(copy, vram, rb_size);
         do {
             do {
                 int src_x = start_x + win_x;
                 int src_y = start_y + win_y;
-                uint8_t src = 0;
+                uint32_t src = 0;
 
                 if (src_x >= 0 && src_x < XL24_WIDTH &&
                     src_y >= 0 && src_y < XL24_HEIGHT) {
@@ -1342,7 +1540,7 @@ static void sgi_gio64_xl24_write(void *opaque, hwaddr addr,
         if (do_high) {
             state->draw_mode1 = sgi_gio64_high_word(value, size, addr);
             state->plane_depth = (state->draw_mode1 >> 3) & 3;
-            state->host_depth = (state->draw_mode1 >> 6) & 3;
+            state->host_depth = (state->draw_mode1 >> 8) & 3;
         }
         if (do_low) {
             state->draw_mode0 = sgi_gio64_low_word(value, size, addr);
@@ -1580,7 +1778,8 @@ static void sgi_gio64_xl24_write(void *opaque, hwaddr addr,
             state->host_dataport =
                 (state->host_dataport & 0xffffffffULL) | (value << 32);
         }
-        state->host_shift = 64 - (1U << (state->host_depth + 2));
+        /* MAME: host_shift restarts at 64 - s_host_shifts[hostdepth]. */
+        state->host_shift = 64 - sgi_gio64_host_shift(state->host_depth);
         break;
     }
     case 0x0008: {
@@ -2176,8 +2375,8 @@ static bool sgi_gio64_update_display(void *opaque)
     SGIGIO64State *state = opaque;
     DisplaySurface *surface = qemu_console_surface(state->console);
     uint32_t *pixels = surface_data(surface);
-    const uint8_t *vram = memory_region_get_ram_ptr(&state->vram);
-    size_t vram_size = memory_region_size(&state->vram);
+    const uint32_t *vram = memory_region_get_ram_ptr(&state->vram);
+    size_t vram_words = memory_region_size(&state->vram) / sizeof(*vram);
     int width = sgi_gio64_display_width(state);
     int height = sgi_gio64_display_height(state);
     int stride;
@@ -2201,8 +2400,10 @@ static bool sgi_gio64_update_display(void *opaque)
     }
     stride = surface_stride(surface) / sizeof(*pixels);
     bool dbg = sgi_gio_dbg();
-    /* One byte per pixel (expanded CI); the aux CID plane is not modeled,
-     * so aux words read 0 and zero overlays fall through to the main pixel. */
+    /* One 32-bit RGBCI word per pixel (MAME rb2): 8-bit CI occupies the low
+     * byte, 12-bit the low 12 bits, 24-bit direct the low 24 bits as
+     * 0x00BBGGRR. The aux CID plane is not modeled, so aux words read 0
+     * and zero overlays fall through to the main pixel. */
     for (y = 0; y < height; y++) {
         uint16_t did = sgi_gio64_vc2_begin_did(state, y);
         uint32_t table = state->xmap_mode[0][did & 0x1f];
@@ -2256,6 +2457,7 @@ static bool sgi_gio64_update_display(void *opaque)
             uint32_t rgb = 0;
             bool replaced = false;
             uint8_t cursor;
+            uint8_t byte = 0;
 
             if ((uint16_t)x == (did >> 5)) {
                 table = state->xmap_mode[0][did & 0x1f];
@@ -2280,8 +2482,9 @@ static bool sgi_gio64_update_display(void *opaque)
             }
             if (!replaced) {
                 size_t off = (size_t)y * XL24_STRIDE + x;
-                uint8_t byte = off < vram_size ? vram[off] : 0;
+                uint32_t word = off < vram_words ? vram[off] : 0;
 
+                byte = (uint8_t)word;
                 switch (pix_mode) {
                 case 0: /* CI through the head-0 colormap */
                     switch (pix_size) {
@@ -2295,13 +2498,10 @@ static bool sgi_gio64_update_display(void *opaque)
                         rgb = cmap[ci_msb | byte];
                         break;
                     case 2: {
-                        /* 12-bit pixel spans two stored bytes (approx:
-                         * low byte + low nibble of next). */
-                        size_t off2 = off + 1;
-                        uint8_t hi =
-                            off2 < vram_size ? vram[off2] : 0;
-                        uint16_t pix_in =
-                            byte | ((uint16_t)(hi & 0x0f) << 8);
+                        /* MAME CI 12bpp: low 12 bits of the word, upper
+                         * half selected by table bit 0. */
+                        uint8_t shift = (table & 1) ? 12 : 0;
+                        uint16_t pix_in = (word >> shift) & 0x0fff;
 
                         rgb = cmap[(ci_msb & 0x1000) | pix_in];
                         break;
@@ -2325,17 +2525,23 @@ static bool sgi_gio64_update_display(void *opaque)
                         rgb = sgi_gio64_bgr8_to_rgb(byte);
                         break;
                     case 2: {
-                        size_t off2 = off + 1;
-                        uint8_t hi =
-                            off2 < vram_size ? vram[off2] : 0;
+                        /* MAME RGB 12bpp: low 12 bits of the word, upper
+                         * half selected by table bit 0. */
+                        uint8_t shift = (table & 1) ? 12 : 0;
 
                         rgb = sgi_gio64_bgr12_to_rgb(
-                            byte | ((uint16_t)(hi & 0x0f) << 8));
+                            (word >> shift) & 0x0fff);
                         break;
                     }
-                    default:
-                        rgb = sgi_gio64_bgr8_to_rgb(byte);
+                    default: {
+                        /* MAME RGB 24bpp: the word is 0x00BBGGRR. */
+                        uint8_t r = (word >> 0) & 0xff;
+                        uint8_t g = (word >> 8) & 0xff;
+                        uint8_t b = (word >> 16) & 0xff;
+
+                        rgb = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
                         break;
+                    }
                     }
                     break;
                 case 2: /* RGB Map1: MAME debug magenta */
@@ -2523,7 +2729,7 @@ static void sgi_gio64_init(Object *object)
     memory_region_init(&state->bus, object, "sgi-gio64.bus", GIO64_BUS_SIZE);
     /* VRAM is the internal RB2 pixel store, not a CPU window (P0-2). */
     memory_region_init_ram(&state->vram, object, "sgi-gio64.xl24.vram",
-                           GIO64_SLOT_SIZE, &error_abort);
+                           XL24_VRAM_SIZE, &error_abort);
     memory_region_init_io(&state->xl24, object, &sgi_gio64_xl24_ops, state,
                           "sgi-gio64.xl24.rex3", XL24_REX3_SIZE);
     memory_region_add_subregion_overlap(&state->bus, XL24_REX3_OFFSET,
@@ -2553,7 +2759,7 @@ static void sgi_gio64_init(Object *object)
     state->rex3_status = 3;
     state->draw_mode1 = 0x3002f001;
     state->plane_depth = (state->draw_mode1 >> 3) & 3;
-    state->host_depth = (state->draw_mode1 >> 6) & 3;
+    state->host_depth = (state->draw_mode1 >> 8) & 3;
     state->dcb_mode = 0x00000780;
     state->dcb_mask = 0xffffffff;
     state->x_window = 0x1000;
@@ -2599,7 +2805,7 @@ static void sgi_gio64_reset(DeviceState *device)
     state->draw_mode1 = 0x3002f001;
     state->draw_mode0 = 0;
     state->plane_depth = (state->draw_mode1 >> 3) & 3;
-    state->host_depth = (state->draw_mode1 >> 6) & 3;
+    state->host_depth = (state->draw_mode1 >> 8) & 3;
     state->x_start = 0;
     state->y_start = 0;
     state->x_end = 0;
