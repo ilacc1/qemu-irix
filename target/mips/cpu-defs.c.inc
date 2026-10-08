@@ -589,7 +589,9 @@ const mips_def_t mips_defs[] =
         .SYNCI_Step = 16,
         .CCRes = 2,
         .CP0_Status_rw_bitmask = 0x3678FFFF,
-        .CP1_fcr0 = (0x4 << FCR0_PRID) | (0x0 << FCR0_REV),
+        /* R4000SC has the R4000's integrated FPU (FIR PRId 5); PRId 4
+         * decodes as R6010 in IRIX hinv. Matches plain R4000 above. */
+        .CP1_fcr0 = (0x5 << FCR0_PRID) | (0x0 << FCR0_REV),
         .CP1_fcr31 = 0,
         .CP1_fcr31_rw_bitmask = 0x0183FFFF,
         .SEGBITS = 40,
