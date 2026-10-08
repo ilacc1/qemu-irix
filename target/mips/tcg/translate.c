@@ -15165,6 +15165,12 @@ static void mips_tr_insn_start(DisasContextBase *dcbase, CPUState *cs)
                        ctx->btarget);
 }
 
+/* SGI IP24 idle-spin quirk; configured by target/mips/tcg/exception.c
+ * (helper_sgi_idle_check). One compare per translated instruction; zero
+ * execution cost unless the idle PC matches. */
+extern uint64_t sgi_idle_pc;
+extern int sgi_idle_on;
+
 static void mips_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
 {
     CPUMIPSState *env = cpu_env(cs);
@@ -15172,6 +15178,10 @@ static void mips_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
     int insn_bytes;
     int is_slot;
 
+    if (sgi_idle_on && ctx->base.pc_next == (target_ulong)sgi_idle_pc) {
+        save_cpu_state(ctx, 1);
+        gen_helper_sgi_idle_check(tcg_env);
+    }
     is_slot = ctx->hflags & MIPS_HFLAG_BMASK;
     if (ctx->insn_flags & ISA_NANOMIPS32) {
         ctx->opcode = translator_lduw_end(env, &ctx->base, ctx->base.pc_next,

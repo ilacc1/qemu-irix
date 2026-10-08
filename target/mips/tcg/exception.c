@@ -78,6 +78,66 @@ void helper_wait(CPUMIPSState *env)
     raise_exception(env, EXCP_HLT);
 }
 
+/* SGI IP24 idle-spin quirk (local, never upstream): IRIX idles by
+ * spinning on a kernel poll loop without WAIT, pinning a host core at
+ * 100% while the guest reports 95% idle. The translator emits a call
+ * here whenever it translates the known idle-loop PC; after sustained
+ * consecutive hits we halt exactly like WAIT (a timer tick always wakes
+ * us). Genuine lock waits are short and never reach the threshold, so
+ * they stay fast. No guest modification; sleeps are always safe.
+ * SGI_IDLE_PC=0 or SGI_IDLE_SPIN=0 disables; SGI_IDLE_THRESH tunes. */
+uint64_t sgi_idle_pc = 0xffffffff8815dd24ULL;
+uint32_t sgi_idle_thresh = 100;
+int sgi_idle_on = 1;
+
+void helper_sgi_idle_check(CPUMIPSState *env)
+{
+    static int cfg_done = 0;
+    static uint32_t idle_count = 0;
+    uint32_t status;
+
+    if (!cfg_done) {
+        const char *e;
+
+        cfg_done = 1;
+        e = getenv("SGI_IDLE_PC");
+        if (e && e[0]) {
+            sgi_idle_pc = strtoull(e, NULL, 0);
+        }
+        e = getenv("SGI_IDLE_THRESH");
+        if (e && e[0]) {
+            sgi_idle_thresh = (uint32_t)strtoul(e, NULL, 0);
+        }
+        e = getenv("SGI_IDLE_SPIN");
+        if (e && (e[0] == '0' || e[0] == 'n' || e[0] == 'N')) {
+            sgi_idle_on = 0;
+        }
+        if (!sgi_idle_pc || !sgi_idle_thresh) {
+            sgi_idle_on = 0;
+        }
+    }
+    if (!sgi_idle_on) {
+        return;
+    }
+    if (++idle_count < sgi_idle_thresh) {
+        return;
+    }
+    /*
+     * Only sleep when a timer tick is guaranteed to wake us: interrupts
+     * enabled, not in an exception, timer unmasked. Otherwise keep
+     * spinning (safe fallback, never hangs).
+     */
+    status = (uint32_t)env->CP0_Status;
+    if ((status & 1) && !(status & 6) && (status & 0x8000)) {
+        CPUState *cs = env_cpu(env);
+
+        idle_count = 0;
+        cs->halted = 1;
+        cpu_reset_interrupt(cs, CPU_INTERRUPT_WAKE);
+        raise_exception(env, EXCP_HLT);
+    }
+}
+
 void mips_cpu_synchronize_from_tb(CPUState *cs, const TranslationBlock *tb)
 {
     CPUMIPSState *env = cpu_env(cs);
