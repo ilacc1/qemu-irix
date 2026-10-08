@@ -128,6 +128,10 @@ struct SGIGIO64State {
     /* RB2 pixel store, internal only: like MAME's card, the CPU has no
      * linear VRAM window; pixels move via REX3 draw/host-dataport. */
     MemoryRegion vram;
+    /* RB2 aux/CID plane (overlay/popup/CID bits, MAME m_cidaux). REX3
+     * writes with draw_mode1 planes 4/5/6 land here; the scanout
+     * composites popup/overlay/underlay from it. Same geometry as vram. */
+    MemoryRegion aux;
     MemoryRegion xl24;
     /* Open-bus for undecoded GIO ranges: reads return all-1s so PROM
      * polling terminates, like unwired MAME PIO. */
@@ -219,7 +223,7 @@ struct SGIGIO64State {
     uint32_t step_z;
     uint32_t z_value;
     uint32_t z_slope;
-    uint32_t zbuffer[XL24_WIDTH * XL24_HEIGHT];
+    uint32_t zbuffer[XL24_STRIDE * XL24_HEIGHT];
     uint8_t plane_depth;
     uint8_t host_depth;
     /* Per-head CMAP/XMAP state (head 0 drives the display). Broadcast slaves
@@ -543,6 +547,30 @@ static unsigned sgi_gio64_host_shift(unsigned host_depth)
     return steps[host_depth & 3];
 }
 
+/* MAME get_host_color shift advance: only packed transfers consume the
+ * dataport; unpacked transfers reuse the same chunk every pixel. Uses
+ * signed arithmetic like MAME (never underflows the stored uint8_t:
+ * a would-be negative shift resets instead). */
+static void sgi_gio64_host_advance(SGIGIO64State *state, unsigned width)
+{
+    bool rwpacked = (state->draw_mode1 >> 7) & 1;
+    bool rwdouble = (state->draw_mode1 >> 10) & 1;
+    int shift = (int)state->host_shift;
+
+    if (!rwpacked) {
+        return;
+    }
+    if ((rwdouble && shift > 0) || shift > 32) {
+        shift -= (int)width;
+        if (shift < 0) {
+            shift = 64 - (int)width;
+        }
+    } else {
+        shift = 64 - (int)width;
+    }
+    state->host_shift = (uint8_t)shift;
+}
+
 static uint32_t sgi_gio64_host_color(SGIGIO64State *state)
 {
     /* MAME s_color_masks / s_host_shifts (value mask and shift step per
@@ -555,6 +583,17 @@ static uint32_t sgi_gio64_host_color(SGIGIO64State *state)
     uint32_t red;
     uint32_t green;
     uint32_t blue;
+    unsigned convert_index =
+        ((state->host_depth & 3) << 2) | (state->plane_depth & 3);
+
+    /* MAME get_host_color convert matrix diagonal (host depth matches
+     * plane depth): no conversion, the raw value passes through. This
+     * preserves CI palette indices (RGB assembly would destroy them). */
+    if (convert_index == 0 || convert_index == 5 ||
+        convert_index == 10 || convert_index == 15) {
+        sgi_gio64_host_advance(state, width);
+        return value;
+    }
 
     switch (state->host_depth) {
     case 0:
@@ -578,7 +617,7 @@ static uint32_t sgi_gio64_host_color(SGIGIO64State *state)
         blue = (value >> 16) & 0xff;
         break;
     }
-    state->host_shift = (state->host_shift + 64 - width) & 63;
+    sgi_gio64_host_advance(state, width);
     if (state->plane_depth == 3) {
         /* 24-bit direct: keep the full assembled color (0x00BBGGRR, MAME
          * get_host_color layout); the store expands/masks per depth. */
@@ -709,9 +748,8 @@ static uint32_t sgi_gio64_rop(uint8_t func, uint32_t src, uint32_t dst)
 
 static uint32_t sgi_gio64_expand_pixel(SGIGIO64State *state, uint32_t color)
 {
-    /* MAME rb2 expand_to_all_lanes for the RGB/CI plane: replicate the
-     * drawn value across the 32-bit word so 8/12-bit draws fill every
-     * lane a 24-bit scanout reads. 24-bit needs no expansion. */
+    /* MAME rb2 expand_to_all_lanes: replicate by draw depth, then shift
+     * by plane (overlay <<8, popup <<2, CID/RGB unshifted). */
     switch (state->plane_depth) {
     case 0: /* 4bpp */
         color |= color << 4;
@@ -728,7 +766,14 @@ static uint32_t sgi_gio64_expand_pixel(SGIGIO64State *state, uint32_t color)
     default: /* 24bpp */
         break;
     }
-    return color;
+    switch (state->draw_mode1 & 7) {
+    case 4: /* overlay planes */
+        return color << 8;
+    case 5: /* popup planes */
+        return color << 2;
+    default: /* RGB/CI, RGBA, CID */
+        return color;
+    }
 }
 
 static uint32_t sgi_gio64_blend_rgb(uint32_t src, uint32_t dst,
@@ -853,22 +898,30 @@ static uint32_t sgi_gio64_blend_rgb24(SGIGIO64State *state, uint32_t src,
 }
 
 static void sgi_gio64_put_pixel(SGIGIO64State *state, uint32_t *vram,
+                                 uint32_t *aux,
                                  int x, int y, uint32_t color, uint32_t mask,
                                  unsigned coverage)
 {
     /* MAME output_pixel applies the window offset to every write and rejects
-     * pixels outside the framebuffer before any addressing. The store is a
-     * 32-bit RGBCI word (MAME rb2): 8-bit draws occupy the low byte and the
-     * masked store preserves the other lanes, so CI scanout (low byte) is
+     * pixels outside the framebuffer before any addressing. Draws with
+     * draw_mode1 planes 4/5/6 (overlay/popup/CID) land in the aux plane
+     * (MAME m_cidaux); all other planes land in the RGBCI word. The masked
+     * store preserves the other lanes, so CI scanout (low byte) is
      * unchanged while 24-bit scanout sees full words. */
+    unsigned plane;
+    uint32_t *pixel;
+    uint32_t dst;
+    uint32_t expanded;
+    uint32_t out;
+
     x += (int)state->x_window - 0x1000;
     y += (int)state->y_window - 0x1000;
-    if (x < 0 || x >= XL24_WIDTH || y < 0 || y >= XL24_HEIGHT ||
+    if (x < 0 || x >= XL24_STRIDE || y < 0 || y >= XL24_HEIGHT ||
         sgi_gio64_clip_pixel(state, x, y)) {
         return;
     }
     if (state->step_z & 1) {
-        uint32_t *z = &state->zbuffer[y * XL24_WIDTH + x];
+        uint32_t *z = &state->zbuffer[y * XL24_STRIDE + x];
         if (state->z_value > *z) {
             return;
         }
@@ -876,13 +929,19 @@ static void sgi_gio64_put_pixel(SGIGIO64State *state, uint32_t *vram,
             *z = state->z_value;
         }
     }
-    uint32_t *pixel = &vram[y * XL24_STRIDE + x];
-    uint32_t dst = *pixel;
-    uint32_t expanded = sgi_gio64_expand_pixel(state, color);
-    uint32_t out;
+    plane = state->draw_mode1 & 7;
+    pixel = (plane >= 4 && plane <= 6) ?
+            &aux[y * XL24_STRIDE + x] : &vram[y * XL24_STRIDE + x];
+    dst = *pixel;
+    expanded = sgi_gio64_expand_pixel(state, color);
 
     if (state->draw_mode1 & (1U << 18)) {
-        if (state->plane_depth == 3) {
+        if (plane >= 4 && plane <= 6) {
+            /* Blending aux/CID bits is undefined; keep the ROP result
+             * (blended overlay draws are vanishingly rare). */
+            out = sgi_gio64_rop((state->draw_mode1 >> 28) & 0xf,
+                                expanded, dst);
+        } else if (state->plane_depth == 3) {
             out = sgi_gio64_blend_rgb24(state, expanded, dst);
         } else {
             /* Legacy CI blend (palette-based); low byte only, matching the
@@ -895,7 +954,7 @@ static void sgi_gio64_put_pixel(SGIGIO64State *state, uint32_t *vram,
         /* Raster op from drawmode1[31:28] (MAME logic_pixel path). */
         out = sgi_gio64_rop((state->draw_mode1 >> 28) & 0xf, expanded, dst);
     }
-    if (coverage < 255) {
+    if (coverage < 255 && (plane < 4 || plane > 6)) {
         if (state->plane_depth == 3) {
             out = sgi_gio64_blend_rgb(out, dst, coverage);
         } else {
@@ -918,6 +977,7 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
     int y_end = state->y_end_i;
     uint32_t color = state->color_i;
     uint32_t *vram = memory_region_get_ram_ptr(&state->vram);
+    uint32_t *aux = memory_region_get_ram_ptr(&state->aux);
     uint8_t address_mode = (mode0 >> 2) & 7;
     uint32_t write_mask = state->write_mask;
     uint32_t pattern = mode0 & (1U << 12) ? state->z_pattern :
@@ -934,7 +994,7 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
 
     state->display_dirty = true;
     if (sgi_gio_dbg()) {
-        static int rex3_rows = 6000;
+        static int rex3_rows = 500000;
 
         if (rex3_rows > 0) {
             rex3_rows--;
@@ -953,18 +1013,29 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
 
     if (opcode == 1) {
         uint64_t data = 0;
+        unsigned plane = state->draw_mode1 & 7;
+        /* MAME read_pixel reads the active destination buffer (RGBCI or
+         * aux/CID by plane_enable). Clamp the row (MAME pixel_clip_pass);
+         * an out-of-range row reads zeros instead of OOB memory. */
+        const uint32_t *src_plane = (plane >= 4 && plane <= 6) ? aux : vram;
+
+        if (y_start < 0 || y_start >= XL24_HEIGHT) {
+            state->host_dataport = 0;
+            state->host_shift = 56;
+            return;
+        }
 
         if (state->plane_depth == 3) {
             /* 24-bit: MAME read_pixel returns whole words (src shift 0 on
              * the RGB/CI plane). */
-            for (uint32_t x = x_start; x <= x_end && x < XL24_WIDTH; x++) {
+            for (uint32_t x = x_start; x <= x_end && x < XL24_STRIDE; x++) {
                 data = (data << 32) |
-                       vram[y_start * XL24_STRIDE + x];
+                       src_plane[y_start * XL24_STRIDE + x];
             }
         } else {
-            for (uint32_t x = x_start; x <= x_end && x < XL24_WIDTH; x++) {
+            for (uint32_t x = x_start; x <= x_end && x < XL24_STRIDE; x++) {
                 data = (data << 8) |
-                       (uint8_t)vram[y_start * XL24_STRIDE + x];
+                       (uint8_t)src_plane[y_start * XL24_STRIDE + x];
             }
         }
         state->host_dataport = data;
@@ -972,10 +1043,13 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
         return;
     }
     if (opcode == 3 && address_mode <= 1) {
-        /* Scr2Scr copy (MAME do_rex3_command case 3). The source snapshot uses
-         * the RB2 STRIDE (1344), not WIDTH, and preserves the source for
-         * overlapping copies; the window offset applies to source and dest,
-         * like MAME's set_address + output_pixel pair. */
+        /* Scr2Scr copy (MAME do_rex3_command case 3). Source and dest live
+         * in the plane selected by draw_mode1 (RGBCI or aux/CID); the
+         * window offset applies to source and dest, like MAME's
+         * set_address + output_pixel pair. The snapshot covers only the
+         * source rect (not the whole store) and preserves it for
+         * overlapping copies. Terminates like iris: a pass without
+         * stop_on_x ends the whole copy (single row/pixel). */
         int x_step = (state->bres_octant_inc1 >> 25) & 1 ? -1 : 1;
         int y_step = (state->bres_octant_inc1 >> 24) & 1 ? -1 : 1;
         int win_x = (int)state->x_window - 0x1000;
@@ -986,22 +1060,42 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
         int start_y = y_start;
         int end_x = x_end + x_step;
         int end_y = y_end + y_step;
-        size_t rb_size = (size_t)XL24_STRIDE * XL24_HEIGHT *
-                         sizeof(*vram);
-        uint32_t *copy = g_malloc(rb_size);
+        unsigned plane = state->draw_mode1 & 7;
+        const uint32_t *src_plane =
+            (plane >= 4 && plane <= 6) ? aux : vram;
+        int sx0 = MIN(x_start, x_end) + win_x;
+        int sx1 = MAX(x_start, x_end) + win_x;
+        int sy0 = MIN(y_start, y_end) + win_y;
+        int sy1 = MAX(y_start, y_end) + win_y;
+        int sw = 0, sh = 0;
+        uint32_t *copy = NULL;
 
-        memcpy(copy, vram, rb_size);
+        if (sx1 >= 0 && sy1 >= 0 && sx0 < XL24_STRIDE &&
+            sy0 < XL24_HEIGHT) {
+            sx0 = MAX(sx0, 0);
+            sy0 = MAX(sy0, 0);
+            sx1 = MIN(sx1, XL24_STRIDE - 1);
+            sy1 = MIN(sy1, XL24_HEIGHT - 1);
+            sw = sx1 - sx0 + 1;
+            sh = sy1 - sy0 + 1;
+            copy = g_malloc((size_t)sw * sh * sizeof(*copy));
+            for (int yy = 0; yy < sh; yy++) {
+                memcpy(&copy[(size_t)yy * sw],
+                       &src_plane[(size_t)(sy0 + yy) * XL24_STRIDE + sx0],
+                       (size_t)sw * sizeof(*copy));
+            }
+        }
         do {
             do {
                 int src_x = start_x + win_x;
                 int src_y = start_y + win_y;
                 uint32_t src = 0;
 
-                if (src_x >= 0 && src_x < XL24_WIDTH &&
-                    src_y >= 0 && src_y < XL24_HEIGHT) {
-                    src = copy[(size_t)src_y * XL24_STRIDE + src_x];
+                if (copy && src_x >= sx0 && src_x <= sx1 &&
+                    src_y >= sy0 && src_y <= sy1) {
+                    src = copy[(size_t)(src_y - sy0) * sw + (src_x - sx0)];
                 }
-                sgi_gio64_put_pixel(state, vram,
+                sgi_gio64_put_pixel(state, vram, aux,
                                     start_x + state->x_move,
                                     start_y + state->y_move,
                                     src, write_mask, 255);
@@ -1010,6 +1104,9 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
             if (start_x == end_x) {
                 start_x = state->x_save;
                 start_y += y_step;
+            }
+            if (!stop_on_x) {
+                break;
             }
         } while (start_y != end_y && stop_on_y);
         g_free(copy);
@@ -1061,7 +1158,7 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
                            127 / MAX(span, 1);
                 coverage = MIN(coverage, 255U);
             }
-            sgi_gio64_put_pixel(state, vram, x, y, color, write_mask,
+            sgi_gio64_put_pixel(state, vram, aux, x, y, color, write_mask,
                                 coverage);
             if (mode0 & (1U << 18)) {
                 sgi_gio64_iterate_shade(state);
@@ -1097,7 +1194,7 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
                                127 / MAX(span, 1);
                     coverage = MIN(coverage, 255U);
                 }
-                sgi_gio64_put_pixel(state, vram, x, y, color, write_mask,
+                sgi_gio64_put_pixel(state, vram, aux, x, y, color, write_mask,
                                     coverage);
                 if (mode0 & (1U << 18)) {
                     sgi_gio64_iterate_shade(state);
@@ -1133,9 +1230,17 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
     int x_step = (state->bres_octant_inc1 >> 25) & 1 ? -1 : 1;
     int y_step = (state->bres_octant_inc1 >> 24) & 1 ? -1 : 1;
     /* Default color (MAME get_default_color): fast-clear sources the VRAM
-     * color, with plane-depth replication. */
+     * color, with plane-depth replication. Kept whole (not truncated):
+     * 24-bit fills need all three bytes. */
     uint32_t base = ((state->draw_mode1 >> 17) & 1) ? state->color_vram :
                     state->color_i;
+    bool shade = (mode0 >> 18) & 1;
+    bool rgbmode = (state->draw_mode1 >> 15) & 1;
+    bool fastclear = (state->draw_mode1 >> 17) & 1;
+    /* Iteration cap: guarantees termination even if a stale octant points
+     * away from the end (MAME shares the bare shape; iris bounds its
+     * walkers). Generous enough to never trigger on legitimate fills. */
+    unsigned long iter_budget = 4UL * XL24_STRIDE * XL24_HEIGHT;
 
     switch (state->plane_depth) {
     case 0:
@@ -1158,11 +1263,13 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
         base &= 0xffffff;
         break;
     }
-    color = base & 0xff;
 
     /*
      * Block/span fill (MAME Draw/Block case): inclusive end extended by one
      * step, rows restart from x_save, loops gated by stop_on_x/stop_on_y.
+     * Per pixel (MAME): shade-iterate, then host color, else shaded color
+     * (unless fast-clear), else the default. Out-of-range rows rely on
+     * put_pixel's per-pixel clip (like MAME output_pixel).
      */
     bool stop_on_x = (mode0 >> 8) & 1;
     bool stop_on_y = (mode0 >> 9) & 1;
@@ -1173,41 +1280,132 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
             prim_end_x = x_start + 32 * x_step;
         }
     }
+    /* MAME lr_abort (mode0 bit19 with negative dx): draw nothing. */
+    if (((mode0 >> 19) & 1) && x_step < 0) {
+        return;
+    }
     /* Inclusive end, extended by one step like MAME. */
     x_end += x_step;
     y_end += y_step;
 
+    /*
+     * Flat-fill fast path: opaque replace, no blend/shade/host/stipple,
+     * no clip or Z, single constant color, rows restart from x_start.
+     * Inlines the masked store instead of per-pixel put_pixel calls.
+     * Falls back to the slow loop unless the windowed rect is fully
+     * on-screen.
+     */
+    if (((state->draw_mode1 >> 28) & 0xf) == 3 &&
+        !(state->draw_mode1 & (1U << 18)) &&
+        !(mode0 & ((1U << 18) | (1U << 6))) &&
+        pattern == 0xffffffffU &&
+        !(state->clip_mode & 1) && !(state->step_z & 1) &&
+        state->x_save == x_start && stop_on_x &&
+        !((mode0 >> 15) & 1)) {
+        int win_x = (int)state->x_window - 0x1000;
+        int win_y = (int)state->y_window - 0x1000;
+        /* Inclusive pixel ranges (x_end/y_end are exclusive here). */
+        int rx0 = x_step > 0 ? x_start : x_end - x_step;
+        int rx1 = x_step > 0 ? x_end - x_step : x_start;
+        int ry0 = y_step > 0 ? y_start : y_end - y_step;
+        int ry1 = y_step > 0 ? y_end - y_step : y_start;
+        unsigned fplane = state->draw_mode1 & 7;
+        uint32_t *ffb = (fplane >= 4 && fplane <= 6) ? aux : vram;
+        uint32_t fmask = write_mask & XL24_GLOBAL_MASK;
+        uint32_t fcol = base;
+        int fy = y_start;
+
+        /* MAME rgbmode-flat (no shade iteration) uses the assembled
+         * shaded color; base already holds the depth-replicated word. */
+        if ((state->draw_mode1 >> 15) & 1) {
+            fcol = sgi_gio64_shaded_color(state);
+            if (state->plane_depth != 3) {
+                fcol = sgi_gio64_expand_pixel(state, fcol);
+            }
+        }
+        if (rx0 + win_x >= 0 && ry0 + win_y >= 0 &&
+            rx1 + win_x < XL24_STRIDE && ry1 + win_y < XL24_HEIGHT &&
+            rx0 <= rx1 && ry0 <= ry1) {
+            int row_w = rx1 - rx0 + 1;
+            int row_x0 = (x_step > 0 ? rx0 : rx1) + win_x;
+
+            do {
+                uint32_t *dst = &ffb[(size_t)(fy + win_y) * XL24_STRIDE +
+                                     row_x0];
+
+                if (fmask == XL24_GLOBAL_MASK) {
+                    for (int i = 0; i < row_w; i++) {
+                        dst[i * x_step] = fcol;
+                    }
+                } else {
+                    for (int i = 0; i < row_w; i++) {
+                        uint32_t d = dst[i * x_step];
+
+                        dst[i * x_step] = (d & ~fmask) | (fcol & fmask);
+                    }
+                }
+                fy += address_mode == 1 ? y_step : 0;
+            } while (fy != y_end && stop_on_y && address_mode == 1);
+            /* End state matches the slow loop (x restarted to x_save). */
+            sgi_gio64_write_x_start(state, state->x_save << 11);
+            sgi_gio64_write_y_start(state, fy << 11);
+            memory_region_set_dirty(&state->vram, 0,
+                                    memory_region_size(&state->vram));
+            return;
+        }
+    }
+
     int x = x_start;
     int y = y_start;
+    /* MAME restores the shade DDA from the entry colors after each row so
+     * gradients restart instead of continuing across rows. */
+    int32_t row_red = state->curr_color_red;
+    int32_t row_green = state->curr_color_green;
+    int32_t row_blue = state->curr_color_blue;
+    int32_t row_alpha = state->curr_color_alpha;
     /* do-while over rows like MAME; the single-pixel stop_on_x-clear case
      * draws once and stops instead of spinning. */
     do {
-        if (y < 0 || y >= XL24_HEIGHT) {
-            break;
-        }
         /* Block mode restarts the stipple bit per row; Span advances it. */
         if (address_mode == 1) {
             pattern_bit = 31;
         }
+        state->curr_color_red = row_red;
+        state->curr_color_green = row_green;
+        state->curr_color_blue = row_blue;
+        state->curr_color_alpha = row_alpha;
         do {
-            if (x >= 0 && x < XL24_WIDTH) {
+            if (x >= 0 && x < XL24_STRIDE) {
                 if (!(pattern & (1U << pattern_bit))) {
                     if (mode0 & (3U << 16)) {
-                        sgi_gio64_put_pixel(state, vram, x, y,
+                        sgi_gio64_put_pixel(state, vram, aux, x, y,
                                             state->color_back, write_mask,
                                             255);
                     }
                 } else if (mode0 & (1U << 6)) {
                     color = sgi_gio64_host_color(state);
-                    sgi_gio64_put_pixel(state, vram, x, y, color, write_mask,
+                    sgi_gio64_put_pixel(state, vram, aux, x, y, color, write_mask,
                                         255);
                 } else {
-                    sgi_gio64_put_pixel(state, vram, x, y, color, write_mask,
+                    uint32_t c = base;
+
+                    if ((shade || rgbmode) && !fastclear) {
+                        if (shade) {
+                            sgi_gio64_iterate_shade(state);
+                        }
+                        c = sgi_gio64_shaded_color(state);
+                    }
+                    sgi_gio64_put_pixel(state, vram, aux, x, y, c, write_mask,
                                         255);
                 }
             }
             pattern_bit = (pattern_bit - 1) & 31;
             x += x_step;
+            if (--iter_budget == 0) {
+                qemu_log_mask(LOG_UNIMP, "sgi-gio64: span/block budget "
+                              "exhausted, aborting fill\n");
+                return;
+            }
         } while (x != prim_end_x && x != x_end && stop_on_x);
         if ((x_step > 0 && x >= x_end) || (x_step < 0 && x <= x_end)) {
             x = state->x_save;
@@ -2384,8 +2582,12 @@ static bool sgi_gio64_update_display(void *opaque)
     /* Head 0 drives the display (MAME screen_update uses m_xmap[0] and
      * m_cmap[0]). Pens are 0x00RRGGBB. */
     const uint32_t *cmap = state->cmap_palette[0];
+    const uint32_t *auxplane = memory_region_get_ram_ptr(&state->aux);
     uint16_t cursor_msb =
         (uint16_t)(state->xmap_cursor_cmap[0] & 0xff) << 5;
+    uint16_t popup_msb =
+        (uint16_t)(state->xmap_popup_cmap[0] & 0xff) << 5;
+    bool is_8bpp = (state->xmap_config[0] >> 2) & 1;
 
     if (surface_width(surface) != width || surface_height(surface) != height) {
         qemu_console_resize(state->console, width, height);
@@ -2402,8 +2604,8 @@ static bool sgi_gio64_update_display(void *opaque)
     bool dbg = sgi_gio_dbg();
     /* One 32-bit RGBCI word per pixel (MAME rb2): 8-bit CI occupies the low
      * byte, 12-bit the low 12 bits, 24-bit direct the low 24 bits as
-     * 0x00BBGGRR. The aux CID plane is not modeled, so aux words read 0
-     * and zero overlays fall through to the main pixel. */
+     * 0x00BBGGRR. A second store holds the aux/CID plane (overlay/popup
+     * bits, MAME m_cidaux), composited below. */
     for (y = 0; y < height; y++) {
         uint16_t did = sgi_gio64_vc2_begin_did(state, y);
         uint32_t table = state->xmap_mode[0][did & 0x1f];
@@ -2474,11 +2676,100 @@ static bool sgi_gio64_update_display(void *opaque)
             if (cursor) {
                 rgb = cmap[cursor_msb | cursor];
                 replaced = true;
-            } else if (aux_mode == 1 || aux_mode == 7) {
-                /* Underlay (or overlay+underlay with zero overlay input):
-                 * zero aux input selects pen 0 of the aux bank. */
-                rgb = cmap[aux_msb];
-                replaced = true;
+            } else {
+                /* MAME screen_update priority: cursor, popup
+                 * (cidaux bits 3:2), aux underlay/overlay, main pixel. */
+                size_t aoff = (size_t)y * XL24_STRIDE + x;
+                uint32_t cidaux = aoff < vram_words ? auxplane[aoff] : 0;
+
+                if (cidaux & 0xcc) {
+                    rgb = cmap[popup_msb | ((cidaux >> 2) & 3)];
+                    replaced = true;
+                } else if (aux_mode != 0) {
+                    if (is_8bpp) {
+                        switch (aux_mode) {
+                        case 1: /* 2-bit underlay, always opaque */
+                            rgb = cmap[aux_msb | ((cidaux >> 8) & 3)];
+                            replaced = true;
+                            break;
+                        case 2: { /* 2-bit overlay, transparent if zero */
+                            uint32_t pix_in = (cidaux >> 8) & 3;
+
+                            if (pix_in) {
+                                rgb = cmap[aux_msb | pix_in];
+                                replaced = true;
+                            }
+                            break;
+                        }
+                        case 6: { /* 1-bit overlay, bit by table bit 1 */
+                            uint32_t shift = (table & 2) ? 9 : 8;
+                            uint32_t pix_in = (cidaux >> shift) & 1;
+
+                            if (pix_in) {
+                                rgb = cmap[aux_msb | pix_in];
+                                replaced = true;
+                            }
+                            break;
+                        }
+                        case 7: { /* 1-bit overlay + 1-bit underlay */
+                            uint32_t pix_in = (cidaux >> 8) & 1;
+
+                            if (pix_in) {
+                                rgb = cmap[aux_msb | pix_in];
+                            } else {
+                                rgb = cmap[aux_msb |
+                                           ((cidaux >> 9) & 1)];
+                            }
+                            replaced = true;
+                            break;
+                        }
+                        default:
+                            break;
+                        }
+                    } else {
+                        switch (aux_mode) {
+                        case 1: /* 8-bit underlay */
+                            rgb = cmap[aux_msb | ((cidaux >> 8) & 0xff)];
+                            replaced = true;
+                            break;
+                        case 2: { /* 8-bit overlay, transparent if zero */
+                            uint32_t pix_in =
+                                ((cidaux >> 8) & 0xf) |
+                                ((cidaux >> 16) & 0xf0);
+
+                            if (pix_in) {
+                                rgb = cmap[aux_msb | pix_in];
+                                replaced = true;
+                            }
+                            break;
+                        }
+                        case 6: { /* 4-bit overlay, shift by table bit 1 */
+                            uint32_t shift = (table & 2) ? 12 : 8;
+                            uint32_t pix_in = (cidaux >> shift) & 0xf;
+
+                            if (pix_in) {
+                                rgb = cmap[aux_msb | pix_in];
+                                replaced = true;
+                            }
+                            break;
+                        }
+                        case 7: { /* 4-bit overlay + 4-bit underlay */
+                            uint32_t pix_in = (cidaux >> 8) & 0xf;
+
+                            if (pix_in) {
+                                rgb = cmap[aux_msb | pix_in];
+                            } else {
+                                rgb = cmap[aux_msb |
+                                           ((cidaux >> 12) & 0xf)];
+                            }
+                            replaced = true;
+                            break;
+                        }
+                        default:
+                            break;
+                        }
+                    }
+                }
             }
             if (!replaced) {
                 size_t off = (size_t)y * XL24_STRIDE + x;
@@ -2520,10 +2811,15 @@ static bool sgi_gio64_update_display(void *opaque)
                             (byte >> shift) & 0x0f);
                         break;
                     }
-                    case 1:
-                        /* The expanded store already holds this pixel's byte. */
-                        rgb = sgi_gio64_bgr8_to_rgb(byte);
+                    case 1: {
+                        /* MAME RGB Map0 8bpp: buffer selected by table bit
+                         * 0 (buffer 1 reads bits 8-15). */
+                        uint8_t shift = (table & 1) ? 8 : 0;
+                        uint8_t pix_in = (word >> shift) & 0xff;
+
+                        rgb = sgi_gio64_bgr8_to_rgb(pix_in);
                         break;
+                    }
                     case 2: {
                         /* MAME RGB 12bpp: low 12 bits of the word, upper
                          * half selected by table bit 0. */
@@ -2612,8 +2908,8 @@ static int sgi_gio64_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_sgi_gio64 = {
     .name = "sgi-gio64",
-    .version_id = 3,
-    .minimum_version_id = 3,
+    .version_id = 4,
+    .minimum_version_id = 4,
     .post_load = sgi_gio64_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(rex3_config, SGIGIO64State),
@@ -2690,7 +2986,7 @@ static const VMStateDescription vmstate_sgi_gio64 = {
         VMSTATE_UINT32(z_value, SGIGIO64State),
         VMSTATE_UINT32(z_slope, SGIGIO64State),
         VMSTATE_UINT32_ARRAY(zbuffer, SGIGIO64State,
-                             XL24_WIDTH * XL24_HEIGHT),
+                             XL24_STRIDE * XL24_HEIGHT),
         VMSTATE_UINT8(plane_depth, SGIGIO64State),
         VMSTATE_UINT8(host_depth, SGIGIO64State),
         VMSTATE_2DARRAY(cmap_palette, SGIGIO64State, 2, 65536, 0,
@@ -2729,6 +3025,8 @@ static void sgi_gio64_init(Object *object)
     memory_region_init(&state->bus, object, "sgi-gio64.bus", GIO64_BUS_SIZE);
     /* VRAM is the internal RB2 pixel store, not a CPU window (P0-2). */
     memory_region_init_ram(&state->vram, object, "sgi-gio64.xl24.vram",
+                           XL24_VRAM_SIZE, &error_abort);
+    memory_region_init_ram(&state->aux, object, "sgi-gio64.xl24.aux",
                            XL24_VRAM_SIZE, &error_abort);
     memory_region_init_io(&state->xl24, object, &sgi_gio64_xl24_ops, state,
                           "sgi-gio64.xl24.rex3", XL24_REX3_SIZE);
