@@ -1035,13 +1035,14 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
         if (rex3_rows > 0) {
             rex3_rows--;
             fprintf(stderr, "REX3 op=%u m0=0x%08x am=%u col=%u back=%u "
-                    "mask=%06x pat=0x%08x x=%d..%d y=%d..%d win=(%d,%d) "
+                    "mask=%06x pat=0x%08x x=%d..%d y=%d..%d win=(%d,%d) clip=0x%04x "
                     "move=(%d,%d) pd=%u vm1=0x%08x color_vram=%06x\n",
                     opcode, mode0, address_mode, state->color_i,
                     state->color_back, write_mask, pattern,
                     x_start, y_start, x_end, y_end,
                     (int)state->x_window - 0x1000,
                     (int)state->y_window - 0x1000,
+                    state->clip_mode & 0x1fff,
                     state->x_move, state->y_move, state->plane_depth,
                     state->draw_mode1, state->color_vram);
         }
@@ -1314,6 +1315,21 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
     if ((mode0 >> 15) & 1) {
         if ((x_end - x_start) * x_step >= 32) {
             prim_end_x = x_start + 32 * x_step;
+        }
+    }
+    /* Packed host blits consume one dataport per command, so the row must
+     * stop after that many pixels even when stop_on_x is clear. */
+    /* MAME newport.cpp:3358-3366,3430-3438 */
+    if (((mode0 >> 6) & 1) && ((state->draw_mode1 >> 7) & 1)) {
+        static const int16_t max_host_lengths[2][4] =
+            { { 4, 4, 2, 1 }, { 8, 8, 4, 2 } };
+        int max_length = max_host_lengths[(state->draw_mode1 >> 10) & 1]
+                                          [(state->draw_mode1 >> 8) & 3];
+        int length = abs(prim_end_x - x_start);
+
+        stop_on_x = true;
+        if (length > max_length) {
+            prim_end_x = x_start + x_step * max_length;
         }
     }
     /* MAME lr_abort (mode0 bit19 with negative dx): draw nothing. */
