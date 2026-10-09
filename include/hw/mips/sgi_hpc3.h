@@ -14,4 +14,9 @@ void sgi_hpc3_set_ioc2(DeviceState *ioc2);
 /* PIO ch6 registers 0x10/0x11: PS/2 keyboard controller (MAME's m_kbdc). */
 void sgi_hpc3_set_pio6_kbd(DeviceState *kbd);
 
+/* PIO ch0 is the HAL2 audio controller (MAME pio0_map); state lives in the
+ * board glue next to the PBUS DMA engine that feeds it. */
+uint64_t sgi_hal2_read(unsigned offset);
+void sgi_hal2_write(unsigned offset, uint16_t value);
+
 #endif

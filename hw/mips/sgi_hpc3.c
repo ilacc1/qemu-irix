@@ -746,15 +746,8 @@ static uint64_t sgi_hpc3_pio_read_do(void *opaque, hwaddr addr, unsigned size)
          *   map(0x00, 0xff).rw(m_hal2, hal2_device::read/write)
          * and hal2.h numbers its registers in dwords
          * (STATUS_REG = 0x0010/4 = 4, REVISION_REG = 0x0020/4 = 8), so
-         * `offset` is the register index, not a byte address.  Only
-         * REVISION_REG is read-only and hard-wired; everything else is
-         * the ISR/indirect-register backing store below.
-         */
-        if (offset == 0x08) {
-            /* MAME hal2.cpp: hal2_device::read(REVISION_REG) -> 0x4010. */
-            return 0x4010;
-        }
-        /* The two shims below are not MAME-derived: they stand in for
+         * `offset` is the register index, not a byte address.
+         * The two shims below are not MAME-derived: they stand in for
          * status bytes the guest polls, which MAME reaches through devices
          * this board does not wire up.  They are keyed on the raw byte
          * address, so with the dword decode they now fire only at that one
@@ -786,7 +779,7 @@ static uint64_t sgi_hpc3_pio_read_do(void *opaque, hwaddr addr, unsigned size)
             }
             return v;
         }
-        rv = state->pio0_data[offset];
+        rv = sgi_hal2_read(offset);
         return rv;
     }
     if (channel == 1) {
@@ -868,7 +861,12 @@ static void sgi_hpc3_pio_write(void *opaque, hwaddr addr, uint64_t val,
         return;
     }
     if (channel == 0) {
-        state->pio0_data[offset] = val;
+        /* HAL2 indirect registers (MAME hal2.cpp:104); the PROM programs
+         * them with dword stores, so a short store only sets its lane. */
+        if (size == 1) {
+            val = (sgi_hal2_read(offset) & 0xff00) | (val & 0xff);
+        }
+        sgi_hal2_write(offset, val & 0xffff);
         return;
     }
     if (channel == 1) {

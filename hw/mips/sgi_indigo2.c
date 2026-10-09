@@ -30,6 +30,7 @@
 #include "hw/nvram/eeprom93xx.h"
 #include "hw/isa/isa.h"
 #include "system/system.h"
+#include "system/runstate.h"
 #include "hw/core/boards.h"
 #include "net/net.h"
 #include "hw/scsi/sgi_wd33c93.h"
@@ -44,6 +45,7 @@
 #include "system/reset.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
+#include "qemu/audio.h"
 #include "qemu/help_option.h"
 #include "qemu/timer.h"
 #ifdef CONFIG_TCG
@@ -196,6 +198,9 @@ static void sgi_hpc3_pbus_tick(void *opaque)
 static bool sgi_hpc3_pbus_access(hwaddr addr, unsigned *channel,
                                  unsigned *reg)
 {
+    /* PBUS DMA channels live at +0x0000 (MAME hpc3.cpp:185) but this
+     * window is mounted at +0x1000, so add the bias back before decoding. */
+    addr += 0x1000;
     if (addr >= 0x10000) {
         return false;
     }
@@ -400,9 +405,267 @@ bool sgi_ip22_trace_enabled(void)
 static uint8_t sgi_hpc3_pio_regs[0x1000];
 static uint16_t sgi_hal2_codec[2][2];
 static uint16_t sgi_hal2_bres[3][3];
+static uint16_t sgi_hal2_isr;
+static uint16_t sgi_hal2_iar;
+static uint16_t sgi_hal2_idr[4];
+static uint16_t sgi_hal2_dma_enable;
+static uint16_t sgi_hal2_dma_drive;
 static int16_t sgi_hal2_dac[2];
 static uint64_t sgi_hal2_dac_samples[2];
 static unsigned sgi_hal2_curr_dac;
+
+/* Guest-selected audio backend id (MachineState.audiodev), resolved lazily
+ * so a missing backend only mutes audio instead of aborting the boot. */
+static char *sgi_hal2_audiodev;
+static AudioBackend *sgi_hal2_be;
+static SWVoiceOut *sgi_hal2_voice;
+static unsigned sgi_hal2_voice_freq;
+
+/* PBUS delivers one 16-bit sample per tick; the voice consumes stereo
+ * frames, so samples queue here until the backend pulls them. */
+#define SGI_HAL2_FIFO_SIZE 65536
+static int16_t sgi_hal2_fifo[SGI_HAL2_FIFO_SIZE];
+static unsigned sgi_hal2_fifo_head;
+static unsigned sgi_hal2_fifo_count;
+
+static void sgi_hal2_reset_state(void)
+{
+    sgi_hal2_isr = 0;
+    sgi_hal2_iar = 0;
+    memset(sgi_hal2_idr, 0, sizeof(sgi_hal2_idr));
+    memset(sgi_hal2_codec, 0, sizeof(sgi_hal2_codec));
+    memset(sgi_hal2_bres, 0, sizeof(sgi_hal2_bres));
+    sgi_hal2_dma_enable = 0;
+    sgi_hal2_dma_drive = 0;
+    memset(sgi_hal2_dac, 0, sizeof(sgi_hal2_dac));
+    memset(sgi_hal2_dac_samples, 0, sizeof(sgi_hal2_dac_samples));
+    sgi_hal2_curr_dac = 0;
+    sgi_hal2_fifo_head = 0;
+    sgi_hal2_fifo_count = 0;
+}
+
+/* Indirect values are staged in IDR0-3, then committed by writing the
+ * target address to IAR (MAME hal2.cpp:115-305). */
+static void sgi_hal2_iar_write(uint16_t iar)
+{
+    unsigned type = iar & 0xf000;
+    unsigned num = iar & 0x0f00;
+    bool read = (iar & 0x0080) != 0;
+    unsigned param = (iar & 0x000c) >> 2;
+
+    sgi_hal2_iar = iar;
+    if (type == 0x1000 && (num == 0x0400 || num == 0x0500)) {
+        /* Codec A/B CTRL1 holds channel/clock/mode, CTRL2 gain (MAME hal2.cpp:134-206). */
+        unsigned codec = (num == 0x0400) ? 0 : 1;
+
+        if (param == 1) {
+            if (read) {
+                sgi_hal2_idr[0] = sgi_hal2_codec[codec][0];
+            } else {
+                sgi_hal2_codec[codec][0] = sgi_hal2_idr[0];
+            }
+        } else if (param == 2) {
+            if (read) {
+                sgi_hal2_idr[0] = sgi_hal2_codec[codec][1];
+            } else {
+                sgi_hal2_codec[codec][1] = sgi_hal2_idr[0];
+            }
+        }
+        return;
+    }
+    if (type == 0x2000 && num >= 0x0100 && num <= 0x0300) {
+        /* One of three identical Bresenham generators (MAME hal2.cpp:215-270). */
+        unsigned gen = (num >> 8) - 1;
+
+        if (param == 1) {
+            if (read) {
+                sgi_hal2_idr[0] = sgi_hal2_bres[gen][0];
+            } else {
+                sgi_hal2_bres[gen][0] = sgi_hal2_idr[0];
+            }
+        } else if (param == 2) {
+            if (read) {
+                sgi_hal2_idr[0] = sgi_hal2_bres[gen][1];
+                sgi_hal2_idr[1] = sgi_hal2_bres[gen][2];
+            } else {
+                sgi_hal2_bres[gen][1] = sgi_hal2_idr[0];
+                sgi_hal2_bres[gen][2] = sgi_hal2_idr[1];
+            }
+        }
+        return;
+    }
+    if (type == 0x9000 && num == 0x0100) {
+        /* Global DMA masks the driver read-modify-writes, so they must
+         * read back what was stored. */
+        if (param == 1) {
+            if (read) {
+                sgi_hal2_idr[0] = sgi_hal2_dma_enable;
+            } else {
+                sgi_hal2_dma_enable = sgi_hal2_idr[0];
+            }
+        } else if (param == 3) {
+            if (read) {
+                sgi_hal2_idr[0] = sgi_hal2_dma_drive;
+            } else {
+                sgi_hal2_dma_drive = sgi_hal2_idr[0];
+            }
+        }
+        return;
+    }
+}
+
+/* PIO0 register file (MAME hal2.h:65-74); the PROM touches these as dwords. */
+uint64_t sgi_hal2_read(unsigned offset)
+{
+    switch (offset) {
+    case 0x04:
+        return sgi_hal2_isr;
+    case 0x08:
+        return 0x4010;
+    case 0x0c:
+        return sgi_hal2_iar;
+    case 0x10:
+    case 0x14:
+    case 0x18:
+    case 0x1c:
+        return sgi_hal2_idr[(offset - 0x10) / 4];
+    default:
+        return 0;
+    }
+}
+
+void sgi_hal2_write(unsigned offset, uint16_t value)
+{
+    switch (offset) {
+    case 0x04:
+        /* Bits 2-4 are writable control; clearing a reset bit resets that
+         * half of the chip (MAME hal2.cpp:108-114). */
+        sgi_hal2_isr &= ~0x1c;
+        sgi_hal2_isr |= value & 0x1c;
+        if (!(value & 0x08)) {
+            sgi_hal2_reset_state();
+            sgi_hal2_isr = value & 0x1c;
+        } else if (!(value & 0x10)) {
+            sgi_hal2_dma_enable = 0;
+            memset(sgi_hal2_codec, 0, sizeof(sgi_hal2_codec));
+        }
+        return;
+    case 0x08:
+        return;
+    case 0x0c:
+        sgi_hal2_iar_write(value);
+        return;
+    case 0x10:
+    case 0x14:
+    case 0x18:
+    case 0x1c:
+        sgi_hal2_idr[(offset - 0x10) / 4] = value;
+        return;
+    default:
+        return;
+    }
+}
+
+static void sgi_hal2_audio_drain(void)
+{
+    while (sgi_hal2_be && sgi_hal2_voice && sgi_hal2_fifo_count) {
+        int16_t tmp[1024];
+        unsigned first;
+        unsigned n;
+        size_t written;
+
+        first = SGI_HAL2_FIFO_SIZE - sgi_hal2_fifo_head;
+        n = sgi_hal2_fifo_count < first ? sgi_hal2_fifo_count : first;
+        n = n < ARRAY_SIZE(tmp) ? n : ARRAY_SIZE(tmp);
+        memcpy(tmp, &sgi_hal2_fifo[sgi_hal2_fifo_head], n * sizeof(int16_t));
+        written = audio_be_write(sgi_hal2_be, sgi_hal2_voice, tmp,
+                                 n * sizeof(int16_t));
+        if (!written) {
+            break;
+        }
+        written /= sizeof(int16_t);
+        sgi_hal2_fifo_head = (sgi_hal2_fifo_head + written) % SGI_HAL2_FIFO_SIZE;
+        sgi_hal2_fifo_count -= written;
+    }
+}
+
+/* The backend pulls whatever the PBUS has queued since its last pull. */
+static void sgi_hal2_audio_callback(void *opaque, int avail)
+{
+    (void)opaque;
+    (void)avail;
+    sgi_hal2_audio_drain();
+}
+
+/* The PBUS tick period already includes the channel count, so the stereo
+ * voice runs at half the mono tick rate (MAME hal2.cpp:356-363). */
+static void sgi_hal2_audio_push(int16_t sample, unsigned channel_count,
+                                uint64_t rate_ns)
+{
+    uint64_t samples_sec = 1000000000ULL / rate_ns;
+    unsigned freq = (unsigned)(channel_count == 1 ? samples_sec :
+                                                        samples_sec / 2);
+
+    if (freq < 4000 || freq > 96000) {
+        return;
+    }
+    if (!sgi_hal2_be) {
+        if (sgi_hal2_audiodev) {
+            Error *err = NULL;
+
+            sgi_hal2_be = audio_be_by_name(sgi_hal2_audiodev, &err);
+            if (!sgi_hal2_be) {
+                if (err) {
+                    error_report_err(err);
+                }
+                g_free(sgi_hal2_audiodev);
+                sgi_hal2_audiodev = NULL;
+                return;
+            }
+        } else {
+            sgi_hal2_be = audio_get_default_audio_be(NULL);
+            if (!sgi_hal2_be) {
+                return;
+            }
+        }
+    }
+    if (!sgi_hal2_voice || sgi_hal2_voice_freq != freq) {
+        struct audsettings as = {
+            .freq = freq,
+            .nchannels = 2,
+            .fmt = AUDIO_FORMAT_S16,
+            .big_endian = false,
+        };
+
+        sgi_hal2_voice = audio_be_open_out(sgi_hal2_be, sgi_hal2_voice,
+                                           "sgi-hal2", NULL,
+                                           sgi_hal2_audio_callback, &as);
+        if (!sgi_hal2_voice) {
+            return;
+        }
+        sgi_hal2_voice_freq = freq;
+        audio_be_set_active_out(sgi_hal2_be, sgi_hal2_voice, true);
+    }
+    if (channel_count == 1) {
+        /* Mono feeds one DAC; duplicate it so the stereo voice stays whole. */
+        if (sgi_hal2_fifo_count + 2 <= SGI_HAL2_FIFO_SIZE) {
+            unsigned tail = (sgi_hal2_fifo_head + sgi_hal2_fifo_count) %
+                            SGI_HAL2_FIFO_SIZE;
+
+            sgi_hal2_fifo[tail] = sample;
+            sgi_hal2_fifo[(tail + 1) % SGI_HAL2_FIFO_SIZE] = sample;
+            sgi_hal2_fifo_count += 2;
+        }
+    } else if (sgi_hal2_fifo_count < SGI_HAL2_FIFO_SIZE) {
+        /* Stereo arrives L/R on successive ticks, already interleaved. */
+        unsigned tail = (sgi_hal2_fifo_head + sgi_hal2_fifo_count) %
+                        SGI_HAL2_FIFO_SIZE;
+
+        sgi_hal2_fifo[tail] = sample;
+        sgi_hal2_fifo_count++;
+    }
+    sgi_hal2_audio_drain();
+}
 
 static uint64_t sgi_hal2_rate_ns(unsigned channel)
 {
@@ -449,6 +712,7 @@ static void sgi_hal2_dma_write(unsigned channel, int16_t sample)
 {
     unsigned dac;
     unsigned channel_count;
+    uint64_t rate;
 
     if (channel >= 2) {
         return;
@@ -462,6 +726,10 @@ static void sgi_hal2_dma_write(unsigned channel, int16_t sample)
         if (sgi_hal2_curr_dac == channel_count) {
             sgi_hal2_curr_dac = 0;
         }
+    }
+    rate = sgi_hal2_rate_ns(channel);
+    if (rate) {
+        sgi_hal2_audio_push(sample, channel_count, rate);
     }
 }
 
@@ -817,6 +1085,19 @@ static const MemoryRegionOps sgi_hpc3_misc_ops = {
     .endianness = DEVICE_BIG_ENDIAN,
 };
 
+/* The backend only finalizes an open voice when it is closed, which never
+ * happens on the quit path, so close it on VM stop (a later push reopens). */
+static void sgi_hal2_vm_state(void *opaque, bool running, RunState state)
+{
+    (void)opaque;
+    (void)state;
+    if (!running && sgi_hal2_voice) {
+        audio_be_close_out(sgi_hal2_be, sgi_hal2_voice);
+        sgi_hal2_voice = NULL;
+        sgi_hal2_voice_freq = 0;
+    }
+}
+
 static void sgi_indigo2_board_reset(void *opaque)
 {
     /*
@@ -849,11 +1130,7 @@ static void sgi_indigo2_board_reset(void *opaque)
     memset(sgi_hpc3_dma_cfg, 0, sizeof(sgi_hpc3_dma_cfg));
     memset(sgi_hpc3_pio_cfg, 0, sizeof(sgi_hpc3_pio_cfg));
     memset(sgi_hpc3_pio_regs, 0, sizeof(sgi_hpc3_pio_regs));
-    memset(sgi_hal2_codec, 0, sizeof(sgi_hal2_codec));
-    memset(sgi_hal2_bres, 0, sizeof(sgi_hal2_bres));
-    memset(sgi_hal2_dac, 0, sizeof(sgi_hal2_dac));
-    memset(sgi_hal2_dac_samples, 0, sizeof(sgi_hal2_dac_samples));
-    sgi_hal2_curr_dac = 0;
+    sgi_hal2_reset_state();
     sgi_edlc_reset();
     sgi_hpc3_enet_update_irq();
 }
@@ -895,10 +1172,14 @@ static void mips_sgi_indigo2_init(MachineState *machine)
                                         MACHINE_TYPE_NAME("indy"));
     clock_set_hz(cpuclk, is_indy ? 200000000ULL : 150000000ULL);
 
+    g_free(sgi_hal2_audiodev);
+    sgi_hal2_audiodev = machine->audiodev ? g_strdup(machine->audiodev) : NULL;
+
     cpu = mips_cpu_create_with_clock(machine->cpu_type, cpuclk, TARGET_BIG_ENDIAN);
     env = &cpu->env;
     qemu_register_reset(main_cpu_reset, cpu);
     qemu_register_reset(sgi_indigo2_board_reset, NULL);
+    qemu_add_vm_change_state_handler(sgi_hal2_vm_state, NULL);
 
     mcc = MIPS_CPU_GET_CLASS(cpu);
     mcc->no_data_aborts = true;
@@ -1255,6 +1536,7 @@ static void mips_sgi_indy_class_init(ObjectClass *oc, const void *data)
     mc->default_cpu_type = MIPS_CPU_TYPE_NAME("R4000SC");
     mc->default_ram_size = 128 * MiB;
     mc->default_ram_id = "sgi_indy.ram";
+    machine_add_audiodev_property(mc);
 }
 
 static const TypeInfo mips_sgi_indigo2_type = {
