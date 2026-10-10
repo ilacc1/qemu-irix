@@ -15170,6 +15170,8 @@ static void mips_tr_insn_start(DisasContextBase *dcbase, CPUState *cs)
  * execution cost unless the idle PC matches. */
 extern uint64_t sgi_idle_pc;
 extern int sgi_idle_on;
+extern uint64_t sgi_prom_pc;
+extern int sgi_prom_on;
 
 static void mips_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
 {
@@ -15181,6 +15183,12 @@ static void mips_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
     if (sgi_idle_on && ctx->base.pc_next == (target_ulong)sgi_idle_pc) {
         save_cpu_state(ctx, 1);
         gen_helper_sgi_idle_check(tcg_env);
+    }
+    /* PROM menu poll (masked interrupts, never halted): same shape, the
+     * helper only yields the host after sustained hits. */
+    if (sgi_prom_on && ctx->base.pc_next == (target_ulong)sgi_prom_pc) {
+        save_cpu_state(ctx, 1);
+        gen_helper_sgi_prom_check(tcg_env);
     }
     is_slot = ctx->hflags & MIPS_HFLAG_BMASK;
     if (ctx->insn_flags & ISA_NANOMIPS32) {

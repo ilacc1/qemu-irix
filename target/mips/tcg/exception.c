@@ -89,6 +89,51 @@ void helper_wait(CPUMIPSState *env)
 uint64_t sgi_idle_pc = 0xffffffff8815dd24ULL;
 uint32_t sgi_idle_thresh = 100;
 int sgi_idle_on = 1;
+/* PROM menu poll loop: spins with interrupts masked, so halting is unsafe
+ * (nothing guarantees a wakeup). Yield the host instead; guest-visible:
+ * nothing but slower spinning. SGI_PROM_PC=0 or SGI_PROM_SPIN=0 disables. */
+uint64_t sgi_prom_pc = 0xffffffff880097a4ULL;
+uint32_t sgi_prom_thresh = 1000;
+int sgi_prom_on = 1;
+
+/* Host-side tuning only (no guest-visible effect): parsed once at startup
+ * so SGI_PROM_PC retargets work even before the default PC ever executes. */
+static void __attribute__((constructor)) sgi_prom_config(void)
+{
+    const char *e;
+
+    e = getenv("SGI_PROM_PC");
+    if (e && e[0]) {
+        sgi_prom_pc = strtoull(e, NULL, 0);
+    }
+    e = getenv("SGI_PROM_THRESH");
+    if (e && e[0]) {
+        sgi_prom_thresh = (uint32_t)strtoul(e, NULL, 0);
+    }
+    e = getenv("SGI_PROM_SPIN");
+    if (e && (e[0] == '0' || e[0] == 'n' || e[0] == 'N')) {
+        sgi_prom_on = 0;
+    }
+    if (!sgi_prom_pc || !sgi_prom_thresh) {
+        sgi_prom_on = 0;
+    }
+}
+
+void helper_sgi_prom_check(CPUMIPSState *env)
+{
+    static uint32_t prom_count = 0;
+    struct timespec ts = { 0, 500000 };
+
+    (void)env;
+    if (!sgi_prom_on) {
+        return;
+    }
+    if (++prom_count < sgi_prom_thresh) {
+        return;
+    }
+    prom_count = 0;
+    nanosleep(&ts, NULL);
+}
 
 void helper_sgi_idle_check(CPUMIPSState *env)
 {
