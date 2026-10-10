@@ -19,6 +19,7 @@
  */
 
 #include "qemu/osdep.h"
+#include <zlib.h>
 #include "qemu/datadir.h"
 #include "hw/core/clock.h"
 #include "hw/mips/mips.h"
@@ -88,6 +89,9 @@ static qemu_irq sgi_hpc3_pbus_done_irq;
 typedef struct SgiHpc3EthernetDma {
     uint32_t cbp;
     uint32_t nbdp;
+    /* MAME hpc3.h: TX has its own NBDP; sharing it with RX
+     * corrupts both chains once RX consumes descriptors. */
+    uint32_t tx_nbdp;
     uint32_t bc;
     uint32_t rx_ctrl;
     uint32_t tx_ctrl;
@@ -108,6 +112,8 @@ static bool sgi_hpc3_enet_tx_done;
 static void sgi_hpc3_enet_rx_start(void);
 static void sgi_hpc3_enet_tx_start(void);
 static void sgi_hpc3_enet_rx_ready_event(void);
+static void sgi_hpc3_enet_rx_complete(void);
+static bool sgi_hpc3_enet_rx_bc_dec(unsigned count);
 static void sgi_hpc3_enet_update_irq(void);
 static void sgi_edlc_reset(void);
 
@@ -274,7 +280,7 @@ static uint64_t sgi_hpc3_pbus_dma_read(void *opaque, hwaddr addr,
     case 0x14018: return sgi_hpc3_enet_dma.dmacfg;
     case 0x1401c: return sgi_hpc3_enet_dma.piocfg;
     case 0x15000: return sgi_hpc3_enet_dma.cbp;
-    case 0x15004: return sgi_hpc3_enet_dma.nbdp;
+    case 0x15004: return sgi_hpc3_enet_dma.tx_nbdp;
     case 0x16000: return sgi_hpc3_enet_dma.bc;
     case 0x16004: return sgi_hpc3_enet_dma.tx_ctrl;
     case 0x16008: return 0;
@@ -343,13 +349,30 @@ static void sgi_hpc3_pbus_dma_write(void *opaque, hwaddr addr,
     }
     switch (addr) {
     case 0x13000: sgi_hpc3_enet_dma.cbp = val; break;
-    case 0x13004: sgi_hpc3_enet_dma.nbdp = val; break;
+    case 0x13004:
+        sgi_hpc3_enet_dma.nbdp = val;
+        /* A posted descriptor may release a held frame. */
+        sgi_hpc3_enet_rx_start();
+        break;
     case 0x14004:
-        sgi_hpc3_enet_dma.rx_ctrl = val;
+        /* MAME hpc3.cpp:469: CTRL writes never clobber latched status. */
+        if (sgi_hpc3_enet_dma.rx_ctrl & 0x400) {
+            sgi_hpc3_enet_dma.rx_ctrl = (sgi_hpc3_enet_dma.rx_ctrl & 0xff) |
+                                        (val & ~0x2ffU);
+        } else {
+            sgi_hpc3_enet_dma.rx_ctrl = (sgi_hpc3_enet_dma.rx_ctrl & 0xff) |
+                                        (val & ~0xffU);
+        }
         sgi_hpc3_enet_rx_start();
         break;
     case 0x14014:
-        sgi_hpc3_enet_misc = val;
+        /* MAME hpc3.cpp:1119: MISC_INT is write-1-to-clear. */
+        if (val & 0x2) {
+            sgi_hpc3_enet_misc = val & ~0x2U;
+            sgi_hpc3_enet_update_irq();
+        } else {
+            sgi_hpc3_enet_misc = val;
+        }
         if (val & 1) {
             sgi_edlc_reset();
         }
@@ -357,7 +380,7 @@ static void sgi_hpc3_pbus_dma_write(void *opaque, hwaddr addr,
     case 0x14018: sgi_hpc3_enet_dma.dmacfg = val; break;
     case 0x1401c: sgi_hpc3_enet_dma.piocfg = val; break;
     case 0x15004:
-        sgi_hpc3_enet_dma.nbdp = val;
+        sgi_hpc3_enet_dma.tx_nbdp = val;
         sgi_hpc3_enet_dma.cpfbdp = val;
         break;
     case 0x16004:
@@ -738,7 +761,14 @@ static qemu_irq sgi_ioc2_enet_hpc_irq;
 
 static NICState *sgi_ethernet_nic;
 static NICConf sgi_ethernet_conf;
+/* Delivery takes nic->reentrancy_guard, so the board keeps one here. */
+static MemReentrancyGuard sgi_ethernet_guard;
 static uint8_t sgi_edlc_station[6];
+/* MAME edlc.cpp:542: the TX command bank bits select the regs 0-5 bank. */
+static uint8_t sgi_edlc_bank;
+static uint64_t sgi_edlc_mcast_filter;
+static uint8_t sgi_edlc_control;
+static uint8_t sgi_edlc_config;
 static uint8_t sgi_edlc_rx_status = 0x80;
 static uint8_t sgi_edlc_tx_status = 0x80;
 static uint8_t sgi_edlc_rx_command;
@@ -761,27 +791,76 @@ static void sgi_edlc_update_irq(void)
 
 static bool sgi_edlc_can_receive(NetClientState *nc)
 {
-    return (sgi_edlc_rx_status & 0x80) &&
-           ((sgi_edlc_rx_command & 0xc0) != 0);
+    /*
+     * Always receivable: TAP stops polling on a refused frame and only
+     * re-arms on delivery, so refusing here can wedge RX with frames
+     * still in the host buffer (QEMU net shape). Disabled/overrun/filter
+     * drops happen inside receive() instead (MAME edlc.cpp:304).
+     */
+    (void)nc;
+    return true;
 }
 
 static ssize_t sgi_edlc_receive(NetClientState *nc, const uint8_t *buf,
                                 size_t size)
 {
     static const uint8_t broadcast[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+    uint8_t mode = sgi_edlc_rx_command & 0xc0;
+    bool for_us = memcmp(buf, sgi_edlc_station, 6) == 0;
+    bool bcast = memcmp(buf, broadcast, 6) == 0;
+    /* MAME edlc.cpp:568: 80C03 station/group/multicast filter. */
+    bool accept = (mode == 0x40);
+
+    if (!accept) {
+        if ((sgi_edlc_config & 0x01) && !memcmp(buf, sgi_edlc_station, 5) &&
+            (((buf[5] ^ sgi_edlc_station[5]) & 0xf0) == 0)) {
+            accept = true;
+        } else if (for_us || bcast) {
+            accept = true;
+        } else if (mode == 0xc0 && (buf[0] & 0x01)) {
+            accept = true;
+            if (sgi_edlc_control & 0x08) {
+                uint32_t crc = crc32(0L, buf, 6);
+
+                if (!(sgi_edlc_mcast_filter & (1ULL << (crc & 63)))) {
+                    accept = false;
+                }
+            }
+        }
+    }
 
     if (!(sgi_edlc_rx_status & 0x80) || size > sizeof(sgi_edlc_rx_fifo) ||
-        size < 6 || ((sgi_edlc_rx_command & 0xc0) == 0 &&
-        memcmp(buf, sgi_edlc_station, 6) != 0 && memcmp(buf, broadcast, 6) != 0)) {
+        size < 6 || mode == 0x00 || !accept) {
         return size;
     }
     memcpy(sgi_edlc_rx_fifo, buf, size);
-    sgi_edlc_rx_length = size;
+    /*
+     * MAME edlc.cpp:268: the wire image is padded to 60 plus 4 FCS
+     * bytes; TAP delivers short frames without FCS, so pad here and
+     * judge the status on the full length. Without GOOD the IRIX
+     * stack drops the frame in ether_input as SN_ERROR.
+     */
+    sgi_edlc_rx_length = size < 60 ? 60 : size;
+    if (size < 60) {
+        memset(sgi_edlc_rx_fifo + size, 0, 60 - size);
+    }
+    if (sgi_edlc_config & 0x40) {
+        /* MAME edlc.cpp:322: keep the FCS when RXC is set. */
+        if (sgi_edlc_rx_length + 4 <= sizeof(sgi_edlc_rx_fifo)) {
+            uint32_t fcs = crc32(0L, sgi_edlc_rx_fifo, sgi_edlc_rx_length);
+
+            sgi_edlc_rx_fifo[sgi_edlc_rx_length++] = fcs & 0xff;
+            sgi_edlc_rx_fifo[sgi_edlc_rx_length++] = (fcs >> 8) & 0xff;
+            sgi_edlc_rx_fifo[sgi_edlc_rx_length++] = (fcs >> 16) & 0xff;
+            sgi_edlc_rx_fifo[sgi_edlc_rx_length++] = (fcs >> 24) & 0xff;
+        }
+    }
     sgi_edlc_rx_pos = 0;
-    sgi_edlc_rx_status = 0x10 | (size < 64 ? 0x08 : 0x20);
+    sgi_edlc_rx_status = 0x10 | (sgi_edlc_rx_length + 4 < 64 ? 0x08 : 0x20);
     sgi_hpc3_enet_rx_ready = true;
+    /* Only the data move happens here; status/IRQ is the completion step
+     * below, once the fifo has drained (MAME hpc3.cpp:539 vs hpc3.cpp:566). */
     sgi_hpc3_enet_rx_ready_event();
-    sgi_edlc_update_irq();
     return size;
 }
 
@@ -810,6 +889,11 @@ static uint8_t sgi_edlc_read(hwaddr addr)
 
         sgi_edlc_rx_status |= 0x80;
         sgi_edlc_update_irq();
+        if (sgi_ethernet_nic) {
+            /* Reading re-arms RXS_O (MAME edlc.cpp:215); queued frames
+             * only retry on a kick, so pull them now (QEMU shape). */
+            qemu_flush_queued_packets(qemu_get_queue(sgi_ethernet_nic));
+        }
         return value;
     }
     case 7: {
@@ -828,14 +912,48 @@ static void sgi_edlc_write(hwaddr addr, uint8_t value)
 {
     switch (addr & 7) {
     case 0 ... 5:
-        sgi_edlc_station[addr & 7] = value;
+        /* MAME edlc.cpp:481: regs 0-5 are banked (station/mcast/ctl). */
+        switch (sgi_edlc_bank) {
+        case 0:
+            sgi_edlc_station[addr & 7] = value;
+            break;
+        case 1:
+            sgi_edlc_mcast_filter &= ~(0xffULL << ((addr & 7) * 8));
+            sgi_edlc_mcast_filter |= (uint64_t)value << ((addr & 7) * 8);
+            break;
+        case 2:
+            if ((addr & 7) < 2) {
+                unsigned shift = ((addr & 7) + 6) * 8;
+
+                sgi_edlc_mcast_filter &= ~(0xffULL << shift);
+                sgi_edlc_mcast_filter |= (uint64_t)value << shift;
+            } else if ((addr & 7) == 3) {
+                sgi_edlc_control = value;
+            } else if ((addr & 7) == 4) {
+                sgi_edlc_config = value;
+            }
+            break;
+        default:
+            break;
+        }
         break;
     case 6:
         sgi_edlc_rx_command = value;
         sgi_edlc_update_irq();
+        if (sgi_ethernet_nic) {
+            /*
+             * Enabling/unmasking the receiver must pull any frames
+             * queued while it was disabled; otherwise TAP stops polling
+             * (tap_send disables on a full queue, re-armed only by
+             * delivery) and RX stays dead (QEMU net shape).
+             */
+            qemu_flush_queued_packets(qemu_get_queue(sgi_ethernet_nic));
+        }
         break;
     case 7:
         sgi_edlc_tx_command = value;
+        /* MAME edlc.cpp:538: the bank follows the TX command bank bits. */
+        sgi_edlc_bank = (value >> 5) & 3;
         if (value & 0x08) {
             if (sgi_edlc_tx_length) {
                 qemu_send_packet(qemu_get_queue(sgi_ethernet_nic),
@@ -872,6 +990,10 @@ static void sgi_edlc_reset(void)
     sgi_edlc_tx_status = 0x80;
     sgi_edlc_rx_command = 0;
     sgi_edlc_tx_command = 0;
+    sgi_edlc_bank = 0;
+    sgi_edlc_mcast_filter = 0;
+    sgi_edlc_control = 0;
+    sgi_edlc_config = 0;
     sgi_edlc_rx_length = 0;
     sgi_edlc_rx_pos = 0;
     sgi_edlc_tx_length = 0;
@@ -891,78 +1013,131 @@ static void sgi_hpc3_enet_write16(hwaddr addr, uint16_t value)
                         &value, sizeof(value));
 }
 
+/* MAME hpc3.cpp:1134: an overrun flags RBO instead of wrapping. */
+static bool sgi_hpc3_enet_rx_bc_dec(unsigned count)
+{
+    if ((sgi_hpc3_enet_dma.bc & 0x3fff) >= count) {
+        sgi_hpc3_enet_dma.bc -= count;
+        return true;
+    }
+    sgi_hpc3_enet_dma.rx_ctrl |= 0x800;
+    return false;
+}
+
 static void sgi_hpc3_enet_fetch_rx_descriptor(void)
 {
     sgi_hpc3_enet_dma.cbdp = sgi_hpc3_enet_dma.nbdp;
     sgi_hpc3_enet_dma.cbp = sgi_hpc3_dma_read32(sgi_hpc3_enet_dma.cbdp);
     sgi_hpc3_enet_dma.bc = sgi_hpc3_dma_read32(sgi_hpc3_enet_dma.cbdp + 4);
     sgi_hpc3_enet_dma.nbdp = sgi_hpc3_dma_read32(sgi_hpc3_enet_dma.cbdp + 8);
-    if ((sgi_hpc3_enet_dma.bc & 0x3fff) >= 2) {
+    /* MAME hpc3.cpp:555: the first two bytes are alignment padding. */
+    if (sgi_hpc3_enet_rx_bc_dec(2)) {
         sgi_hpc3_enet_dma.cbp += 2;
-        sgi_hpc3_enet_dma.bc -= 2;
     }
 }
 
 static void sgi_hpc3_enet_update_irq(void)
 {
+    /* MAME hpc3.cpp:623: the HPC line is the latched MISC_INT bit, raised
+     * by RX completion and cleared by a misc write (TX keeps its pulse). */
     qemu_set_irq(sgi_ioc2_enet_hpc_irq,
-                 sgi_hpc3_enet_tx_done ||
-                 (sgi_hpc3_enet_rx_ready &&
-                  !(sgi_hpc3_enet_dma.rx_ctrl & 0x800)));
+                 (sgi_hpc3_enet_misc & 0x2) || sgi_hpc3_enet_tx_done);
 }
 
 static void sgi_hpc3_enet_rx_start(void)
 {
     if (!sgi_hpc3_enet_rx_active && (sgi_hpc3_enet_dma.rx_ctrl & 0x200)) {
         sgi_hpc3_enet_rx_active = true;
-        if (sgi_hpc3_enet_rx_ready) {
-            sgi_hpc3_enet_rx_ready_event();
-        }
+    }
+    /* A posted descriptor or a re-armed channel releases a held frame. */
+    if (sgi_hpc3_enet_rx_active && sgi_hpc3_enet_rx_ready) {
+        sgi_hpc3_enet_rx_ready_event();
+    }
+    if (sgi_ethernet_nic) {
+        /* Same queue pull-through as the RX command write below. */
+        qemu_flush_queued_packets(qemu_get_queue(sgi_ethernet_nic));
     }
 }
 
+/* MAME hpc3.cpp:539: RXDMA moves frame bytes only; the status byte
+ * and IRQ belong to the completion step below. */
 static void sgi_hpc3_enet_rx_ready_event(void)
 {
-    size_t remaining;
-
     if (!sgi_hpc3_enet_rx_active || !sgi_hpc3_enet_rx_ready) {
         return;
     }
-    if (!sgi_hpc3_enet_dma.cbdp) {
-        sgi_hpc3_enet_fetch_rx_descriptor();
+    /* No descriptor posted: hold the frame; the NBDP/CTRL writes kick
+     * the drain once the driver posts one. */
+    if (!sgi_hpc3_enet_dma.nbdp) {
+        return;
     }
-    remaining = sgi_edlc_rx_length - sgi_edlc_rx_pos;
-    while (remaining && (sgi_hpc3_enet_dma.bc & 0x3fff)) {
-            uint8_t value = sgi_edlc_fifo_read();
+    /* MAME hpc3.cpp:539: each frame consumes the next descriptor. */
+    sgi_hpc3_enet_fetch_rx_descriptor();
+    while (sgi_edlc_rx_pos < sgi_edlc_rx_length) {
+        if (!sgi_hpc3_enet_rx_bc_dec(1)) {
+            break;
+        }
+        uint8_t value = sgi_edlc_fifo_read();
         MemTxResult result;
 
         address_space_stb(&address_space_memory, sgi_hpc3_enet_dma.cbp++,
                           value, MEMTXATTRS_UNSPECIFIED, &result);
-        sgi_hpc3_enet_dma.bc--;
-        remaining--;
     }
-    if (!remaining) {
-        sgi_hpc3_enet_rx_ready = false;
-        if (sgi_hpc3_enet_dma.bc & 0x3fff) {
+    if (sgi_edlc_rx_pos < sgi_edlc_rx_length) {
+        /* RBO is already latched above; the tail has nowhere to go. */
+        sgi_edlc_rx_pos = sgi_edlc_rx_length;
+    }
+    sgi_edlc_rx_length = 0;
+    sgi_edlc_rx_pos = 0;
+    sgi_hpc3_enet_rx_ready = false;
+    /* MAME edlc.cpp:333: the EDLC interrupt fires once the fifo drains. */
+    sgi_edlc_update_irq();
+    if (!(sgi_edlc_rx_status & 0x80) &&
+        (sgi_edlc_rx_status & sgi_edlc_rx_command & 0x3f)) {
+        sgi_hpc3_enet_rx_complete();
+    }
+}
+
+/* MAME hpc3.cpp:566: completion copies EDLC status, DMAs the status byte,
+ * stores the remaining count, and latches the IRQ on XIE/EOX/error. */
+static void sgi_hpc3_enet_rx_complete(void)
+{
+    uint8_t status = sgi_edlc_rx_status;
+    bool interrupt = false;
+
+    /* MAME edlc.cpp:215: the status read re-arms RXS_O for the next frame. */
+    sgi_edlc_rx_status |= 0x80;
+    sgi_edlc_update_irq();
+    sgi_hpc3_enet_dma.rx_ctrl = (sgi_hpc3_enet_dma.rx_ctrl & ~0xbfU) |
+                                (status & 0xbfU);
+    if (!(sgi_hpc3_enet_dma.rx_ctrl & 0x80)) {
+        if (sgi_hpc3_enet_rx_bc_dec(1)) {
             MemTxResult result;
 
             address_space_stb(&address_space_memory,
-                              sgi_hpc3_enet_dma.cbp++, sgi_edlc_rx_status,
+                              sgi_hpc3_enet_dma.cbp++,
+                              sgi_hpc3_enet_dma.rx_ctrl & 0xff,
                               MEMTXATTRS_UNSPECIFIED, &result);
-            sgi_hpc3_enet_dma.bc--;
         }
+        /* MAME hpc3.cpp:611: only the count field reads back. */
         sgi_hpc3_enet_write16(sgi_hpc3_enet_dma.cbdp + 6,
-                              (uint16_t)(sgi_hpc3_enet_dma.bc & 0xffff));
-        sgi_edlc_rx_length = 0;
-        sgi_edlc_rx_pos = 0;
-        if (sgi_hpc3_enet_dma.bc & 0x80000000U) {
+                              (uint16_t)(sgi_hpc3_enet_dma.bc & 0x3fff));
+        if ((sgi_hpc3_enet_dma.rx_ctrl & (0x01 | 0x800)) ||
+            (sgi_hpc3_enet_dma.bc & 0x80000000U)) {
+            /* MAME hpc3.cpp:614: overflow/EOX stops the channel. */
+            sgi_hpc3_enet_dma.rx_ctrl &= ~0x200U;
             sgi_hpc3_enet_rx_active = false;
+            interrupt = true;
+        } else if (sgi_hpc3_enet_dma.bc & 0x20000000U) {
+            interrupt = true;
         }
-        sgi_edlc_rx_status = 0x80;
-        sgi_edlc_update_irq();
-        qemu_flush_queued_packets(qemu_get_queue(sgi_ethernet_nic));
+    }
+    /* MAME hpc3.cpp:623: latch unless already pending (misc write clears). */
+    if (interrupt && !(sgi_hpc3_enet_misc & 0x2)) {
+        sgi_hpc3_enet_misc |= 0x2;
     }
     sgi_hpc3_enet_update_irq();
+    qemu_flush_queued_packets(qemu_get_queue(sgi_ethernet_nic));
 }
 
 static void sgi_hpc3_enet_tx_start(void)
@@ -973,8 +1148,8 @@ static void sgi_hpc3_enet_tx_start(void)
         return;
     }
     sgi_hpc3_enet_tx_active = true;
-    sgi_hpc3_enet_dma.cpfbdp = sgi_hpc3_enet_dma.nbdp;
-    desc = sgi_hpc3_enet_dma.nbdp;
+    sgi_hpc3_enet_dma.cpfbdp = sgi_hpc3_enet_dma.tx_nbdp;
+    desc = sgi_hpc3_enet_dma.tx_nbdp;
     while (desc) {
         uint32_t buffer = sgi_hpc3_dma_read32(desc);
         uint32_t flags = sgi_hpc3_dma_read32(desc + 4);
@@ -1007,7 +1182,7 @@ static void sgi_hpc3_enet_tx_start(void)
             break;
         }
     }
-    sgi_hpc3_enet_dma.nbdp = desc;
+    sgi_hpc3_enet_dma.tx_nbdp = desc;
     sgi_hpc3_enet_tx_active = false;
     sgi_hpc3_enet_dma.tx_ctrl &= ~0x200U;
     sgi_hpc3_enet_update_irq();
@@ -1038,7 +1213,15 @@ static uint64_t sgi_hpc3_misc_read(void *opaque, hwaddr addr, unsigned size)
         return sgi_hpc3_pio_cfg[((addr - 0x15000) >> 8) & 15];
     }
     if (addr >= 0xc000 && addr < 0xc500) {
-        return sgi_edlc_read(addr - 0xc000);
+        /*
+         * IRIX programs the SEEQ as u_ints at 4-byte stride (IRIX seeq.h
+         * seeq_reg), so the register is the word index; byte accesses
+         * keep the byte index (MAME edlc.cpp:442 bank map).
+         */
+        hwaddr reg = (size == 1) ? (addr & 7) :
+                     (size == 2) ? ((addr >> 1) & 7) : ((addr >> 2) & 7);
+
+        return sgi_edlc_read(reg);
     }
     return 0;
 }
@@ -1071,7 +1254,11 @@ static void sgi_hpc3_misc_write(void *opaque, hwaddr addr,
         return;
     }
     if (addr >= 0xc000 && addr < 0xc500) {
-        sgi_edlc_write(addr - 0xc000, val);
+        /* Word-stride register index, matching the read side above. */
+        hwaddr reg = (size == 1) ? (addr & 7) :
+                     (size == 2) ? ((addr >> 1) & 7) : ((addr >> 2) & 7);
+
+        sgi_edlc_write(reg, val & 0xff);
         return;
     }
     if (addr >= 0x15000 && addr < 0x16000) {
@@ -1504,7 +1691,7 @@ static void mips_sgi_indigo2_init(MachineState *machine)
         sgi_ethernet_nic = qemu_new_nic(&sgi_edlc_net_info,
                                         &sgi_ethernet_conf,
                                         "seeq80c03", "indigo2",
-                                        NULL,
+                                        &sgi_ethernet_guard,
                                         NULL);
         nd->instantiated = 1;
         qemu_format_nic_info_str(qemu_get_queue(sgi_ethernet_nic),
