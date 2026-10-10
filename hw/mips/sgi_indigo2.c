@@ -450,6 +450,12 @@ static unsigned sgi_hal2_voice_freq;
 static int16_t sgi_hal2_fifo[SGI_HAL2_FIFO_SIZE];
 static unsigned sgi_hal2_fifo_head;
 static unsigned sgi_hal2_fifo_count;
+/* An unwritten DAC keeps its last output, so mono (left only) pairs each
+ * sample with the held right value (MAME hal2.cpp:365-378). */
+static int16_t sgi_hal2_hold_right;
+static int16_t sgi_hal2_hold_left;
+static int16_t sgi_hal2_pending_left;
+static bool sgi_hal2_pending_valid;
 
 static void sgi_hal2_reset_state(void)
 {
@@ -465,6 +471,10 @@ static void sgi_hal2_reset_state(void)
     sgi_hal2_curr_dac = 0;
     sgi_hal2_fifo_head = 0;
     sgi_hal2_fifo_count = 0;
+    sgi_hal2_hold_right = 0;
+    sgi_hal2_hold_left = 0;
+    sgi_hal2_pending_left = 0;
+    sgi_hal2_pending_valid = false;
 }
 
 /* Indirect values are staged in IDR0-3, then committed by writing the
@@ -622,8 +632,22 @@ static void sgi_hal2_audio_callback(void *opaque, int avail)
 
 /* The PBUS tick period already includes the channel count, so the stereo
  * voice runs at half the mono tick rate (MAME hal2.cpp:356-363). */
-static void sgi_hal2_audio_push(int16_t sample, unsigned channel_count,
-                                uint64_t rate_ns)
+static void sgi_hal2_audio_emit(int16_t left, int16_t right)
+{
+    /* A stereo voice consumes whole frames; drop a frame on overrun
+     * rather than splitting it across the ring. */
+    if (sgi_hal2_fifo_count + 2 <= SGI_HAL2_FIFO_SIZE) {
+        unsigned tail = (sgi_hal2_fifo_head + sgi_hal2_fifo_count) %
+                        SGI_HAL2_FIFO_SIZE;
+
+        sgi_hal2_fifo[tail] = left;
+        sgi_hal2_fifo[(tail + 1) % SGI_HAL2_FIFO_SIZE] = right;
+        sgi_hal2_fifo_count += 2;
+    }
+}
+
+static void sgi_hal2_audio_push(int16_t sample, unsigned dac,
+                                unsigned channel_count, uint64_t rate_ns)
 {
     uint64_t samples_sec = 1000000000ULL / rate_ns;
     unsigned freq = (unsigned)(channel_count == 1 ? samples_sec :
@@ -669,23 +693,23 @@ static void sgi_hal2_audio_push(int16_t sample, unsigned channel_count,
         sgi_hal2_voice_freq = freq;
         audio_be_set_active_out(sgi_hal2_be, sgi_hal2_voice, true);
     }
-    if (channel_count == 1) {
-        /* Mono feeds one DAC; duplicate it so the stereo voice stays whole. */
-        if (sgi_hal2_fifo_count + 2 <= SGI_HAL2_FIFO_SIZE) {
-            unsigned tail = (sgi_hal2_fifo_head + sgi_hal2_fifo_count) %
-                            SGI_HAL2_FIFO_SIZE;
-
-            sgi_hal2_fifo[tail] = sample;
-            sgi_hal2_fifo[(tail + 1) % SGI_HAL2_FIFO_SIZE] = sample;
-            sgi_hal2_fifo_count += 2;
+    if (dac == 0) {
+        /* Left DAC; mono stands alone with the held right value, stereo
+         * waits for the right tick to complete the frame (MAME hal2.cpp:365-378). */
+        sgi_hal2_pending_left = sample;
+        sgi_hal2_pending_valid = true;
+        sgi_hal2_hold_left = sample;
+        if (channel_count == 1) {
+            sgi_hal2_audio_emit(sample, sgi_hal2_hold_right);
+            sgi_hal2_pending_valid = false;
         }
-    } else if (sgi_hal2_fifo_count < SGI_HAL2_FIFO_SIZE) {
-        /* Stereo arrives L/R on successive ticks, already interleaved. */
-        unsigned tail = (sgi_hal2_fifo_head + sgi_hal2_fifo_count) %
-                        SGI_HAL2_FIFO_SIZE;
-
-        sgi_hal2_fifo[tail] = sample;
-        sgi_hal2_fifo_count++;
+    } else {
+        /* Right DAC completes the frame and becomes the held value. */
+        sgi_hal2_audio_emit(sgi_hal2_pending_valid ? sgi_hal2_pending_left :
+                                                     sgi_hal2_hold_left,
+                            sample);
+        sgi_hal2_hold_right = sample;
+        sgi_hal2_pending_valid = false;
     }
     sgi_hal2_audio_drain();
 }
@@ -752,7 +776,7 @@ static void sgi_hal2_dma_write(unsigned channel, int16_t sample)
     }
     rate = sgi_hal2_rate_ns(channel);
     if (rate) {
-        sgi_hal2_audio_push(sample, channel_count, rate);
+        sgi_hal2_audio_push(sample, dac, channel_count, rate);
     }
 }
 
