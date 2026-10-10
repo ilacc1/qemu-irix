@@ -258,7 +258,124 @@ struct SGIGIO64State {
      * idle; skipping the full 1280x1024 re-raster (and the console blit)
      * when this is clear removes that cost without changing the output. */
     bool display_dirty;
+    /* Damage tracking for partial scanout: REX3 draws union their
+     * framebuffer rect here, while palette/XMAP/VC2/RAMDAC writes fall
+     * back to a full frame via dmg_full. */
+    bool dmg_full;
+    bool dmg_valid;
+    int dmg_x0;
+    int dmg_y0;
+    int dmg_x1;
+    int dmg_y1;
+    /* Cached RB2 store pointers, hoisted out of the per-command path
+     * (refreshed on realize/migration; never guest-visible). */
+    uint32_t *vram_ptr;
+    uint32_t *aux_ptr;
+    /* Reusable Scr2Scr snapshot, grown on demand instead of per command. */
+    uint32_t *blt_buf;
+    size_t blt_len;
 };
+
+/* Union raw framebuffer coords into the damage rect (over-cover is safe,
+ * under-cover leaves stale pixels). Clamped to the RB2 store. */
+static void sgi_gio64_damage_union(SGIGIO64State *state, int x0, int y0,
+                                   int x1, int y1)
+{
+    if (x0 > x1) {
+        int t = x0;
+        x0 = x1;
+        x1 = t;
+    }
+    if (y0 > y1) {
+        int t = y0;
+        y0 = y1;
+        y1 = t;
+    }
+    if (x1 < 0 || y1 < 0 || x0 >= XL24_STRIDE || y0 >= XL24_HEIGHT) {
+        return;
+    }
+    x0 = MAX(x0, 0);
+    y0 = MAX(y0, 0);
+    x1 = MIN(x1, XL24_STRIDE - 1);
+    y1 = MIN(y1, XL24_HEIGHT - 1);
+    state->display_dirty = true;
+    if (!state->dmg_valid) {
+        state->dmg_valid = true;
+        state->dmg_x0 = x0;
+        state->dmg_y0 = y0;
+        state->dmg_x1 = x1;
+        state->dmg_y1 = y1;
+    } else {
+        state->dmg_x0 = MIN(state->dmg_x0, x0);
+        state->dmg_y0 = MIN(state->dmg_y0, y0);
+        state->dmg_x1 = MAX(state->dmg_x1, x1);
+        state->dmg_y1 = MAX(state->dmg_y1, y1);
+    }
+}
+
+/* Latch a draw-coords bbox (REX3 coords need the window offset applied,
+ * like put_pixel does) into the damage rect. */
+static void sgi_gio64_damage_rect(SGIGIO64State *state, int x0, int y0,
+                                  int x1, int y1)
+{
+    int wx = (int)state->x_window - 0x1000;
+    int wy = (int)state->y_window - 0x1000;
+
+    sgi_gio64_damage_union(state, x0 + wx, y0 + wy, x1 + wx, y1 + wy);
+}
+
+/* Config writes (palette/XMAP/VC2/RAMDAC) reinterpret existing pixels, so
+ * only a full re-raster is correct. */
+static void sgi_gio64_damage_full(SGIGIO64State *state)
+{
+    state->display_dirty = true;
+    state->dmg_full = true;
+}
+
+/* Cursor moves only repaint the small fetch window (see cursor_pixel). */
+static void sgi_gio64_damage_cursor(SGIGIO64State *state)
+{
+    int cx = state->vc2_regs[VC2_REG_CURSOR_X];
+    int cy = state->vc2_regs[VC2_REG_CURSOR_Y];
+
+    sgi_gio64_damage_union(state, cx - 31, cy - 31, cx, cy);
+}
+
+/* Migration dirty tracking scoped to the written rect (draw coords, window
+ * offset applied like put_pixel). Whole-VRAM marks churn the dirty bitmap
+ * on every small command; the rect covers every pixel put_pixel can store
+ * (clip/Z/stipple only shrink it). */
+static void sgi_gio64_fb_dirty(SGIGIO64State *state, bool aux,
+                               int x0, int y0, int x1, int y1)
+{
+    MemoryRegion *mr = aux ? &state->aux : &state->vram;
+    hwaddr base, top;
+
+    x0 += (int)state->x_window - 0x1000;
+    x1 += (int)state->x_window - 0x1000;
+    y0 += (int)state->y_window - 0x1000;
+    y1 += (int)state->y_window - 0x1000;
+    if (x0 > x1) {
+        int t = x0;
+        x0 = x1;
+        x1 = t;
+    }
+    if (y0 > y1) {
+        int t = y0;
+        y0 = y1;
+        y1 = t;
+    }
+    x0 = MAX(x0, 0);
+    y0 = MAX(y0, 0);
+    x1 = MIN(x1, XL24_STRIDE - 1);
+    y1 = MIN(y1, XL24_HEIGHT - 1);
+    if (x0 > x1 || y0 > y1) {
+        return;
+    }
+    base = ((hwaddr)y0 * XL24_STRIDE + x0) * 4;
+    top = ((hwaddr)y1 * XL24_STRIDE + x1) * 4 + 4;
+    memory_region_set_dirty(mr, base, top - base);
+}
 
 /* VC2 video-timing decode (MAME vc2_device::decode_vt_line/update_screen_size,
  * newport.cpp:669-775). Visible size comes from bit 7 of the decoded pixels,
@@ -1012,8 +1129,8 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
     int x_end = state->x_end_i;
     int y_end = state->y_end_i;
     uint32_t color = state->color_i;
-    uint32_t *vram = memory_region_get_ram_ptr(&state->vram);
-    uint32_t *aux = memory_region_get_ram_ptr(&state->aux);
+    uint32_t *vram = state->vram_ptr;
+    uint32_t *aux = state->aux_ptr;
     uint8_t address_mode = (mode0 >> 2) & 7;
     uint32_t write_mask = state->write_mask;
     uint32_t pattern = mode0 & (1U << 12) ? state->z_pattern :
@@ -1028,7 +1145,6 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
         sgi_gio64_rex3_setup(state);
     }
 
-    state->display_dirty = true;
     if (sgi_gio_dbg()) {
         static int rex3_rows = 6000;
 
@@ -1106,21 +1222,136 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
         int sy1 = MAX(y_start, y_end) + win_y;
         int sw = 0, sh = 0;
         uint32_t *copy = NULL;
+        /* Opaque row copies bypass per-pixel ROP/mask/clip/Z (the snapshot
+         * already froze the source, like MAME). Rows restart at x_save, so
+         * the fast rect needs x_save == x_start. */
+        bool row_copy = ((state->draw_mode1 >> 28) & 0xf) == 3 &&
+                        !(state->draw_mode1 & (1U << 18)) &&
+                        (write_mask & XL24_GLOBAL_MASK) == XL24_GLOBAL_MASK &&
+                        !(state->clip_mode & 0x1f) && !(state->step_z & 1) &&
+                        stop_on_x && stop_on_y &&
+                        state->x_save == x_start &&
+                        (x_end - x_start) * x_step >= 0 &&
+                        (y_end - y_start) * y_step >= 0;
 
         if (sx1 >= 0 && sy1 >= 0 && sx0 < XL24_STRIDE &&
             sy0 < XL24_HEIGHT) {
+            size_t need;
+
             sx0 = MAX(sx0, 0);
             sy0 = MAX(sy0, 0);
             sx1 = MIN(sx1, XL24_STRIDE - 1);
             sy1 = MIN(sy1, XL24_HEIGHT - 1);
             sw = sx1 - sx0 + 1;
             sh = sy1 - sy0 + 1;
-            copy = g_malloc((size_t)sw * sh * sizeof(*copy));
+            need = (size_t)sw * sh;
+            if (need > state->blt_len) {
+                state->blt_buf = g_realloc(state->blt_buf,
+                                           need * sizeof(*copy));
+                state->blt_len = need;
+            }
+            copy = state->blt_buf;
             for (int yy = 0; yy < sh; yy++) {
                 memcpy(&copy[(size_t)yy * sw],
                        &src_plane[(size_t)(sy0 + yy) * XL24_STRIDE + sx0],
                        (size_t)sw * sizeof(*copy));
             }
+        }
+        /* Only the moved-to rect changes pixels (rows restart at x_save). */
+        sgi_gio64_damage_rect(state,
+                              MIN(MIN(start_x, x_end), (int)state->x_save) +
+                              state->x_move,
+                              MIN(start_y, y_end) + state->y_move,
+                              MAX(MAX(start_x, x_end), (int)state->x_save) +
+                              state->x_move,
+                              MAX(start_y, y_end) + state->y_move);
+        if (row_copy) {
+            uint32_t *dst_plane =
+                (plane >= 4 && plane <= 6) ? aux : vram;
+
+            if (!copy) {
+                /* Off-screen source still paints dest with zeros below. */
+                sgi_gio64_fb_dirty(state, plane >= 4 && plane <= 6,
+                                   MIN(MIN(start_x, x_end),
+                                       (int)state->x_save) + state->x_move,
+                                   MIN(start_y, y_end) + state->y_move,
+                                   MAX(MAX(start_x, x_end),
+                                       (int)state->x_save) + state->x_move,
+                                   MAX(start_y, y_end) + state->y_move);
+                for (int yy = MIN(y_start, y_end) + state->y_move;
+                     yy <= MAX(y_start, y_end) + state->y_move; yy++) {
+                    int dy = yy + win_y;
+                    int dx0 = MIN(x_start, x_end) + state->x_move + win_x;
+                    int dx1 = MAX(x_start, x_end) + state->x_move + win_x;
+
+                    if (dy < 0 || dy >= XL24_HEIGHT) {
+                        continue;
+                    }
+                    dx0 = MAX(dx0, 0);
+                    dx1 = MIN(dx1, XL24_STRIDE - 1);
+                    if (dx0 <= dx1) {
+                        memset(&dst_plane[(size_t)dy * XL24_STRIDE + dx0], 0,
+                               (size_t)(dx1 - dx0 + 1) * sizeof(*dst_plane));
+                    }
+                }
+            } else {
+                /* Full destination span (draw coords); source pixels
+                 * outside the snapshot read back as zeros below. */
+                int fy0 = MIN(y_start, y_end) + state->y_move;
+                int fy1 = MAX(y_start, y_end) + state->y_move;
+                int fx0 = MIN(x_start, x_end) + state->x_move;
+                int fx1 = MAX(x_start, x_end) + state->x_move;
+
+                sgi_gio64_fb_dirty(state, plane >= 4 && plane <= 6,
+                                   fx0, fy0, fx1, fy1);
+                for (int yy = fy0; yy <= fy1; yy++) {
+                    int dy = yy + win_y;
+                    int srow = dy - state->y_move;
+                    int cd0 = MAX(fx0 + win_x, 0);
+                    int cd1 = MIN(fx1 + win_x, XL24_STRIDE - 1);
+
+                    if (dy < 0 || dy >= XL24_HEIGHT || cd0 > cd1) {
+                        continue;
+                    }
+                    if (srow >= sy0 && srow <= sy1) {
+                        /* Source row is live: copy the overlap with the
+                         * snapshot, zero the fringes (generic loop reads
+                         * zeros outside the source rect). */
+                        int ov0 = MAX(sx0 + state->x_move, cd0);
+                        int ov1 = MIN(sx1 + state->x_move, cd1);
+
+                        if (ov0 > ov1) {
+                            memset(&dst_plane[(size_t)dy * XL24_STRIDE + cd0],
+                                   0, (size_t)(cd1 - cd0 + 1) *
+                                   sizeof(*dst_plane));
+                        } else {
+                            if (ov0 > cd0) {
+                                memset(&dst_plane[(size_t)dy * XL24_STRIDE +
+                                                  cd0], 0,
+                                       (size_t)(ov0 - cd0) *
+                                       sizeof(*dst_plane));
+                            }
+                            memcpy(&dst_plane[(size_t)dy * XL24_STRIDE + ov0],
+                                   &copy[(size_t)(srow - sy0) * sw +
+                                         (ov0 - state->x_move - sx0)],
+                                   (size_t)(ov1 - ov0 + 1) *
+                                   sizeof(*dst_plane));
+                            if (ov1 < cd1) {
+                                memset(&dst_plane[(size_t)dy * XL24_STRIDE +
+                                                  ov1 + 1], 0,
+                                       (size_t)(cd1 - ov1) *
+                                       sizeof(*dst_plane));
+                            }
+                        }
+                    } else {
+                        memset(&dst_plane[(size_t)dy * XL24_STRIDE + cd0], 0,
+                               (size_t)(cd1 - cd0 + 1) * sizeof(*dst_plane));
+                    }
+                }
+            }
+            sgi_gio64_write_x_start(state, state->x_save << 11);
+            sgi_gio64_write_y_start(state, (y_end + y_step) << 11);
+            return;
         }
         do {
             do {
@@ -1146,11 +1377,16 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
                 break;
             }
         } while (start_y != end_y && stop_on_y);
-        g_free(copy);
+        /* Snapshot lives in the reusable scratch buffer. */
         sgi_gio64_write_x_start(state, start_x << 11);
         sgi_gio64_write_y_start(state, start_y << 11);
-        memory_region_set_dirty(&state->vram, 0,
-                                memory_region_size(&state->vram));
+        sgi_gio64_fb_dirty(state, plane >= 4 && plane <= 6,
+                           MIN(MIN(x_start, x_end), (int)state->x_save) +
+                           state->x_move,
+                           MIN(y_start, y_end) + state->y_move,
+                           MAX(MAX(x_start, x_end), (int)state->x_save) +
+                           state->x_move,
+                           MAX(y_start, y_end) + state->y_move);
         return;
     }
     /* Opcode 0 is NoOp (pipeline sync); opcodes 1/3 handled above. */
@@ -1169,7 +1405,8 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
         return;
     }
 
-    if (address_mode >= 2 && address_mode <= 4) {        int x = x_start;
+    if (address_mode >= 2 && address_mode <= 4) {
+        int x = x_start;
         int y = y_start;
         int dx = abs((int)x_end - x);
         int sx = x < (int)x_end ? 1 : -1;
@@ -1197,6 +1434,10 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
             }
             sgi_gio64_put_pixel(state, vram, aux, x, y, color, write_mask,
                                 coverage);
+            /* Single stepped pixel plus its endpoint (MAME steps once). */
+            sgi_gio64_damage_rect(state, MIN(x, (int)x_end),
+                                  MIN(y, (int)y_end),
+                                  MAX(x, (int)x_end), MAX(y, (int)y_end));
             if (mode0 & (1U << 18)) {
                 sgi_gio64_iterate_shade(state);
             }
@@ -1213,11 +1454,15 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
             }
             sgi_gio64_write_x_start(state, x << 11);
             sgi_gio64_write_y_start(state, y << 11);
-            memory_region_set_dirty(&state->vram, 0,
-                                    memory_region_size(&state->vram));
+            sgi_gio64_fb_dirty(state, (state->draw_mode1 & 7) >= 4 &&
+                               (state->draw_mode1 & 7) <= 6,
+                               MIN(x, (int)x_end), MIN(y, (int)y_end),
+                               MAX(x, (int)x_end), MAX(y, (int)y_end));
             return;
         }
 
+        /* Bresenham walks stay inside the endpoint bbox. */
+        sgi_gio64_damage_rect(state, x_start, y_start, x_end, y_end);
         for (;;) {
             bool last = x == (int)x_end && y == (int)y_end;
             if ((!skip_first || point != 0) && (!last || !skip_last)) {
@@ -1256,8 +1501,9 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
          * sees fresh coordinates instead of a stale start. */
         sgi_gio64_write_x_start(state, x << 11);
         sgi_gio64_write_y_start(state, y << 11);
-        memory_region_set_dirty(&state->vram, 0,
-                                memory_region_size(&state->vram));
+        sgi_gio64_fb_dirty(state, (state->draw_mode1 & 7) >= 4 &&
+                           (state->draw_mode1 & 7) <= 6,
+                           x_start, y_start, x_end, y_end);
         return;
     }
     if (address_mode > 1) {
@@ -1336,6 +1582,11 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
     if (((mode0 >> 19) & 1) && x_step < 0) {
         return;
     }
+    /* Fills stay inside the corner bbox (rows restart at x_save). */
+    sgi_gio64_damage_rect(state, MIN(MIN(x_start, x_end), (int)state->x_save),
+                          MIN(y_start, y_end),
+                          MAX(MAX(x_start, x_end), (int)state->x_save),
+                          MAX(y_start, y_end));
     /* Inclusive end, extended by one step like MAME. */
     x_end += x_step;
     y_end += y_step;
@@ -1392,21 +1643,35 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
                                      row_x0];
                 int i;
 
-                /* Always read-modify-write (preserves lanes outside the
-                 * mask, matching the slow path exactly, including the
-                 * top padding byte). */
-                for (i = 0; i < row_w; i++) {
-                    uint32_t d = dst[i * x_step];
+                if (fmask == 0x00ffffffu) {
+                    /* Full-word store, no readback. Byte-replicated
+                     * colors (8-bit CI fills) go through memset. */
+                    uint8_t b = fcol & 0xff;
 
-                    dst[i * x_step] = (d & ~fmask) | (fcol & fmask);
+                    if (fcol == (uint32_t)b * 0x010101u) {
+                        memset(x_step > 0 ? dst : dst - row_w + 1, b,
+                               (size_t)row_w * sizeof(*dst));
+                    } else {
+                        for (i = 0; i < row_w; i++) {
+                            dst[i * x_step] = fcol;
+                        }
+                    }
+                } else {
+                    /* Read-modify-write (preserves lanes outside the
+                     * mask, matching the slow path exactly, including
+                     * the top padding byte). */
+                    for (i = 0; i < row_w; i++) {
+                        uint32_t d = dst[i * x_step];
+
+                        dst[i * x_step] = (d & ~fmask) | (fcol & fmask);
+                    }
                 }
                 fy += address_mode == 1 ? y_step : 0;
             } while (fy != y_end && stop_on_y && address_mode == 1);
             /* End state matches the slow loop (x restarted to x_save). */
             sgi_gio64_write_x_start(state, state->x_save << 11);
             sgi_gio64_write_y_start(state, fy << 11);
-            memory_region_set_dirty(&state->vram, 0,
-                                    memory_region_size(&state->vram));
+            sgi_gio64_fb_dirty(state, false, rx0, ry0, rx1, ry1);
             return;
         }
     }
@@ -1464,8 +1729,14 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
                  * coordinates don't go stale for the next primitive. */
                 sgi_gio64_write_x_start(state, x << 11);
                 sgi_gio64_write_y_start(state, y << 11);
-                memory_region_set_dirty(&state->vram, 0,
-                                        memory_region_size(&state->vram));
+                sgi_gio64_fb_dirty(state, (state->draw_mode1 & 7) >= 4 &&
+                                   (state->draw_mode1 & 7) <= 6,
+                                   MIN(MIN(x_start, x_end),
+                                       (int)state->x_save),
+                                   MIN(y_start, y_end),
+                                   MAX(MAX(x_start, x_end),
+                                       (int)state->x_save),
+                                   MAX(y_start, y_end));
                 return;
             }
         } while (x != prim_end_x && x != x_end && stop_on_x);
@@ -1481,7 +1752,12 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
     } while (y != y_end && stop_on_y && address_mode == 1);
     sgi_gio64_write_x_start(state, x << 11);
     sgi_gio64_write_y_start(state, y << 11);
-    memory_region_set_dirty(&state->vram, 0, memory_region_size(&state->vram));
+    sgi_gio64_fb_dirty(state, (state->draw_mode1 & 7) >= 4 &&
+                       (state->draw_mode1 & 7) <= 6,
+                       MIN(MIN(x_start, x_end), (int)state->x_save),
+                       MIN(y_start, y_end),
+                       MAX(MAX(x_start, x_end), (int)state->x_save),
+                       MAX(y_start, y_end));
 }
 
 static uint64_t sgi_gio64_xl24_read_reg(void *opaque, hwaddr addr,
@@ -1780,9 +2056,33 @@ static void sgi_gio64_xl24_write(void *opaque, hwaddr addr,
     SGIGIO64State *state = opaque;
     hwaddr reg = addr & ~7ULL;
 
-    /* Any GIO write may reprogram the scanout (VC2 timing, XMAP/CMAP,
-     * RAMDAC, cursor) or push pixels through the REX3 dataport. */
-    state->display_dirty = true;
+    /* Draw-state setup is invisible until a command runs (the go-bit
+     * command marks its own damage rect below); only scanout-config or
+     * unknown registers need a full re-raster here. */
+    if (!(addr & 0x800)) {
+        hwaddr cfg = reg < 0x1000 ? reg & ~0x800ULL : reg;
+
+        if (cfg == 0x0240 || (cfg != 0x0000 && cfg != 0x0008 &&
+            cfg != 0x0010 && cfg != 0x0018 && cfg != 0x0020 &&
+            cfg != 0x0028 && cfg != 0x0030 && cfg != 0x0038 &&
+            cfg != 0x0100 && cfg != 0x0108 && cfg != 0x0110 &&
+            cfg != 0x0118 && cfg != 0x0120 && cfg != 0x0128 &&
+            cfg != 0x0130 && cfg != 0x0138 && cfg != 0x0140 &&
+            cfg != 0x0148 && cfg != 0x0150 && cfg != 0x0158 &&
+            cfg != 0x0200 && cfg != 0x0208 && cfg != 0x0210 &&
+            cfg != 0x0218 && cfg != 0x0220 && cfg != 0x0228 &&
+            cfg != 0x0230 && cfg != 0x0238 && cfg != 0x1300 &&
+            cfg != 0x1308 && cfg != 0x1310 && cfg != 0x1318 &&
+            cfg != 0x1320 && cfg != 0x1328 && cfg != 0x1330 &&
+            cfg != 0x1338 && cfg != 0x1340)) {
+            /* DCB data hits palette/XMAP/VC2/RAMDAC state; the cursor
+             * registers narrow it to the cursor area below, the PCD
+             * timeout touches no pixels. Unknown registers stay full. */
+            if (cfg != 0x0240) {
+                sgi_gio64_damage_full(state);
+            }
+        }
+    }
     if (sgi_gio_trace_enabled() && sgi_gio_trace_wanted(addr)) {
         fprintf(stderr, "GIO-W off=%05x sz=%u val=%016llx\n",
                 (unsigned)addr, size, (unsigned long long)value);
@@ -2279,6 +2579,7 @@ static void sgi_gio64_xl24_write(void *opaque, hwaddr addr,
                         (uint16_t)state->dcb_data_msw;
                     state->vc2_ram_addr =
                         (state->vc2_ram_addr + 1) & 0x7fff;
+                    sgi_gio64_damage_full(state);
                 }
             } else {
                 if (state->dcb_reg_select == 3) {
@@ -2286,12 +2587,27 @@ static void sgi_gio64_xl24_write(void *opaque, hwaddr addr,
                         state->dcb_data_msw & 0xffff;
                     state->vc2_ram_addr =
                         (state->vc2_ram_addr + 1) & 0x7fff;
+                    sgi_gio64_damage_full(state);
                 } else if (state->dcb_reg_select == 0) {
                     uint8_t vcreg = state->dcb_data_msw >> 24;
 
                     if (vcreg < ARRAY_SIZE(state->vc2_regs)) {
+                        if (vcreg == VC2_REG_CURSOR_X ||
+                            vcreg == VC2_REG_CURSOR_Y ||
+                            vcreg == VC2_REG_CURSOR_ENTRY ||
+                            vcreg == VC2_REG_DISPLAY_CTRL) {
+                            sgi_gio64_damage_cursor(state);
+                        }
                         state->vc2_regs[vcreg] =
                             (state->dcb_data_msw >> 8) & 0xffff;
+                        if (vcreg == VC2_REG_CURSOR_X ||
+                            vcreg == VC2_REG_CURSOR_Y ||
+                            vcreg == VC2_REG_CURSOR_ENTRY ||
+                            vcreg == VC2_REG_DISPLAY_CTRL) {
+                            sgi_gio64_damage_cursor(state);
+                        } else {
+                            sgi_gio64_damage_full(state);
+                        }
                         if (vcreg == 0x07) {
                             state->vc2_ram_addr = state->vc2_regs[vcreg];
                         }
@@ -2320,6 +2636,7 @@ static void sgi_gio64_xl24_write(void *opaque, hwaddr addr,
                     /* Pens are 0x00RRGGBB (MAME cmap set_pen_color order). */
                     state->cmap_palette[head][state->cmap_index[head]] =
                         state->dcb_data_msw >> 8;
+                    sgi_gio64_damage_full(state);
                     if (state->cmap_index[head] < 0x2000 && sgi_gio_dbg()) {
                         static unsigned npens;
                         if (npens++ < 2500) {
@@ -2345,20 +2662,24 @@ static void sgi_gio64_xl24_write(void *opaque, hwaddr addr,
                 switch (state->dcb_reg_select) {
                 case 0:
                     state->xmap_config[head] = (uint8_t)state->dcb_data_msw;
+                    sgi_gio64_damage_full(state);
                     break;
                 case 3:
                     state->xmap_cursor_cmap[head] =
                         (uint8_t)state->dcb_data_msw;
+                    sgi_gio64_damage_cursor(state);
                     break;
                 case 4:
                     state->xmap_popup_cmap[head] =
                         (uint8_t)state->dcb_data_msw;
+                    sgi_gio64_damage_full(state);
                     break;
                 case 5:
                     /* 32-entry table; mask the index. */
                     state->xmap_mode[head][
                         (state->dcb_data_msw >> 24) & 31] =
                         state->dcb_data_msw & 0xffffff;
+                    sgi_gio64_damage_full(state);
                     break;
                 case 7:
                     state->xmap_mode_index[head] =
@@ -2383,6 +2704,7 @@ static void sgi_gio64_xl24_write(void *opaque, hwaddr addr,
                 state->ramdac_lut_b[state->ramdac_index] =
                     (uint8_t)(state->dcb_data_msw >> 24);
                 state->ramdac_index++;
+                sgi_gio64_damage_full(state);
             }
             break;
         case DCB_ADDR_PCD: /* Presenter not connected; bus timeout */
@@ -2644,7 +2966,7 @@ static bool sgi_gio64_update_display(void *opaque)
     SGIGIO64State *state = opaque;
     DisplaySurface *surface = qemu_console_surface(state->console);
     uint32_t *pixels = surface_data(surface);
-    const uint32_t *vram = memory_region_get_ram_ptr(&state->vram);
+    const uint32_t *vram = state->vram_ptr;
     size_t vram_words = memory_region_size(&state->vram) / sizeof(*vram);
     int width = sgi_gio64_display_width(state);
     int height = sgi_gio64_display_height(state);
@@ -2653,7 +2975,7 @@ static bool sgi_gio64_update_display(void *opaque)
     /* Head 0 drives the display (MAME screen_update uses m_xmap[0] and
      * m_cmap[0]). Pens are 0x00RRGGBB. */
     const uint32_t *cmap = state->cmap_palette[0];
-    const uint32_t *auxplane = memory_region_get_ram_ptr(&state->aux);
+    const uint32_t *auxplane = state->aux_ptr;
     uint16_t cursor_msb =
         (uint16_t)(state->xmap_cursor_cmap[0] & 0xff) << 5;
     uint16_t popup_msb =
@@ -2664,11 +2986,28 @@ static bool sgi_gio64_update_display(void *opaque)
         qemu_console_resize(state->console, width, height);
         surface = qemu_console_surface(state->console);
         pixels = surface_data(surface);
+        /* Resized surface holds no valid pixels: repaint everything. */
+        sgi_gio64_damage_full(state);
     }
     /* Nothing has touched the scanout since the last frame: the surface
      * still holds the last rendered image, so skip both the full-frame
      * re-raster and the console blit. */
     if (!state->display_dirty) {
+        return true;
+    }
+    /* REX3 draws repaint only their damage rect; the per-pixel DID walk
+     * stays identical (skipped columns still advance the DID chain), so
+     * the output matches a full frame exactly. */
+    bool full = state->dmg_full || !state->dmg_valid;
+    int rx0 = full ? 0 : MAX(state->dmg_x0, 0);
+    int ry0 = full ? 0 : MAX(state->dmg_y0, 0);
+    int rx1 = full ? width - 1 : MIN(state->dmg_x1, width - 1);
+    int ry1 = full ? height - 1 : MIN(state->dmg_y1, height - 1);
+
+    if (rx0 > rx1 || ry0 > ry1) {
+        state->display_dirty = false;
+        state->dmg_full = false;
+        state->dmg_valid = false;
         return true;
     }
     stride = surface_stride(surface) / sizeof(*pixels);
@@ -2726,6 +3065,8 @@ static bool sgi_gio64_update_display(void *opaque)
             }
         }
         did = sgi_gio64_vc2_next_did(state);
+        bool row_hit = full || (y >= ry0 && y <= ry1);
+
         for (x = 0; x < width; x++) {
             uint32_t rgb = 0;
             bool replaced = false;
@@ -2742,6 +3083,9 @@ static bool sgi_gio64_update_display(void *opaque)
                             table, pix_mode, pix_size, ci_msb);
                 }
                 did = sgi_gio64_vc2_next_did(state);
+            }
+            if (!row_hit || x < rx0 || x > rx1) {
+                continue;
             }
             cursor = sgi_gio64_cursor_pixel(state, x, y);
             if (cursor) {
@@ -2943,11 +3287,15 @@ static bool sgi_gio64_update_display(void *opaque)
         }
     }
     state->display_dirty = false;
+    state->dmg_full = false;
+    state->dmg_valid = false;
     /*
      * Push the surface to the UI; without this the window only repaints on
      * resize. Polled at the GUI refresh interval, so no extra timer needed.
      */
-    qemu_console_update(state->console, 0, 0, width, height);
+    qemu_console_update(state->console, full ? 0 : rx0, full ? 0 : ry0,
+                        full ? width : rx1 - rx0 + 1,
+                        full ? height : ry1 - ry0 + 1);
     return true;
 }
 
@@ -2956,8 +3304,11 @@ static int sgi_gio64_post_load(void *opaque, int version_id)
     SGIGIO64State *state = opaque;
 
     state->display_dirty = true;
+    state->dmg_full = true;
     /* Timers are transient; re-arm them so VRINT IRQs and the DCB
      * timeout resume after migration. */
+    state->vram_ptr = memory_region_get_ram_ptr(&state->vram);
+    state->aux_ptr = memory_region_get_ram_ptr(&state->aux);
     if (!state->vblank_timer) {
         state->vblank_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                            sgi_gio64_vblank, state);
@@ -3154,6 +3505,9 @@ static void sgi_gio64_realize(DeviceState *device, Error **errp)
     state->dcb_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                     sgi_gio64_dcb_timeout, state);
     state->display_dirty = true;
+    state->dmg_full = true;
+    state->vram_ptr = memory_region_get_ram_ptr(&state->vram);
+    state->aux_ptr = memory_region_get_ram_ptr(&state->aux);
     state->console = qemu_graphic_console_create(device, 0,
                                                  &sgi_gio64_graphics_ops,
                                                  state);
@@ -3174,6 +3528,7 @@ static void sgi_gio64_reset(DeviceState *device)
     memset(state->rex3_regs, 0, sizeof(state->rex3_regs));
     state->host_dataport = 0;
     state->display_dirty = true;
+    state->dmg_full = true;
     state->draw_mode1 = 0x3002f001;
     state->draw_mode0 = 0;
     state->plane_depth = (state->draw_mode1 >> 3) & 3;
