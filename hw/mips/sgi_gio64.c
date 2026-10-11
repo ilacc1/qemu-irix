@@ -1595,8 +1595,9 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
      * Flat-fill fast path: opaque replace, no blend/shade/host/stipple,
      * no clip or Z, single constant color, rows restart from x_start.
      * Inlines the masked store instead of per-pixel put_pixel calls.
-     * Falls back to the slow loop unless the windowed rect is fully
-     * on-screen.
+     * Rows outside the store are skipped (iris drops them in
+     * calculate_fb_address, iris rex3_generic.rs:663); the loop still
+     * steps through them so end state matches the slow loop.
      */
     if (((state->draw_mode1 >> 28) & 0xf) == 3 &&
         !(state->draw_mode1 & (1U << 18)) &&
@@ -1605,7 +1606,7 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
         !(state->clip_mode & 0x1f) && !(state->step_z & 1) &&
         state->x_save == x_start && stop_on_x &&
         !((mode0 >> 15) & 1) &&
-        (state->draw_mode1 & 7) < 4) {
+        (state->draw_mode1 & 7) <= 6) {
         int win_x = (int)state->x_window - 0x1000;
         int win_y = (int)state->y_window - 0x1000;
         /* Inclusive pixel ranges (x_end/y_end are exclusive here). */
@@ -1614,15 +1615,22 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
         int ry0 = y_step > 0 ? y_start : y_end - y_step;
         int ry1 = y_step > 0 ? y_end - y_step : y_start;
         unsigned fplane = state->draw_mode1 & 7;
-        uint32_t *ffb = (fplane >= 4 && fplane <= 6) ? aux : vram;
+        bool faux = fplane >= 4 && fplane <= 6;
+        uint32_t *ffb = faux ? aux : vram;
         uint32_t fmask = write_mask & XL24_GLOBAL_MASK;
         uint32_t fcol = base;
+        /* Visible columns (a constant fill covers the same columns on
+         * every row, so one clamped range serves all rows). */
+        int cx0 = MAX(rx0 + win_x, 0);
+        int cx1 = MIN(rx1 + win_x, XL24_STRIDE - 1);
         int fy = y_start;
 
         /* MAME rgbmode-flat (no shade iteration) uses the assembled
          * shaded color; base already holds the depth-replicated word.
          * Fast-clear sources COLORVRAM, not the (possibly stale) shade
-         * DDA. Mask to 24 bits (no alpha byte in VRAM). */
+         * DDA. Aux/CID lanes sit shifted inside the word (iris
+         * rex3_generic.rs:547); run the same expander put_pixel uses
+         * so the store matches the slow loop exactly. */
         if (((state->draw_mode1 >> 17) & 1)) {
             fcol = base;
         } else if ((state->draw_mode1 >> 15) & 1) {
@@ -1631,39 +1639,43 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
                 fcol = sgi_gio64_expand_pixel(state, fcol);
             }
         }
+        if (faux && !((state->draw_mode1 >> 15) & 1 &&
+                      state->plane_depth != 3)) {
+            fcol = sgi_gio64_expand_pixel(state, fcol);
+        }
         fcol &= 0x00ffffff;
-        if (rx0 + win_x >= 0 && ry0 + win_y >= 0 &&
-            rx1 + win_x < XL24_STRIDE && ry1 + win_y < XL24_HEIGHT &&
-            rx0 <= rx1 && ry0 <= ry1) {
-            int row_w = rx1 - rx0 + 1;
-            int row_x0 = (x_step > 0 ? rx0 : rx1) + win_x;
+        if (rx0 <= rx1 && ry0 <= ry1) {
+            int row_w = cx1 - cx0 + 1;
 
             do {
-                uint32_t *dst = &ffb[(size_t)(fy + win_y) * XL24_STRIDE +
-                                     row_x0];
-                int i;
+                int dy = fy + win_y;
 
-                if (fmask == 0x00ffffffu) {
-                    /* Full-word store, no readback. Byte-replicated
-                     * colors (8-bit CI fills) go through memset. */
-                    uint8_t b = fcol & 0xff;
+                if (dy >= 0 && dy < XL24_HEIGHT && row_w > 0) {
+                    uint32_t *dst =
+                        &ffb[(size_t)dy * XL24_STRIDE + cx0];
+                    int i;
 
-                    if (fcol == (uint32_t)b * 0x010101u) {
-                        memset(x_step > 0 ? dst : dst - row_w + 1, b,
-                               (size_t)row_w * sizeof(*dst));
-                    } else {
-                        for (i = 0; i < row_w; i++) {
-                            dst[i * x_step] = fcol;
+                    if (fmask == 0x00ffffffu) {
+                        /* Full-word store, no readback. Byte-replicated
+                         * colors (8-bit CI fills) go through memset. */
+                        uint8_t b = fcol & 0xff;
+
+                        if (fcol == (uint32_t)b * 0x010101u) {
+                            memset(dst, b,
+                                   (size_t)row_w * sizeof(*dst));
+                        } else {
+                            for (i = 0; i < row_w; i++) {
+                                dst[i] = fcol;
+                            }
                         }
-                    }
-                } else {
-                    /* Read-modify-write (preserves lanes outside the
-                     * mask, matching the slow path exactly, including
-                     * the top padding byte). */
-                    for (i = 0; i < row_w; i++) {
-                        uint32_t d = dst[i * x_step];
+                    } else {
+                        /* Read-modify-write (preserves lanes outside the
+                         * mask, matching the slow path exactly). */
+                        for (i = 0; i < row_w; i++) {
+                            uint32_t d = dst[i];
 
-                        dst[i * x_step] = (d & ~fmask) | (fcol & fmask);
+                            dst[i] = (d & ~fmask) | (fcol & fmask);
+                        }
                     }
                 }
                 fy += address_mode == 1 ? y_step : 0;
@@ -1671,7 +1683,7 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
             /* End state matches the slow loop (x restarted to x_save). */
             sgi_gio64_write_x_start(state, state->x_save << 11);
             sgi_gio64_write_y_start(state, fy << 11);
-            sgi_gio64_fb_dirty(state, false, rx0, ry0, rx1, ry1);
+            sgi_gio64_fb_dirty(state, faux, rx0, ry0, rx1, ry1);
             return;
         }
     }
