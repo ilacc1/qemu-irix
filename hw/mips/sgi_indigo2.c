@@ -33,6 +33,7 @@
 #include "system/runstate.h"
 #include "hw/core/boards.h"
 #include "net/net.h"
+#include "qemu/mem-reentrancy.h"
 #include "hw/scsi/sgi_wd33c93.h"
 #include "hw/core/loader.h"
 #include "hw/display/vga.h"
@@ -87,7 +88,12 @@ static qemu_irq sgi_hpc3_pbus_done_irq;
 
 typedef struct SgiHpc3EthernetDma {
     uint32_t cbp;
-    uint32_t nbdp;
+    /* WHY: RX and TX channels have independent next-descriptor pointers
+     * (iris hpc3.rs:329 nbdp per PdmaChannel; MAME m_enet_rx_nbdp vs
+     * m_enet_tx_nbdp). One shared nbdp lets TX kicks clobber the RX ring
+     * position and vice versa, hiding every inbound frame. */
+    uint32_t rx_nbdp;
+    uint32_t tx_nbdp;
     uint32_t bc;
     uint32_t rx_ctrl;
     uint32_t tx_ctrl;
@@ -101,15 +107,25 @@ typedef struct SgiHpc3EthernetDma {
 static SgiHpc3EthernetDma sgi_hpc3_enet_dma;
 static uint32_t sgi_hpc3_enet_misc;
 static bool sgi_hpc3_enet_rx_active;
-static bool sgi_hpc3_enet_tx_active;
 static bool sgi_hpc3_enet_rx_ready;
-static bool sgi_hpc3_enet_tx_done;
+/* WHY: delivery runs from both the TAP receive callback and the RX-enable
+ * path below; the guard keeps a nested entry from re-entering the DMA walk
+ * (iris seeq8003.rs pumps with DMA ops outside the state lock for the same
+ * reason). TAP re-poll on receiver enable is iris hpc3.rs:999-1000. */
+static bool sgi_hpc3_enet_rx_in_event;
 
 static void sgi_hpc3_enet_rx_start(void);
 static void sgi_hpc3_enet_tx_start(void);
 static void sgi_hpc3_enet_rx_ready_event(void);
 static void sgi_hpc3_enet_update_irq(void);
 static void sgi_edlc_reset(void);
+static bool sgi_edlc_irq_level(void);
+static void sgi_edlc_update_irq(void);
+/* Tentative definitions: full definitions with initializers live in the
+ * EDLC block below; the DMA register handlers above need the symbols. */
+static uint8_t sgi_edlc_rx_status;
+static uint8_t sgi_edlc_tx_status;
+static NICState *sgi_ethernet_nic;
 
 static uint8_t sgi_edlc_fifo_read(void);
 static void sgi_edlc_fifo_write(uint8_t value);
@@ -265,22 +281,42 @@ static uint64_t sgi_hpc3_pbus_dma_read(void *opaque, hwaddr addr,
     }
     switch (addr) {
     case 0x13000: return sgi_hpc3_enet_dma.cbp;
-    case 0x13004: return sgi_hpc3_enet_dma.nbdp;
+    case 0x13004: return sgi_hpc3_enet_dma.rx_nbdp;
     case 0x14000: return sgi_hpc3_enet_dma.bc;
-    case 0x14004: return sgi_hpc3_enet_dma.rx_ctrl;
+    /* WHY: rcvstat low bits mirror live SEEQ RX status (iris hpc3.rs:944-956,
+     * mask 0xBF at hpc3.rs:186; MAME hpc3.cpp enet_intr_in_w copies the EDLC
+     * status into rx_ctrl). Bit 6 is HPC-internal and stays stored. */
+    case 0x14004: {
+        uint32_t rv = (sgi_hpc3_enet_dma.rx_ctrl & ~0xbfU) |
+                      (sgi_edlc_rx_status & 0xbfU);
+        return rv;
+    }
     case 0x14008: return 0;
     case 0x1400c: return 0;
-    case 0x14014: return sgi_hpc3_enet_misc;
+    /* WHY: INTPEND (bit 1) is live EDLC level, not stored misc (iris
+     * hpc3.rs:961-968: INTPEND comes from SeeqState). */
+    case 0x14014: {
+        uint32_t rv = (sgi_hpc3_enet_misc & ~0x02U) |
+                      (sgi_edlc_irq_level() ? 0x02U : 0U);
+        return rv;
+    }
     case 0x14018: return sgi_hpc3_enet_dma.dmacfg;
     case 0x1401c: return sgi_hpc3_enet_dma.piocfg;
     case 0x15000: return sgi_hpc3_enet_dma.cbp;
-    case 0x15004: return sgi_hpc3_enet_dma.nbdp;
+    case 0x15004: return sgi_hpc3_enet_dma.tx_nbdp;
     case 0x16000: return sgi_hpc3_enet_dma.bc;
-    case 0x16004: return sgi_hpc3_enet_dma.tx_ctrl;
+    /* WHY: trstat low byte mirrors live SEEQ TX status (iris hpc3.rs:1022-1030,
+     * full-byte mask at hpc3.rs:205); this is where IRIX clean_xd_chain reads
+     * SEQ_XS_SUCCESS. */
+    case 0x16004:
+        return (sgi_hpc3_enet_dma.tx_ctrl & ~0xffU) |
+               (sgi_edlc_tx_status & 0xffU);
     case 0x16008: return 0;
     case 0x1600c: return 0;
     case 0x17000: return sgi_hpc3_enet_dma.bc;
-    case 0x17004: return sgi_hpc3_enet_dma.tx_ctrl;
+    case 0x17004:
+        return (sgi_hpc3_enet_dma.tx_ctrl & ~0xffU) |
+               (sgi_edlc_tx_status & 0xffU);
     case 0x18000: return sgi_hpc3_enet_dma.cbdp;
     case 0x1a000: return sgi_hpc3_enet_dma.cpfbdp;
     case 0x1a004: return sgi_hpc3_enet_dma.ppfbdp;
@@ -343,28 +379,83 @@ static void sgi_hpc3_pbus_dma_write(void *opaque, hwaddr addr,
     }
     switch (addr) {
     case 0x13000: sgi_hpc3_enet_dma.cbp = val; break;
-    case 0x13004: sgi_hpc3_enet_dma.nbdp = val; break;
-    case 0x14004:
-        sgi_hpc3_enet_dma.rx_ctrl = val;
-        sgi_hpc3_enet_rx_start();
+    case 0x13004:
+        sgi_hpc3_enet_dma.rx_nbdp = val; break;
+    case 0x14004: {
+        /* WHY: ACTIVE changes only when AMASK is clear in the written value
+         * (iris hpc3.rs:987-988); a set AMASK preserves the channel state.
+         * The rising edge delivers held frames and re-polls TAP. */
+        bool was_active = sgi_hpc3_enet_rx_active;
+
+        if (!(val & 0x400U)) {
+            sgi_hpc3_enet_rx_active = (val & 0x200U) != 0;
+        }
+        sgi_hpc3_enet_dma.rx_ctrl =
+            (val & ~0x200U) | (sgi_hpc3_enet_rx_active ? 0x200U : 0U);
+        if (!was_active && sgi_hpc3_enet_rx_active) {
+            sgi_hpc3_enet_rx_start();
+        }
+        sgi_hpc3_enet_update_irq();
         break;
-    case 0x14014:
-        sgi_hpc3_enet_misc = val;
+    }
+    case 0x14014: {
+        /* WHY: ENET reset register (iris hpc3.rs:1972-1998, MAME hpc3.cpp
+         * enet_misc_w). Bit 0 is channel reset, bit 1 is the CLRINT strobe
+         * (never stored; it marks both status OLD via reset_interrupt),
+         * RBO is write-1-to-clear, and only set bits clear (never a full
+         * register replace). */
+        bool clrint = (val & 0x02U) != 0;
+
+        if (val & 0x800U) {
+            sgi_hpc3_enet_misc &= ~0x800U;
+            sgi_hpc3_enet_dma.rx_ctrl &= ~0x800U;
+        }
+        sgi_hpc3_enet_misc =
+            (val & ~0x802U) | (sgi_hpc3_enet_misc & 0x800U & ~val);
         if (val & 1) {
             sgi_edlc_reset();
         }
+        if (clrint) {
+            sgi_edlc_rx_status |= 0x80;
+            sgi_edlc_tx_status |= 0x80;
+            sgi_edlc_update_irq();
+            sgi_hpc3_enet_update_irq();
+            /* WHY: re-offer frames stalled while status was NEW; receive
+             * returns 0 then so the net queue holds them (iris hpc3.rs:999-1000
+             * kick_rx on enable; iris seeq8003.rs:431-433 kick_rx drains queued frames). */
+            if (sgi_ethernet_nic) {
+                qemu_flush_queued_packets(qemu_get_queue(sgi_ethernet_nic));
+            }
+        }
         break;
+    }
     case 0x14018: sgi_hpc3_enet_dma.dmacfg = val; break;
     case 0x1401c: sgi_hpc3_enet_dma.piocfg = val; break;
     case 0x15004:
-        sgi_hpc3_enet_dma.nbdp = val;
-        sgi_hpc3_enet_dma.cpfbdp = val;
+        sgi_hpc3_enet_dma.tx_nbdp = val;
         break;
-    case 0x16004:
-        sgi_hpc3_enet_dma.tx_ctrl = val;
-        sgi_hpc3_enet_tx_done = false;
-        sgi_hpc3_enet_tx_start();
+    case 0x16004: {
+        bool was_active = sgi_hpc3_enet_dma.tx_ctrl & 0x200U;
+        bool now_active;
+
+        /* WHY: same AMASK rule as RX (iris hpc3.rs:1052-1053); the ACTIVE
+         * rising edge is the TX trigger. */
+        sgi_hpc3_enet_dma.tx_ctrl =
+            (sgi_hpc3_enet_dma.tx_ctrl & 0x200U) | (val & ~0x200U);
+        if (!(val & 0x400U)) {
+            if (val & 0x200U) {
+                sgi_hpc3_enet_dma.tx_ctrl |= 0x200U;
+            } else {
+                sgi_hpc3_enet_dma.tx_ctrl &= ~0x200U;
+            }
+        }
+        now_active = sgi_hpc3_enet_dma.tx_ctrl & 0x200U;
+        if (!was_active && now_active) {
+            sgi_hpc3_enet_tx_start();
+        }
+        sgi_hpc3_enet_update_irq();
         break;
+    }
     case 0x18000: sgi_hpc3_enet_dma.cbdp = val; break;
     case 0x1a000: sgi_hpc3_enet_dma.cpfbdp = val; break;
     case 0x1a004: sgi_hpc3_enet_dma.ppfbdp = val; break;
@@ -760,9 +851,19 @@ static void sgi_hal2_dma_write(unsigned channel, int16_t sample)
 static qemu_irq sgi_ioc2_enet_edlc_irq;
 static qemu_irq sgi_ioc2_enet_hpc_irq;
 
-static NICState *sgi_ethernet_nic;
 static NICConf sgi_ethernet_conf;
+/* WHY: qemu_deliver_packet_iov dereferences the NIC reentrancy guard on the
+ * first inbound frame; a NULL guard segfaults. Other NICs pass their device
+ * guard here (e.g. dp8393x passes &dev->mem_reentrancy_guard). */
+static MemReentrancyGuard sgi_ethernet_guard;
 static uint8_t sgi_edlc_station[6];
+/* WHY: 80C03 bank-selected registers (iris seeq8003.rs:127-132). Station is
+ * bank 0 only; bank 1 holds the multicast hash LSB, bank 2 the MSB plus
+ * pktgap/ctl. Reads 0-5 always return collision counters/flags. */
+static uint8_t sgi_edlc_mcast_lsb[6];
+static uint8_t sgi_edlc_mcast_msb[2];
+static uint8_t sgi_edlc_pktgap;
+static uint8_t sgi_edlc_ctl;
 static uint8_t sgi_edlc_rx_status = 0x80;
 static uint8_t sgi_edlc_tx_status = 0x80;
 static uint8_t sgi_edlc_rx_command;
@@ -773,14 +874,21 @@ static size_t sgi_edlc_rx_pos;
 static uint8_t sgi_edlc_tx_fifo[1518];
 static size_t sgi_edlc_tx_length;
 
+/* WHY: interrupt only on NEW (OLD clear) status whose bits are enabled
+ * (iris seeq8003.rs:261-282, MAME edlc.cpp interrupt()). The level drops
+ * when the guest reads the status register (OLD-marking below) or issues
+ * the CLRINT strobe; nothing here latches, so the boot cannot wedge. */
+static bool sgi_edlc_irq_level(void)
+{
+    return ((!(sgi_edlc_rx_status & 0x80) &&
+             (sgi_edlc_rx_status & sgi_edlc_rx_command & 0x3f)) ||
+            (!(sgi_edlc_tx_status & 0x80) &&
+             (sgi_edlc_tx_status & sgi_edlc_tx_command & 0x0f)));
+}
+
 static void sgi_edlc_update_irq(void)
 {
-    bool level = ((!(sgi_edlc_rx_status & 0x80) &&
-                   (sgi_edlc_rx_status & sgi_edlc_rx_command & 0x3f)) ||
-                  (!(sgi_edlc_tx_status & 0x80) &&
-                   (sgi_edlc_tx_status & sgi_edlc_tx_command & 0x0f)));
-
-    qemu_set_irq(sgi_ioc2_enet_edlc_irq, level);
+    qemu_set_irq(sgi_ioc2_enet_edlc_irq, sgi_edlc_irq_level());
 }
 
 static bool sgi_edlc_can_receive(NetClientState *nc)
@@ -793,19 +901,38 @@ static ssize_t sgi_edlc_receive(NetClientState *nc, const uint8_t *buf,
                                 size_t size)
 {
     static const uint8_t broadcast[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
-
-    if (!(sgi_edlc_rx_status & 0x80) || size > sizeof(sgi_edlc_rx_fifo) ||
-        size < 6 || ((sgi_edlc_rx_command & 0xc0) == 0 &&
-        memcmp(buf, sgi_edlc_station, 6) != 0 && memcmp(buf, broadcast, 6) != 0)) {
+    /* WHY: a frame is already held (status NEW, iris seeq8003.rs:698 keeps
+     * rx_stat NEW until the guest re-arms). Report unconsumed so the QEMU
+     * net queue holds the frame for a later flush instead of dropping it. */
+    if (!(sgi_edlc_rx_status & 0x80)) {
+        return 0;
+    }
+    /* WHY: address filter (iris seeq8003.rs:316-329). MATCH_DISABLE drops;
+     * any match bit set accepts station/broadcast (and multicast, which the
+     * driver software-filters via ei_efix when not promiscuous). */
+    if (size > sizeof(sgi_edlc_rx_fifo) || size < 6 ||
+        (((sgi_edlc_rx_command & 0xc0) == 0 &&
+          memcmp(buf, sgi_edlc_station, 6) != 0 &&
+          memcmp(buf, broadcast, 6) != 0))) {
         return size;
     }
     memcpy(sgi_edlc_rx_fifo, buf, size);
     sgi_edlc_rx_length = size;
     sgi_edlc_rx_pos = 0;
-    sgi_edlc_rx_status = 0x10 | (size < 64 ? 0x08 : 0x20);
+    /* WHY: wire minimum is 60 bytes + 4 FCS; TAP strips the FCS, so pad
+     * short frames to 60 and report GOOD for anything the wire would call
+     * good (len + 4 >= 64, MAME edlc.cpp receive()). Without this every
+     * 60-byte ARP reads SHORT and IRIX drops it for lack of SEQ_RS_GOOD.
+     * Status stays NEW (iris seeq8003.rs:95) until the guest re-arms. */
+    if (size < 60) {
+        memset(sgi_edlc_rx_fifo + size, 0, 60 - size);
+        sgi_edlc_rx_length = 60;
+    }
+    sgi_edlc_rx_status = 0x10 | (size < 60 ? 0x08 : 0x20);
     sgi_hpc3_enet_rx_ready = true;
     sgi_hpc3_enet_rx_ready_event();
     sgi_edlc_update_irq();
+    sgi_hpc3_enet_update_irq();
     return size;
 }
 
@@ -818,7 +945,12 @@ static NetClientInfo sgi_edlc_net_info = {
 
 static uint8_t sgi_edlc_read(hwaddr addr)
 {
-    switch (addr & 7) {
+    /* WHY: IRIX maps the SEEQ registers as 32-bit words (IRIX seeq.h
+     * seeq_reg: eaddr/csr/csx are u_int), so decode the word stride
+     * (iris hpc3.rs:1649-1652: idx = (offset - SEEQ_BASE) >> 2). A
+     * size-blind addr & 7 leaves rx_cmd at MATCH_DISABLE and the receiver
+     * never enables. This also decodes byte-lane sb accesses correctly. */
+    switch ((addr >> 2) & 7) {
     case 0 ... 5:
         /*
          * 80C03 regs 0-5 read back as collision counters/flags regardless
@@ -828,10 +960,12 @@ static uint8_t sgi_edlc_read(hwaddr addr)
          * heartbeat).  Returning the station MAC here misidentifies the
          * chip and, worse, its 0x02 bit reads as NO_CARRIER.
          */
-        return (addr & 7) == 5 ? 0x01 : 0x00;
+        return ((addr >> 2) & 7) == 5 ? 0x01 : 0x00;
     case 6: {
         uint8_t value = sgi_edlc_rx_status;
 
+        /* WHY: status-read re-arm (iris seeq8003.rs:476-481, MAME edlc.cpp
+         * rx_status_r()): reading marks OLD and re-evaluates the line. */
         sgi_edlc_rx_status |= 0x80;
         sgi_edlc_update_irq();
         return value;
@@ -850,26 +984,50 @@ static uint8_t sgi_edlc_read(hwaddr addr)
 
 static void sgi_edlc_write(hwaddr addr, uint8_t value)
 {
-    switch (addr & 7) {
+    unsigned reg = (addr >> 2) & 7;
+
+    switch (reg) {
     case 0 ... 5:
-        sgi_edlc_station[addr & 7] = value;
+        /* WHY: bank routing honors the TXC bank bits (iris seeq8003.rs:500-524,
+         * MAME edlc.cpp seeq80c03 map_reg bank). Station is bank 0 only, so a
+         * 0x4F bank-select write parks later station writes in the multicast
+         * bank instead of corrupting the MAC the RX filter matches. */
+        switch (sgi_edlc_tx_command & 0x60) {
+        case 0x00:
+            sgi_edlc_station[reg] = value;
+            break;
+        case 0x20:
+            sgi_edlc_mcast_lsb[reg] = value;
+            break;
+        case 0x40:
+            switch (reg) {
+            case 0:
+            case 1:
+                sgi_edlc_mcast_msb[reg] = value;
+                break;
+            case 2:
+                sgi_edlc_pktgap = value;
+                break;
+            case 3:
+                sgi_edlc_ctl = value;
+                break;
+            default:
+                break;
+            }
+            break;
+        default:
+            break;
+        }
         break;
     case 6:
         sgi_edlc_rx_command = value;
         sgi_edlc_update_irq();
         break;
     case 7:
+        /* WHY: TXC bit 0x08 is INTGOOD enable, not a send strobe (IRIX seeq.h
+         * SEQ_XC_INTGOOD; iris seeq8003.rs:530-534 latches tx_cmd only). The
+         * true TX trigger is the HPC TX-DMA ACTIVE edge in sgi_hpc3_enet_tx_start. */
         sgi_edlc_tx_command = value;
-        if (value & 0x08) {
-            if (sgi_edlc_tx_length) {
-                qemu_send_packet(qemu_get_queue(sgi_ethernet_nic),
-                                 sgi_edlc_tx_fifo, sgi_edlc_tx_length);
-                sgi_edlc_tx_status = 0x08;
-            } else {
-                sgi_edlc_tx_status = 0x01;
-            }
-            sgi_edlc_tx_length = 0;
-        }
         sgi_edlc_update_irq();
         break;
     }
@@ -892,6 +1050,8 @@ static void sgi_edlc_fifo_write(uint8_t value)
 
 static void sgi_edlc_reset(void)
 {
+    /* WHY: CH_RESET clears commands and marks both status OLD (iris
+     * seeq8003.rs:446-456); station/filter programming survives reset. */
     sgi_edlc_rx_status = 0x80;
     sgi_edlc_tx_status = 0x80;
     sgi_edlc_rx_command = 0;
@@ -900,12 +1060,11 @@ static void sgi_edlc_reset(void)
     sgi_edlc_rx_pos = 0;
     sgi_edlc_tx_length = 0;
     sgi_hpc3_enet_rx_active = false;
-    sgi_hpc3_enet_tx_active = false;
     sgi_hpc3_enet_rx_ready = false;
-    sgi_hpc3_enet_tx_done = false;
     sgi_hpc3_enet_dma.rx_ctrl = 0;
     sgi_hpc3_enet_dma.tx_ctrl = 0;
     sgi_edlc_update_irq();
+    sgi_hpc3_enet_update_irq();
 }
 
 static void sgi_hpc3_enet_write16(hwaddr addr, uint16_t value)
@@ -917,31 +1076,40 @@ static void sgi_hpc3_enet_write16(hwaddr addr, uint16_t value)
 
 static void sgi_hpc3_enet_fetch_rx_descriptor(void)
 {
-    sgi_hpc3_enet_dma.cbdp = sgi_hpc3_enet_dma.nbdp;
+    sgi_hpc3_enet_dma.cbdp = sgi_hpc3_enet_dma.rx_nbdp;
     sgi_hpc3_enet_dma.cbp = sgi_hpc3_dma_read32(sgi_hpc3_enet_dma.cbdp);
     sgi_hpc3_enet_dma.bc = sgi_hpc3_dma_read32(sgi_hpc3_enet_dma.cbdp + 4);
-    sgi_hpc3_enet_dma.nbdp = sgi_hpc3_dma_read32(sgi_hpc3_enet_dma.cbdp + 8);
+    sgi_hpc3_enet_dma.rx_nbdp = sgi_hpc3_dma_read32(sgi_hpc3_enet_dma.cbdp + 8);
     if ((sgi_hpc3_enet_dma.bc & 0x3fff) >= 2) {
         sgi_hpc3_enet_dma.cbp += 2;
         sgi_hpc3_enet_dma.bc -= 2;
     }
 }
 
+/* WHY: pure level, never latched (iris: enet DMA channels carry no callback,
+ * the SEEQ line is the only interrupt source). It clears itself when the
+ * frame is delivered, the receiver is disabled, or RBO is set, so the guest
+ * always has a clear path and the boot cannot wedge. */
 static void sgi_hpc3_enet_update_irq(void)
 {
     qemu_set_irq(sgi_ioc2_enet_hpc_irq,
-                 sgi_hpc3_enet_tx_done ||
-                 (sgi_hpc3_enet_rx_ready &&
-                  !(sgi_hpc3_enet_dma.rx_ctrl & 0x800)));
+                 sgi_hpc3_enet_rx_ready && sgi_hpc3_enet_rx_active &&
+                 !(sgi_hpc3_enet_dma.rx_ctrl & 0x800));
 }
 
 static void sgi_hpc3_enet_rx_start(void)
 {
-    if (!sgi_hpc3_enet_rx_active && (sgi_hpc3_enet_dma.rx_ctrl & 0x200)) {
-        sgi_hpc3_enet_rx_active = true;
-        if (sgi_hpc3_enet_rx_ready) {
-            sgi_hpc3_enet_rx_ready_event();
-        }
+    /* WHY: ACTIVE edge with AMASK clear (iris hpc3.rs:987-1001). A frame held
+     * while the receiver was off is delivered now, and the TAP queue is
+     * re-polled so frames that arrived while disabled are not lost. */
+    if (!sgi_hpc3_enet_rx_active) {
+        return;
+    }
+    if (sgi_ethernet_nic) {
+        qemu_flush_queued_packets(qemu_get_queue(sgi_ethernet_nic));
+    }
+    if (sgi_hpc3_enet_rx_ready) {
+        sgi_hpc3_enet_rx_ready_event();
     }
 }
 
@@ -949,13 +1117,46 @@ static void sgi_hpc3_enet_rx_ready_event(void)
 {
     size_t remaining;
 
-    if (!sgi_hpc3_enet_rx_active || !sgi_hpc3_enet_rx_ready) {
+    if (sgi_hpc3_enet_rx_in_event) {
         return;
     }
-    if (!sgi_hpc3_enet_dma.cbdp) {
-        sgi_hpc3_enet_fetch_rx_descriptor();
+    if (!sgi_hpc3_enet_rx_active || !sgi_hpc3_enet_rx_ready) {
+        sgi_hpc3_enet_update_irq();
+        return;
     }
+    sgi_hpc3_enet_rx_in_event = true;
+    /* WHY: one frame per descriptor (MAME hpc3.cpp enet_rxrdy_w advances
+     * cbdp=nbdp and fetches on every frame; iris hpc3.rs:714-716 fetches on
+     * bc_done). The driver tracks HW progress via crbdp, so packing frames
+     * into a stale descriptor hides them. An empty ring holds the frame
+     * until the driver reposts and re-enables. */
+    if (!sgi_hpc3_enet_dma.rx_nbdp) {
+        sgi_hpc3_enet_rx_in_event = false;
+        sgi_hpc3_enet_update_irq();
+        return;
+    }
+    sgi_hpc3_enet_fetch_rx_descriptor();
+    /* WHY: RX DMA layout is [2 pad][frame][status] (iris seeq8003.rs:5-8);
+     * the driver derives rlen from the desc+6 writeback and the status byte
+     * at eh+rlen (IRIX if_ec2.c ecintr). */
     remaining = sgi_edlc_rx_length - sgi_edlc_rx_pos;
+    if ((sgi_hpc3_enet_dma.bc & 0x3fff) < remaining + 1) {
+        /* WHY: descriptor too small (MAME hpc3.cpp enet_rx_bc_dec fails):
+         * report RBO in both rcvstat and ctl (IRIX ecintr reads hio->ctl &
+         * HPC_RBO and hio->rcvstat & HPC_RBO, clears via ctl W1C) and stop
+         * the channel. The held frame is dropped; CLRINT re-arms. */
+        sgi_hpc3_enet_dma.rx_ctrl |= 0x800U;
+        sgi_hpc3_enet_misc |= 0x800U;
+        sgi_hpc3_enet_rx_active = false;
+        sgi_hpc3_enet_dma.rx_ctrl &= ~0x200U;
+        sgi_hpc3_enet_rx_ready = false;
+        sgi_edlc_rx_length = 0;
+        sgi_edlc_rx_pos = 0;
+        sgi_hpc3_enet_rx_in_event = false;
+        sgi_edlc_update_irq();
+        sgi_hpc3_enet_update_irq();
+        return;
+    }
     while (remaining && (sgi_hpc3_enet_dma.bc & 0x3fff)) {
             uint8_t value = sgi_edlc_fifo_read();
         MemTxResult result;
@@ -975,31 +1176,55 @@ static void sgi_hpc3_enet_rx_ready_event(void)
                               MEMTXATTRS_UNSPECIFIED, &result);
             sgi_hpc3_enet_dma.bc--;
         }
+        /* WHY: RX writeback is the low 14-bit remainder so ROWN clears
+         * and ecintr collects the frame (iris hpc3.rs:151 ROWN 0x4000;
+         * iris hpc3.rs:682 rem = bc & 0x3FFF to crbdp+6). */
         sgi_hpc3_enet_write16(sgi_hpc3_enet_dma.cbdp + 6,
-                              (uint16_t)(sgi_hpc3_enet_dma.bc & 0xffff));
+                              (uint16_t)(sgi_hpc3_enet_dma.bc & 0x3fff));
         sgi_edlc_rx_length = 0;
         sgi_edlc_rx_pos = 0;
         if (sgi_hpc3_enet_dma.bc & 0x80000000U) {
             sgi_hpc3_enet_rx_active = false;
+            sgi_hpc3_enet_dma.rx_ctrl &= ~0x200U;
         }
-        sgi_edlc_rx_status = 0x80;
+        /* WHY: rx status stays NEW (iris seeq8003.rs:695-706) so the EDLC
+         * line interrupts the guest; the guest re-arms with a status read
+         * or the CLRINT strobe, either of which drops the level. */
         sgi_edlc_update_irq();
-        qemu_flush_queued_packets(qemu_get_queue(sgi_ethernet_nic));
+        if (sgi_ethernet_nic) {
+            qemu_flush_queued_packets(qemu_get_queue(sgi_ethernet_nic));
+        }
     }
+    sgi_hpc3_enet_rx_in_event = false;
     sgi_hpc3_enet_update_irq();
 }
 
+/* WHY: the HPC TX-DMA ACTIVE edge is the only send trigger (iris
+ * hpc3.rs:1052-1067, MAME hpc3.cpp hd_enet_w TXC_CA arming enet_transmit).
+ * Each EOXP-flagged descriptor completes a packet: send it, report SUCCESS
+ * (iris seeq8003.rs:678-691), and write TXD to the packet-FIRST descriptor
+ * (iris hpc3.rs:703-708, MAME enet_intr_in_w BC_TXD to cpfbdp), which is what
+ * IRIX clean_xd_chain inspects. ACTIVE clears at end of chain; the guest
+ * re-kicks per packet, so no completion can pin a level. */
 static void sgi_hpc3_enet_tx_start(void)
 {
     uint32_t desc;
+    uint32_t first;
+    unsigned ndesc;
 
-    if (!(sgi_hpc3_enet_dma.tx_ctrl & 0x200) || sgi_hpc3_enet_tx_active) {
+    desc = sgi_hpc3_enet_dma.tx_nbdp;
+    if (!desc) {
+        sgi_hpc3_enet_dma.tx_ctrl &= ~0x200U;
+        sgi_hpc3_enet_update_irq();
         return;
     }
-    sgi_hpc3_enet_tx_active = true;
-    sgi_hpc3_enet_dma.cpfbdp = sgi_hpc3_enet_dma.nbdp;
-    desc = sgi_hpc3_enet_dma.nbdp;
-    while (desc) {
+    /* WHY: cpfbdp/ppfxbdp promotion per packet (iris hpc3.rs:446-450). */
+    sgi_hpc3_enet_dma.ppfbdp = sgi_hpc3_enet_dma.cpfbdp;
+    sgi_hpc3_enet_dma.cpfbdp = desc;
+    first = desc;
+    sgi_edlc_tx_length = 0;
+    ndesc = 0;
+    while (desc && ndesc < 1024) {
         uint32_t buffer = sgi_hpc3_dma_read32(desc);
         uint32_t flags = sgi_hpc3_dma_read32(desc + 4);
         uint32_t next = sgi_hpc3_dma_read32(desc + 8);
@@ -1013,6 +1238,7 @@ static void sgi_hpc3_enet_tx_start(void)
                                                &result);
             sgi_edlc_fifo_write(value);
         }
+        ndesc++;
         if (flags & 0x40000000U) {
             if (sgi_ethernet_nic) {
                 qemu_send_packet(qemu_get_queue(sgi_ethernet_nic),
@@ -1020,33 +1246,20 @@ static void sgi_hpc3_enet_tx_start(void)
             }
             sgi_edlc_tx_length = 0;
             sgi_edlc_tx_status = 0x08;
+            sgi_hpc3_enet_write16(first + 6, 0x8000);
+            sgi_hpc3_enet_dma.ppfbdp = sgi_hpc3_enet_dma.cpfbdp;
+            sgi_hpc3_enet_dma.cpfbdp = next;
+            first = next;
             sgi_edlc_update_irq();
-        }
-        if ((flags & 0x20000000U) && (sgi_edlc_tx_status & 0x08)) {
-            sgi_hpc3_enet_write16(desc + 6, 0x8000);
-            sgi_hpc3_enet_tx_done = true;
         }
         desc = next;
         if (flags & 0x80000000U) {
             break;
         }
     }
-    sgi_hpc3_enet_dma.nbdp = desc;
-    sgi_hpc3_enet_tx_active = false;
+    sgi_hpc3_enet_dma.tx_nbdp = desc;
     sgi_hpc3_enet_dma.tx_ctrl &= ~0x200U;
     sgi_hpc3_enet_update_irq();
-    if (sgi_hpc3_enet_tx_done) {
-        /*
-         * MAME hpc3 has no latching TX-done level: enet_intr_in_w turns
-         * the EDLC interrupt into a one-shot edge on the HPC3 ENET line
-         * (Local0 0x08), and completion is observed via the descriptor's
-         * BC_TXD flag written above.  Clearing here mirrors that, so a
-         * completed transmission cannot pin the IOC2 line (which would
-         * livelock IRIX in the LIO interrupt dispatcher at boot).
-         */
-        sgi_hpc3_enet_tx_done = false;
-        sgi_hpc3_enet_update_irq();
-    }
 }
 
 static uint64_t sgi_hpc3_misc_read(void *opaque, hwaddr addr, unsigned size)
@@ -1136,9 +1349,7 @@ static void sgi_indigo2_board_reset(void *opaque)
     memset(&sgi_hpc3_enet_dma, 0, sizeof(sgi_hpc3_enet_dma));
     sgi_hpc3_enet_misc = 0;
     sgi_hpc3_enet_rx_active = false;
-    sgi_hpc3_enet_tx_active = false;
     sgi_hpc3_enet_rx_ready = false;
-    sgi_hpc3_enet_tx_done = false;
     for (unsigned i = 0; i < ARRAY_SIZE(sgi_hpc3_pbus_dma); i++) {
         if (sgi_hpc3_pbus_dma[i].timer) {
             timer_del(sgi_hpc3_pbus_dma[i].timer);
@@ -1528,7 +1739,7 @@ static void mips_sgi_indigo2_init(MachineState *machine)
         sgi_ethernet_nic = qemu_new_nic(&sgi_edlc_net_info,
                                         &sgi_ethernet_conf,
                                         "seeq80c03", "indigo2",
-                                        NULL,
+                                        &sgi_ethernet_guard,
                                         NULL);
         nd->instantiated = 1;
         qemu_format_nic_info_str(qemu_get_queue(sgi_ethernet_nic),
