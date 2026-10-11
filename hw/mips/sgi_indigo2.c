@@ -172,7 +172,7 @@ static void sgi_hpc3_pbus_tick(void *opaque)
     SgiHpc3PbusDma *dma = opaque;
     unsigned channel = dma - sgi_hpc3_pbus_dma;
     uint32_t word;
-    uint16_t sample;
+    int16_t sample;
     uint64_t rate;
 
     if (!dma->bytes_left || !(dma->control & 0x10)) {
@@ -182,10 +182,15 @@ static void sgi_hpc3_pbus_tick(void *opaque)
 
     if (!(dma->control & 0x04) && channel < 4) {
         word = sgi_hpc3_dma_read32(dma->current);
-        sample = (dma->config & (1U << 19)) ? word : bswap16(word >> 16);
-        sgi_hal2_dma_write(channel, (int16_t)sample);
+        /* WHY: PBUS audio words carry a 16-bit sample as `sample << 8`
+         * (bits 23:8, low byte zero-padded; trace-proven PROM chime words
+         * like 0x00000500/0xffffe400), so the sample is bits 23:8
+         * (iris hpc3.rs:546-551, iris docs/hal2.md:180-190). dmacfg bit 19
+         * (even_high) is a physical PBUS byte-lane hint that does not
+         * change the in-memory word layout (iris hpc3.rs:549-550). */
+        sample = (int16_t)(word >> 8);
+        sgi_hal2_dma_write(channel, sample);
     }
-    (void)sample;
     dma->current += 4;
     dma->bytes_left = dma->bytes_left > 4 ? dma->bytes_left - 4 : 0;
 
@@ -810,14 +815,22 @@ static uint64_t sgi_hal2_rate_ns(unsigned channel)
         frequency = clock_select == 0 ? 48000 :
                     clock_select == 1 ? 44100 : 0;
         increment = sgi_hal2_bres[codec_clock - 1][1];
-        if (!frequency || !increment) {
+        if (!frequency || !channel_count) {
             return 0;
         }
-        modulus = 0x10000U -
-                  ((sgi_hal2_bres[codec_clock - 1][2] + 1U) - increment);
-        if (!modulus) {
-            return 1000000000ULL /
-                   (frequency * increment * channel_count);
+        /* WHY: Bresenham divider re-derived from first principles
+         * (iris src/dev/hal2.rs:401-409, iris docs/hal2.md:93-98): the
+         * modulus is programmed as modctrl = (inc - mod - 1) & 0xFFFF, so
+         * mod = (inc - modctrl - 1) & 0xFFFF and the generator ticks at
+         * master * inc / mod. A zero modulus (e.g. inc=0/modctrl=0xFFFF,
+         * the IRIX 44.1kHz programming) ticks on every master clock, and
+         * inc >= mod saturates to the master too -- at most one tick per
+         * master clock. Trace-proven PROM chime: BRES1 sel=1 (44.1kHz
+         * master), inc=1, modctrl=0xFFFF -> mod=1 -> 44100Hz mono. */
+        modulus = (increment - sgi_hal2_bres[codec_clock - 1][2] - 1U) &
+                  0xFFFFU;
+        if (!modulus || increment >= modulus) {
+            return 1000000000ULL / (frequency * channel_count);
         }
         return (1000000000ULL * modulus) /
                (frequency * increment * channel_count);
