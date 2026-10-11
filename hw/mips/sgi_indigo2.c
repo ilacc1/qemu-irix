@@ -762,13 +762,15 @@ static void sgi_hal2_audio_push(int16_t sample, unsigned dac,
         audio_be_set_active_out(sgi_hal2_be, sgi_hal2_voice, true);
     }
     if (dac == 0) {
-        /* Left DAC; mono stands alone with the held right value, stereo
-         * waits for the right tick to complete the frame (MAME hal2.cpp:365-378). */
+        /* Left DAC; stereo waits for the right tick to complete the frame
+         * (MAME hal2.cpp:365-378). Mono carries a whole frame per tick, so
+         * the sample feeds both outputs (iris docs/hal2.md:160,
+         * iris src/dev/hal2.rs:1191). */
         sgi_hal2_pending_left = sample;
         sgi_hal2_pending_valid = true;
         sgi_hal2_hold_left = sample;
         if (channel_count == 1) {
-            sgi_hal2_audio_emit(sample, sgi_hal2_hold_right);
+            sgi_hal2_audio_emit(sample, sample);
             sgi_hal2_pending_valid = false;
         }
     } else {
