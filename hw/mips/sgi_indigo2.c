@@ -139,6 +139,10 @@ typedef struct SgiHpc3PbusDma {
     uint32_t control;
     uint32_t config;
     QEMUTimer *timer;
+    /* Last tick deadline (host ns); 0 when (re)armed elsewhere. The
+     * timer list clears expire_time before running the callback, so the
+     * deadline is tracked here for catch-up pacing. */
+    uint64_t tick_deadline_ns;
 } SgiHpc3PbusDma;
 
 static SgiHpc3PbusDma sgi_hpc3_pbus_dma[8];
@@ -171,47 +175,81 @@ static void sgi_hpc3_pbus_tick(void *opaque)
 {
     SgiHpc3PbusDma *dma = opaque;
     unsigned channel = dma - sgi_hpc3_pbus_dma;
-    uint32_t word;
-    int16_t sample;
     uint64_t rate;
+    /*
+     * Wall-clock pacing (iris src/dev/hal2.rs:159-196 Pacer::due): the
+     * audio backend consumes in real time, but main-loop latency makes
+     * the host-clock timer fire late. Move at most ~5/4 of a 250us
+     * period per fire (iris PACE_PERIOD with PACE_CATCHUP_NUM/DEN) so
+     * the DMA position advances smoothly -- a burst leap would run past
+     * what the guest has written and replay stale slots. Debt past
+     * 100ms is skipped, not replayed (iris PACE_MAX_BACKLOG).
+     */
+    unsigned budget = 1;
+    uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_HOST);
 
-    if (!dma->bytes_left || !(dma->control & 0x10)) {
-        timer_del(dma->timer);
-        return;
-    }
-
-    if (!(dma->control & 0x04) && channel < 4) {
-        word = sgi_hpc3_dma_read32(dma->current);
-        /* WHY: PBUS audio words carry a 16-bit sample as `sample << 8`
-         * (bits 23:8, low byte zero-padded; trace-proven PROM chime words
-         * like 0x00000500/0xffffe400), so the sample is bits 23:8
-         * (iris hpc3.rs:546-551, iris docs/hal2.md:180-190). dmacfg bit 19
-         * (even_high) is a physical PBUS byte-lane hint that does not
-         * change the in-memory word layout (iris hpc3.rs:549-550). */
-        sample = (int16_t)(word >> 8);
-        sgi_hal2_dma_write(channel, sample);
-    }
-    dma->current += 4;
-    dma->bytes_left = dma->bytes_left > 4 ? dma->bytes_left - 4 : 0;
-
-    if (!dma->bytes_left) {
-        if (dma->flags & 0x20000000) {
-            sgi_hpc3_intstat |= 1U << channel;
-            /* MAME do_pbus_dma: bit 29 raises dma_complete (Local1). */
-            qemu_set_irq(sgi_hpc3_pbus_done_irq, 1);
+    rate = sgi_hal2_rate_ns(channel);
+    if (rate && dma->tick_deadline_ns && now > dma->tick_deadline_ns) {
+        uint64_t late = now - dma->tick_deadline_ns;
+        if (late > 100000000ULL) {
+            dma->tick_deadline_ns = now;
+        } else {
+            uint64_t per = 250000ULL / rate + 1;
+            uint64_t cap = per + (per + 3) / 4;
+            uint64_t due = late / rate;
+            budget = 1 + (unsigned)MIN(due, cap);
+            dma->tick_deadline_ns += (uint64_t)budget * rate;
         }
-        if (dma->flags & 0x80000000) {
-            dma->control &= ~0x10U;
+    }
+    for (unsigned i = 0; i < budget; i++) {
+        uint32_t word;
+        int16_t sample;
+
+        if (!dma->bytes_left || !(dma->control & 0x10)) {
+            dma->tick_deadline_ns = 0;
             timer_del(dma->timer);
             return;
         }
-        dma->descriptor = dma->next;
-        sgi_hpc3_pbus_fetch(dma);
+
+        if (!(dma->control & 0x04) && channel < 4) {
+            word = sgi_hpc3_dma_read32(dma->current);
+            /* WHY: PBUS audio words carry a 16-bit sample as `sample << 8`
+             * (bits 23:8, low byte zero-padded; trace-proven PROM chime words
+             * like 0x00000500/0xffffe400), so the sample is bits 23:8
+             * (iris hpc3.rs:546-551, iris docs/hal2.md:180-190). dmacfg bit 19
+             * (even_high) is a physical PBUS byte-lane hint that does not
+             * change the in-memory word layout (iris hpc3.rs:549-550). */
+            sample = (int16_t)(word >> 8);
+            sgi_hal2_dma_write(channel, sample);
+        }
+        dma->current += 4;
+        dma->bytes_left = dma->bytes_left > 4 ? dma->bytes_left - 4 : 0;
+
+        if (!dma->bytes_left) {
+            if (dma->flags & 0x20000000) {
+                sgi_hpc3_intstat |= 1U << channel;
+                /* MAME do_pbus_dma: bit 29 raises dma_complete (Local1). */
+                qemu_set_irq(sgi_hpc3_pbus_done_irq, 1);
+            }
+            if (dma->flags & 0x80000000) {
+                dma->control &= ~0x10U;
+                dma->tick_deadline_ns = 0;
+                timer_del(dma->timer);
+                return;
+            }
+            dma->descriptor = dma->next;
+            sgi_hpc3_pbus_fetch(dma);
+        }
     }
+
     rate = sgi_hal2_rate_ns(channel);
     if (rate) {
-        timer_mod_ns(dma->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + rate);
+        if (!dma->tick_deadline_ns || dma->tick_deadline_ns <= now) {
+            dma->tick_deadline_ns = now + rate;
+        }
+        timer_mod_ns(dma->timer, dma->tick_deadline_ns);
     } else {
+        dma->tick_deadline_ns = 0;
         timer_del(dma->timer);
     }
 }
@@ -369,12 +407,15 @@ static void sgi_hpc3_pbus_dma_write(void *opaque, hwaddr addr,
                 uint64_t rate = sgi_hal2_rate_ns(channel);
 
                 if (rate) {
-                    timer_mod_ns(dma->timer,
-                                 qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + rate);
+                    dma->tick_deadline_ns =
+                        qemu_clock_get_ns(QEMU_CLOCK_HOST) + rate;
+                    timer_mod_ns(dma->timer, dma->tick_deadline_ns);
                 } else {
+                    dma->tick_deadline_ns = 0;
                     timer_del(dma->timer);
                 }
             } else if (!(val & 0x10)) {
+                dma->tick_deadline_ns = 0;
                 timer_del(dma->timer);
             }
             return;
@@ -717,6 +758,7 @@ static void sgi_hal2_audio_emit(int16_t left, int16_t right)
         sgi_hal2_fifo[(tail + 1) % SGI_HAL2_FIFO_SIZE] = right;
         sgi_hal2_fifo_count += 2;
     }
+    /* Else overrun: drop the frame; the backend is behind. */
 }
 
 static void sgi_hal2_audio_push(int16_t sample, unsigned dac,
@@ -786,7 +828,16 @@ static void sgi_hal2_audio_push(int16_t sample, unsigned dac,
         sgi_hal2_hold_right = sample;
         sgi_hal2_pending_valid = false;
     }
-    sgi_hal2_audio_drain();
+    /* WHY: pull-driven drain only -- the backend callback (above) moves
+     * queued frames at the host clock instead of shoving every PBUS tick
+     * into the backend synchronously (iris src/dev/hal2.rs:619-636 pacer,
+     * iris src/dev/hal2.rs:110-116 20ms prebuffer: the guest produces on
+     * virtual time while the host consumes on wall time, so the FIFO
+     * absorbs the skew and the backend pull sets the cadence). Draining
+     * on every ~23us PBUS tick cost a backend write per sample, which
+     * dragged virtual delivery to ~0.6x realtime; the realtime backend
+     * then starved between bursts and padded ~40% silence that the
+     * clock-free wav capture never shows. */
 }
 
 static uint64_t sgi_hal2_rate_ns(unsigned channel)
@@ -1344,6 +1395,10 @@ static void sgi_hal2_vm_state(void *opaque, bool running, RunState state)
     (void)opaque;
     (void)state;
     if (!running && sgi_hal2_voice) {
+        /* WHY: the pull callback above stops once the VM does, so move
+         * any frames still queued in the FIFO into the backend before
+         * closing; otherwise the capture tail is trimmed on quit. */
+        sgi_hal2_audio_drain();
         audio_be_close_out(sgi_hal2_be, sgi_hal2_voice);
         sgi_hal2_voice = NULL;
         sgi_hal2_voice_freq = 0;
@@ -1369,6 +1424,7 @@ static void sgi_indigo2_board_reset(void *opaque)
         if (sgi_hpc3_pbus_dma[i].timer) {
             timer_del(sgi_hpc3_pbus_dma[i].timer);
         }
+        sgi_hpc3_pbus_dma[i].tick_deadline_ns = 0;
         sgi_hpc3_pbus_dma[i].current = 0;
         sgi_hpc3_pbus_dma[i].descriptor = 0;
         sgi_hpc3_pbus_dma[i].next = 0;
@@ -1447,7 +1503,7 @@ static void mips_sgi_indigo2_init(MachineState *machine)
         memory_region_add_subregion(address_space, 0x00080000, eisa_io);
     }
     for (n = 0; n < ARRAY_SIZE(sgi_hpc3_pbus_dma); n++) {
-        sgi_hpc3_pbus_dma[n].timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+        sgi_hpc3_pbus_dma[n].timer = timer_new_ns(QEMU_CLOCK_HOST,
                                                    sgi_hpc3_pbus_tick,
                                                    &sgi_hpc3_pbus_dma[n]);
     }
