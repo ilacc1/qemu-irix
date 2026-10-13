@@ -153,15 +153,6 @@ struct SGIGIO64State {
     uint32_t rex3_status;
     uint32_t rex3_regs[XL24_REX3_SIZE / sizeof(uint32_t)];
     uint64_t host_dataport;
-    /* WHY a batch walks words while MAME feeds one per GO: iris batches N
-     * qwords behind one GO in hostrw[host_cursor..host_len] (iris
-     * rex3.rs:3172-3206); the staging array below is the same run, fed by
-     * HOSTRW writes since the last GO and drained by the draw. */
-    uint64_t *host_words;
-    uint32_t host_words_cap;
-    uint32_t host_staged;
-    uint32_t host_len;
-    uint32_t host_cursor;
     uint32_t draw_mode1;
     uint32_t draw_mode0;
     /* REX3 geometry/state file (MAME newport_base_device::rex3_t). Start/end
@@ -673,34 +664,6 @@ static unsigned sgi_gio64_host_shift(unsigned host_depth)
     return steps[host_depth & 3];
 }
 
-/* WHY the batch needs its own start-of-word test: iris loads
- * hostrw[host_cursor] when hostcnt == 0 then steps the cursor (iris
- * rex3_generic.rs:1181-1199); here a fresh word is host_shift back at its
- * initial 64-step value. */
-static unsigned sgi_gio64_host_initial_shift(SGIGIO64State *state)
-{
-    return 64 - sgi_gio64_host_shift(state->host_depth);
-}
-
-/* WHY len > 1 means batched: a PIO write is host_len == 1, which reproduces
- * one-word-per-GO exactly (iris rex3_generic.rs:1171-1175). */
-static bool sgi_gio64_host_batch_active(SGIGIO64State *state)
-{
-    return state->host_len > 1 && state->host_cursor < state->host_len;
-}
-
-static void sgi_gio64_host_stage(SGIGIO64State *state, uint64_t word)
-{
-    if (state->host_staged >= state->host_words_cap) {
-        uint32_t cap = state->host_words_cap ? state->host_words_cap * 2 : 1024;
-
-        state->host_words = g_realloc(state->host_words,
-                                      (size_t)cap * sizeof(*state->host_words));
-        state->host_words_cap = cap;
-    }
-    state->host_words[state->host_staged++] = word;
-}
-
 /* MAME get_host_color shift advance: only packed transfers consume the
  * dataport; unpacked transfers reuse the same chunk every pixel. Uses
  * signed arithmetic like MAME (never underflows the stored uint8_t:
@@ -732,25 +695,8 @@ static uint32_t sgi_gio64_host_color(SGIGIO64State *state)
     static const uint32_t masks[] = { 0xf, 0xff, 0xfff, 0xffffffff };
     static const unsigned widths[] = { 8, 8, 16, 32 };
     unsigned width = widths[state->host_depth & 3];
-    uint32_t value;
-    /* WHY the cursor steps on load, not on wrap: iris fetch loads
-     * hostrw[host_cursor] when hostcnt == 0 then advances past the taken
-     * word (iris rex3_generic.rs:1181-1199, rex3.rs:1184-1186); the next
-     * fresh-word pixel then loads the following word. */
-    if (sgi_gio64_host_batch_active(state) &&
-        state->host_shift == sgi_gio64_host_initial_shift(state)) {
-        uint32_t idx = state->host_cursor;
-
-        if (idx >= state->host_len) {
-            idx = state->host_len - 1;
-        }
-        state->host_dataport = state->host_words[idx];
-        if (state->host_cursor < state->host_len) {
-            state->host_cursor++;
-        }
-    }
-    value = (state->host_dataport >> state->host_shift) &
-            masks[state->host_depth & 3];
+    uint32_t value = (state->host_dataport >> state->host_shift) &
+                     masks[state->host_depth & 3];
     uint32_t red;
     uint32_t green;
     uint32_t blue;
@@ -1191,23 +1137,6 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
                        (mode0 & (1U << 13) ? state->line_stipple_pattern :
                         UINT32_MAX);
     uint8_t pattern_bit = 31;
-    /* WHY the cursor/len are armed here: the batch token carries the next
-     * count entries and the GO runs the primitive once over the whole run
-     * (iris rex3.rs:3172-3206); the staged HOSTRW writes since the last GO
-     * are that run. A lone PIO word leaves len <= 1 and the scalar path
-     * below runs unchanged. */
-    if (state->host_staged > 0) {
-        state->host_len = state->host_staged;
-        state->host_cursor = 0;
-        state->host_staged = 0;
-        state->host_shift = 64 - sgi_gio64_host_shift(state->host_depth);
-    } else {
-        /* WHY retire here: a transfer lives inside one GO (iris
-         * rex3.rs:1043-1048), so a GO with no staged words has no run to
-         * drain and falls back to the scalar dataport. */
-        state->host_len = 0;
-        state->host_cursor = 0;
-    }
     /* With the Setup bit (mode0[5]) set, Read/Draw/Scr2Scr recompute the
      * octant from the current coordinates first (MAME do_rex3_command). */
     if ((mode0 & (1U << 5)) &&
@@ -1637,11 +1566,7 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
     /* Packed host blits consume one dataport per command, so the row must
      * stop after that many pixels even when stop_on_x is clear. */
     /* MAME newport.cpp:3358-3366,3430-3438 */
-    /* WHY skipped when batched: one transfer per GO keeps going until the
-     * array is drained, and len == 1 is exactly the old one-word rule (iris
-     * rex3_generic.rs:1484-1488). */
-    if (((mode0 >> 6) & 1) && ((state->draw_mode1 >> 7) & 1) &&
-        !sgi_gio64_host_batch_active(state)) {
+    if (((mode0 >> 6) & 1) && ((state->draw_mode1 >> 7) & 1)) {
         static const int16_t max_host_lengths[2][4] =
             { { 4, 4, 2, 1 }, { 8, 8, 4, 2 } };
         int max_length = max_host_lengths[(state->draw_mode1 >> 10) & 1]
@@ -1828,17 +1753,6 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
             }
         } while (x != prim_end_x && x != x_end && stop_on_x);
         if ((x_step > 0 && x >= x_end) || (x_step < 0 && x <= x_end)) {
-            /* WHY a partial word dies at the row edge: a row boundary is a
-             * forced word boundary even when the width does not divide into
-             * the word, and the next row resumes on a fresh word exactly
-             * like the one-word-per-GO feed (iris rex3_generic.rs:1459-1471,
-             * rex3.rs:2871-2874). The cursor already stepped past the taken
-             * word on load, so resetting the shift is the whole discard. */
-            if ((mode0 & (1U << 6)) && sgi_gio64_host_batch_active(state) &&
-                ((state->draw_mode1 >> 7) & 1) &&
-                state->host_shift != sgi_gio64_host_initial_shift(state)) {
-                state->host_shift = sgi_gio64_host_initial_shift(state);
-            }
             x = state->x_save;
             y += address_mode == 1 ? y_step : 0;
         } else if (!stop_on_x) {
@@ -2429,9 +2343,6 @@ static void sgi_gio64_xl24_write(void *opaque, hwaddr addr,
     case 0x0230: {
         if (size == 8) {
             state->host_dataport = value;
-            /* WHY only whole qwords stage: DMA moves whole qwords (iris
-             * rex3.rs:3172-3206); halves stay scalar fallback. */
-            sgi_gio64_host_stage(state, value);
         } else if (addr & 4) {
             state->host_dataport =
                 (state->host_dataport & 0xffffffff00000000ULL) | value;
@@ -3406,11 +3317,6 @@ static int sgi_gio64_post_load(void *opaque, int version_id)
 
     state->display_dirty = true;
     state->dmg_full = true;
-    /* WHY drop the run here too: the cursor/len are transient inside one GO
-     * (iris rex3.rs:1043-1048), so migration resumes on the scalar port. */
-    state->host_staged = 0;
-    state->host_len = 0;
-    state->host_cursor = 0;
     /* Timers are transient; re-arm them so VRINT IRQs and the DCB
      * timeout resume after migration. */
     state->vram_ptr = memory_region_get_ram_ptr(&state->vram);
@@ -3633,11 +3539,6 @@ static void sgi_gio64_reset(DeviceState *device)
     state->rex3_status = 3;
     memset(state->rex3_regs, 0, sizeof(state->rex3_regs));
     state->host_dataport = 0;
-    /* WHY keep the array but drop the run: a transfer lives inside one GO
-     * (iris rex3.rs:1043-1048), so reset/post-load has nothing to resume. */
-    state->host_staged = 0;
-    state->host_len = 0;
-    state->host_cursor = 0;
     state->display_dirty = true;
     state->dmg_full = true;
     state->draw_mode1 = 0x3002f001;
