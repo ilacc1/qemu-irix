@@ -99,29 +99,116 @@ static void sgi_mc_rpss_update(SgiMcState *state)
     state->rpss_counter += (uint32_t)(ticks * increment);
 }
 
-static uint32_t sgi_mc_dma_translate(SgiMcState *state, uint32_t address)
-{
-    for (unsigned entry = 0; entry < ARRAY_SIZE(state->dma_tlb_hi); entry++) {
-        if ((address & 0xffc00000) ==
-            (state->dma_tlb_hi[entry] & 0xffc00000)) {
-            uint32_t vpn = (address & 0x003ff000) >> 12;
-            uint32_t pte_addr = ((state->dma_tlb_lo[entry] & 0x003fffc0)
-                                 << 6) + (vpn << 2);
-            uint8_t pte_bytes[sizeof(uint32_t)];
+/* DMA_CAUSE bits (iris mc_vdma.rs). */
+#define MC_DMA_CAUSE_FAULT     0x01
+#define MC_DMA_CAUSE_TLB_MISS  0x02
+#define MC_DMA_CAUSE_CLEAN     0x04
+#define MC_DMA_CAUSE_COMPLETE  0x08
+#define MC_DMA_CTL_IE          (1U << 4)
+#define MC_DMA_CTL_XLATE       (1U << 8)
 
-            address_space_read(&address_space_memory, pte_addr,
-                               MEMTXATTRS_UNSPECIFIED, pte_bytes,
-                               sizeof(pte_bytes));
-            uint32_t pte = ldl_be_p(pte_bytes);
-            return ((pte & 0x03ffffc0) << 6) + (address & 0xfff);
+/*
+ * iris mc_vdma.rs dma_xlate_walk: translate one DMA virtual address through
+ * the 4-entry uTLB and the page table it names. Without XLATE the address is
+ * physical. Returns false with *cause set on a fault; the caller aborts.
+ */
+static bool sgi_mc_dma_xlate(SgiMcState *state, uint32_t vaddr, bool writing,
+                             hwaddr *pa, uint32_t *cause)
+{
+    uint32_t ctl = state->dma_control;
+    bool page_16k;
+    bool pte_8byte;
+    unsigned page_shift;
+    uint32_t page_mask;
+    unsigned pte_shift;
+    unsigned entry;
+    uint32_t pte_base;
+    uint32_t vpn_lo;
+    uint32_t pte;
+    uint8_t pte_bytes[8];
+    uint64_t pte64;
+
+    if (!(ctl & MC_DMA_CTL_XLATE)) {
+        *pa = vaddr;
+        return true;
+    }
+    /* GIO CTL[1]: page size (0=4KB, 1=16KB). CTL[0]: PTE size (0=4B, 1=8B). */
+    page_16k = (ctl & 0x2) != 0;
+    pte_8byte = (ctl & 0x1) != 0;
+    page_shift = page_16k ? 14 : 12;
+    page_mask = page_16k ? 0x3fff : 0xfff;
+    pte_shift = pte_8byte ? 3 : 2;
+
+    for (entry = 0; entry < ARRAY_SIZE(state->dma_tlb_hi); entry++) {
+        if ((vaddr & 0xffc00000) == (state->dma_tlb_hi[entry] & 0xffc00000)) {
+            break;
         }
     }
-    return address;
+    if (entry == ARRAY_SIZE(state->dma_tlb_hi)) {
+        *cause = MC_DMA_CAUSE_TLB_MISS;
+        return false;
+    }
+    if (!(state->dma_tlb_lo[entry] & 0x2)) {
+        *cause = MC_DMA_CAUSE_TLB_MISS;
+        return false;
+    }
+    pte_base = (state->dma_tlb_lo[entry] & 0x03ffffc0) << 6;
+    vpn_lo = (vaddr & 0x003fffff) >> page_shift;
+    if (!address_space_access_valid(&address_space_memory,
+                                    pte_base + (vpn_lo << pte_shift),
+                                    1 << pte_shift, false,
+                                    MEMTXATTRS_UNSPECIFIED)) {
+        *cause = MC_DMA_CAUSE_FAULT;
+        return false;
+    }
+    if (pte_8byte) {
+        address_space_read(&address_space_memory,
+                           pte_base + (vpn_lo << pte_shift),
+                           MEMTXATTRS_UNSPECIFIED, pte_bytes, 8);
+        pte64 = ldq_be_p(pte_bytes);
+        pte = (uint32_t)pte64;
+    } else {
+        address_space_read(&address_space_memory,
+                           pte_base + (vpn_lo << pte_shift),
+                           MEMTXATTRS_UNSPECIFIED, pte_bytes, 4);
+        pte = ldl_be_p(pte_bytes);
+    }
+    if (!(pte & 0x2)) {
+        *cause = MC_DMA_CAUSE_FAULT;
+        return false;
+    }
+    if (writing && !(pte & 0x4)) {
+        *cause = MC_DMA_CAUSE_CLEAN;
+        return false;
+    }
+    *pa = ((hwaddr)(pte & 0x03ffffc0) << 6) | (vaddr & page_mask);
+    return true;
+}
+
+/* iris: a fault aborts the transfer, leaves mem_vaddr at the faulting
+ * address and raises the cause (and the interrupt when IE is set). */
+static void sgi_mc_dma_abort(SgiMcState *state, uint32_t fault_addr,
+                             uint32_t cause)
+{
+    state->dma_mem_addr = fault_addr;
+    state->dma_count = 0;
+    state->dma_run &= ~0x40;
+    state->dma_timer = NULL;
+    state->dma_int_cause |= cause;
+    if (state->dma_control & MC_DMA_CTL_IE) {
+        qemu_set_irq(state->dma_done, 1);
+    }
 }
 
 static void sgi_mc_dma_complete(void *opaque)
 {
     SgiMcState *state = SGI_MC(opaque);
+    /* One transfer per start: the DMA timer and a DMA_RUN read can both reach
+     * here for the same start. Only a pending transfer (RUN bit 0x40) runs. */
+    if (!(state->dma_run & 0x40)) {
+        return;
+    }
+    state->dma_run_unread = false;
     uint32_t memory_addr = state->dma_mem_addr;
     uint32_t line_count = (state->dma_size >> 16) & 0xffff;
     uint32_t line_width = state->dma_size & 0xffff;
@@ -150,7 +237,14 @@ static void sgi_mc_dma_complete(void *opaque)
             while (remaining) {
                 uint32_t length = MIN(remaining, 8U);
                 uint8_t buffer[8] = { 0 };
-                hwaddr translated = sgi_mc_dma_translate(state, memory_addr);
+                hwaddr translated;
+                uint32_t fault_cause = 0;
+
+                if (!sgi_mc_dma_xlate(state, memory_addr, to_host,
+                                      &translated, &fault_cause)) {
+                    sgi_mc_dma_abort(state, memory_addr, fault_cause);
+                    return;
+                }
 
                 if (to_host && fill) {
                     uint32_t fill_value = state->dma_gio_addr;
@@ -186,12 +280,10 @@ static void sgi_mc_dma_complete(void *opaque)
     state->dma_count = 0;
     state->dma_run = (state->dma_run & ~0x40) | 0x08;
     state->dma_timer = NULL;
-    /*
-     * MAME perform_dma: raise DMA-done only when dma_control bit 4 is set,
-     * held level until the guest clears dma_int_cause (not a pulse).
-     */
-    if (state->dma_control & (1U << 4)) {
-        state->dma_int_cause |= 1U << 3;
+    /* iris: COMPLETE is a cause bit on every successful transfer; IE only
+     * gates the interrupt (polled drivers read the cause bit). */
+    state->dma_int_cause |= MC_DMA_CAUSE_COMPLETE;
+    if (state->dma_control & MC_DMA_CTL_IE) {
         qemu_set_irq(state->dma_done, 1);
     }
 }
@@ -378,6 +470,9 @@ static void sgi_mc_map_banks(SgiMcState *state, unsigned reg, uint32_t data)
 
 static uint64_t sgi_mc_read_inner(void *opaque, hwaddr addr, unsigned size)
 {
+    /* iris mc.rs: offset & !4 (bit 2 is an alias). The driver starts DMA
+     * through the aliases (0x2004 memory address, 0x202c start). */
+    addr &= ~(hwaddr)4;
     SgiMcState *state = SGI_MC(opaque);
 
     switch (addr) {
@@ -521,6 +616,9 @@ static uint64_t sgi_mc_read(void *opaque, hwaddr addr, unsigned size)
 static void sgi_mc_write_inner(void *opaque, hwaddr addr,
                                uint64_t val, unsigned size)
 {
+    /* iris mc.rs: offset & !4 (bit 2 is an alias). The driver starts DMA
+     * through the aliases (0x2004 memory address, 0x202c start). */
+    addr &= ~(hwaddr)4;
     SgiMcState *state = SGI_MC(opaque);
 
     switch (addr) {
