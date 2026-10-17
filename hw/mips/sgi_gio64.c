@@ -1,4 +1,5 @@
 #include "qemu/osdep.h"
+#include <stdlib.h>
 #include "qemu/log.h"
 #include "qemu/units.h"
 #include "hw/core/irq.h"
@@ -7,6 +8,7 @@
 #include "qapi/error.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
+#include "qemu/thread.h"
 #include "ui/console.h"
 
 #define TYPE_SGI_GIO64 "sgi-gio64"
@@ -16,9 +18,6 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGIO64State, SGI_GIO64)
 #define GIO64_BUS_SIZE 0xa00000
 #define XL24_REX3_OFFSET 0x0f0000
 #define XL24_REX3_SIZE 0x2000
-/* Vertical blank interval for the VRINT pulse to the IOC2 (MAME newport.cpp:4477
- * set_vblank_time 2500us). */
-#define SGI_GIO64_VBLANK_PULSE_NS (2500000ULL)
 #define XL24_WIDTH 1288
 #define XL24_HEIGHT 1024
 #define XL24_STRIDE 1344
@@ -53,6 +52,284 @@ static bool sgi_gio_dbg(void)
 #else
     return false;
 #endif
+}
+
+/* TEMP primitive logger (env SGI_GIO_PRIMLOG=1). Records unique REX3 draw
+ * primitives and, crucially, commands that store ZERO pixels despite a
+ * non-empty bbox (silently dropped draws). Default off; remove once the
+ * dropped-draw path is fixed. */
+static int sgi_pl_on = -1;
+static uint64_t sgi_pl_stores;
+static uint64_t sgi_pl_zerodropped;
+static int sgi_pl_zerologged;
+typedef struct {
+    uint8_t op, am, plane, flags;
+    uint32_t ci;
+    uint64_t n;
+    int x0, y0, x1, y1;
+} SgiPlKey;
+static SgiPlKey sgi_pl_keys[128];
+static int sgi_pl_nkeys;
+static uint8_t sgi_pl_prevop, sgi_pl_prevam, sgi_pl_prevplane,
+    sgi_pl_prevflags;
+static int sgi_pl_prevx0, sgi_pl_prevy0, sgi_pl_prevx1, sgi_pl_prevy1;
+static uint64_t sgi_pl_prevs0;
+static bool sgi_pl_haveprev;
+static int sgi_pl_actx0, sgi_pl_acty0, sgi_pl_actx1, sgi_pl_acty1;
+static bool sgi_pl_actvalid;
+static uint64_t sgi_pl_misaddr;
+static int sgi_pl_mislogged;
+static int sgi_pl_wx, sgi_pl_wy;
+static uint32_t sgi_pl_prevm0, sgi_pl_prevm1, sgi_pl_prevpat;
+static uint32_t sgi_pl_prevci, sgi_pl_prevback, sgi_pl_prevvram;
+static int sgi_pl_prevxsave, sgi_pl_prevysave;
+static int sgi_pl_looplogged;
+static uint64_t sgi_pl_cmd_s0;
+/* Per-opcode dropped-draw counters (op>=2 only; op==1 reads store nothing
+ * by design and must not consume the log quota). */
+static uint64_t sgi_pl_zerodropped_op[4];
+static unsigned sgi_pl_zerologged_op[4];
+static bool sgi_pl_enabled(void)
+{
+    if (sgi_pl_on < 0) {
+        sgi_pl_on = getenv("SGI_GIO_PRIMLOG") ? 1 : 0;
+    }
+    return sgi_pl_on != 0;
+}
+
+static void sgi_pl_note(uint8_t op, uint8_t am, uint8_t plane, uint8_t flags,
+                        int x0, int y0, int x1, int y1)
+{
+    int i;
+
+    /* Deferred: the previous command's stores are now final. */
+    if (sgi_pl_haveprev) {
+        uint64_t st = sgi_pl_stores - sgi_pl_prevs0;
+
+        if (st == 0 && sgi_pl_prevx1 >= sgi_pl_prevx0 &&
+            sgi_pl_prevy1 >= sgi_pl_prevy0 && sgi_pl_prevop >= 2) {
+            sgi_pl_zerodropped++;
+            sgi_pl_zerodropped_op[sgi_pl_prevop & 3]++;
+            if (sgi_pl_zerologged_op[sgi_pl_prevop & 3] < 400) {
+                sgi_pl_zerologged++;
+                sgi_pl_zerologged_op[sgi_pl_prevop & 3]++;
+                fprintf(stderr, "ZEROSTORE op=%u am=%u plane=%u flags=%02x "
+                        "bbox=(%d,%d)-(%d,%d) m0=%08x m1=%08x pat=%08x "
+                        "ci=%06x win=(%d,%d) xsave=%d\n", sgi_pl_prevop,
+                        sgi_pl_prevam, sgi_pl_prevplane, sgi_pl_prevflags,
+                        sgi_pl_prevx0, sgi_pl_prevy0, sgi_pl_prevx1,
+                        sgi_pl_prevy1, sgi_pl_prevm0, sgi_pl_prevm1,
+                        sgi_pl_prevpat, sgi_pl_prevci & 0xffffff,
+                        sgi_pl_wx, sgi_pl_wy, sgi_pl_prevxsave);
+            }
+        } else if (st > 0 && sgi_pl_actvalid) {
+            /* Intended bbox is in draw coords; actual stores are in fb
+             * coords. Overlap check catches systematically misaddressed
+             * draws (stores land nowhere near the target). */
+            int ix0 = sgi_pl_prevx0 + sgi_pl_wx;
+            int iy0 = sgi_pl_prevy0 + sgi_pl_wy;
+            int ix1 = sgi_pl_prevx1 + sgi_pl_wx;
+            int iy1 = sgi_pl_prevy1 + sgi_pl_wy;
+            int nx0 = ix0 < ix1 ? ix0 : ix1;
+            int nx1 = ix0 < ix1 ? ix1 : ix0;
+            int ny0 = iy0 < iy1 ? iy0 : iy1;
+            int ny1 = iy0 < iy1 ? iy1 : iy0;
+
+            if (sgi_pl_actx1 < nx0 || sgi_pl_actx0 > nx1 ||
+                sgi_pl_acty1 < ny0 || sgi_pl_acty0 > ny1) {
+                sgi_pl_misaddr++;
+                if (sgi_pl_mislogged < 20) {
+                    sgi_pl_mislogged++;
+                    fprintf(stderr, "MISADDR op=%u am=%u plane=%u flags=%02x "
+                            "want=(%d,%d)-(%d,%d) got=(%d,%d)-(%d,%d) "
+                            "m0=%08x m1=%08x pat=%08x xsave=%d\n",
+                            sgi_pl_prevop, sgi_pl_prevam, sgi_pl_prevplane,
+                            sgi_pl_prevflags, ix0, iy0, ix1, iy1,
+                            sgi_pl_actx0, sgi_pl_acty0,
+                            sgi_pl_actx1, sgi_pl_acty1,
+                            sgi_pl_prevm0, sgi_pl_prevm1, sgi_pl_prevpat,
+                            sgi_pl_prevxsave);
+                }
+            }
+        }
+    }
+    sgi_pl_actvalid = false;
+    for (i = 0; i < sgi_pl_nkeys; i++) {
+        if (sgi_pl_keys[i].op == op && sgi_pl_keys[i].am == am &&
+            sgi_pl_keys[i].plane == plane && sgi_pl_keys[i].flags == flags &&
+            sgi_pl_keys[i].ci == sgi_pl_prevci) {
+            sgi_pl_keys[i].n++;
+            return;
+        }
+    }
+    if (sgi_pl_nkeys < 128) {
+        SgiPlKey *k = &sgi_pl_keys[sgi_pl_nkeys++];
+
+        k->op = op; k->am = am; k->plane = plane; k->flags = flags;
+        k->ci = sgi_pl_prevci;
+        k->n = 1; k->x0 = x0; k->y0 = y0; k->x1 = x1; k->y1 = y1;
+        fprintf(stderr, "PRIM op=%u am=%u plane=%u flags=%02x "
+                "bbox=(%d,%d)-(%d,%d) ci=%06x back=%06x vram=%06x m1=%08x\n",
+                op, am, plane, flags, x0, y0, x1, y1,
+                sgi_pl_prevci & 0xffffff, sgi_pl_prevback & 0xffffff,
+                sgi_pl_prevvram & 0xffffff, sgi_pl_prevm1);
+    }
+    sgi_pl_prevop = op; sgi_pl_prevam = am; sgi_pl_prevplane = plane;
+    sgi_pl_prevflags = flags;
+    sgi_pl_prevx0 = x0; sgi_pl_prevy0 = y0;
+    sgi_pl_prevx1 = x1; sgi_pl_prevy1 = y1;
+    sgi_pl_prevs0 = sgi_pl_stores;
+    sgi_pl_haveprev = true;
+}
+
+/* TEMP full-refresh diagnostic (env SGI_GIO_FULLREFRESH=1). Forces a full
+ * re-raster every frame so CPU-written VRAM (which never sets damage)
+ * becomes visible. Decisive test for "content in VRAM but stale on screen".
+ * Default off; remove once the damage gap is fixed. */
+static int sgi_gio_fullrefresh = -1;
+static bool sgi_gio_fullrefresh_enabled(void)
+{
+    if (sgi_gio_fullrefresh < 0) {
+        sgi_gio_fullrefresh = getenv("SGI_GIO_FULLREFRESH") ? 1 : 0;
+    }
+    return sgi_gio_fullrefresh != 0;
+}
+
+/* TEMP fill-path statistics (env SGI_GIO_FILLSTATS=1). Cheap always-on
+ * counters, reported at most every 2s; remove once fills are fixed. */
+static uint64_t sgi_fs_cmd[4][8];
+static uint64_t sgi_fs_fast, sgi_fs_fastpx, sgi_fs_slowpx, sgi_fs_hostpx;
+static uint64_t sgi_fs_hostwrites, sgi_fs_hostgos, sgi_fs_hostmultigos;
+static uint64_t sgi_fs_batchgos, sgi_fs_batchwords;
+static int64_t sgi_fs_last_ms;
+static int sgi_fs_on = -1;
+typedef struct { uint32_t m0, m1; uint64_t n, px; } SGIFSMode;
+static SGIFSMode sgi_fs_modes[64];
+static int sgi_fs_nmodes;
+static uint32_t sgi_fs_lsseen[32];
+static int sgi_fs_nls;
+static bool sgi_fs_enabled(void)
+{
+    if (sgi_fs_on < 0) {
+        sgi_fs_on = getenv("SGI_GIO_FILLSTATS") ? 1 : 0;
+    }
+    return sgi_fs_on != 0;
+}
+
+/* TEMP command trace (env SGI_GIO_CMDT=1). Logs the wallpaper host block
+ * GOs: entry coordinates + exit cursor, to diff against iris block.log. */
+static int sgi_cmdt_on = -1;
+static uint64_t sgi_cmdt_n;
+static bool sgi_cmdt_enabled(void)
+{
+    if (sgi_cmdt_on < 0) {
+        sgi_cmdt_on = getenv("SGI_GIO_CMDT") ? 1 : 0;
+    }
+    return sgi_cmdt_on != 0;
+}
+
+/* TEMP guest-read probe (reported with FILLSTATS). Counts STATUS (flow
+ * control), USER_STATUS, DCBDATA and HOSTRW reads per window: a guest
+ * that spins on status/backbusy or retries reads instead of issuing
+ * draws shows up here. Zero overhead when FILLSTATS is off. */
+static uint64_t sgi_rd_status, sgi_rd_user, sgi_rd_dcb, sgi_rd_host;
+
+/* TEMP VRAM peek (env SGI_GIO_VRAMPEEK=1). Dumps one VRAM+aux rect
+ * (hardcoded below) from the next frame: ground truth for WHERE draws
+ * really land, independent of all counters and logs. One-shot. */
+static int sgi_vrampeek_on = -1;
+static bool sgi_vrampeek_done;
+static bool sgi_vrampeek_enabled(void)
+{
+    if (sgi_vrampeek_on < 0) {
+        sgi_vrampeek_on = getenv("SGI_GIO_VRAMPEEK") ? 1 : 0;
+    }
+    return sgi_vrampeek_on != 0;
+}
+
+/* TEMP scanout-map probe (env SGI_GIO_MODELOG=1). Logs XMAP mode-table
+ * writes and, once, the full per-row DID->mode table used by scanout.
+ * GL draws land correctly but the viewport stays black: this shows what
+ * scanout does with those rows (wrong entry? wrong buffer? CI vs RGB?).
+ * Default off. */
+static int sgi_modlog_on = -1;
+static bool sgi_modlog_dumped;
+static unsigned sgi_modlog_seg_n;
+static bool sgi_modlog_seg_armed;
+static bool sgi_modlog_enabled(void)
+{
+    if (sgi_modlog_on < 0) {
+        sgi_modlog_on = getenv("SGI_GIO_MODELOG") ? 1 : 0;
+    }
+    return sgi_modlog_on != 0;
+}
+
+/* TEMP RGB-command probe (env SGI_GIO_GLPROBE=1). Logs full addressing
+ * state for RGBMODE draws (GL): bbox, xywin, smasks, clip, writemask.
+ * GL stores millions of pixels that never appear; this shows WHERE they
+ * go and under what clip/mask. Capped; default off. */
+static int sgi_glprobe_on = -1;
+static bool sgi_glprobe_enabled(void)
+{
+    if (sgi_glprobe_on < 0) {
+        sgi_glprobe_on = getenv("SGI_GIO_GLPROBE") ? 1 : 0;
+    }
+    return sgi_glprobe_on != 0;
+}
+
+static void sgi_fs_report(void)
+{
+    int op, am;
+
+    fprintf(stderr, "FILLSTATS");
+    for (op = 0; op < 4; op++) {
+        for (am = 0; am < 8; am++) {
+            if (sgi_fs_cmd[op][am]) {
+                fprintf(stderr, " c%d%d=%llu", op, am,
+                        (unsigned long long)sgi_fs_cmd[op][am]);
+            }
+        }
+    }
+    fprintf(stderr, " fast=%llu fastpx=%llu slowpx=%llu hostpx=%llu"
+            " hostw=%llu hostgo=%llu hostmul=%llu batchgo=%llu batchw=%llu\n",
+            (unsigned long long)sgi_fs_fast,
+            (unsigned long long)sgi_fs_fastpx,
+            (unsigned long long)sgi_fs_slowpx,
+            (unsigned long long)sgi_fs_hostpx,
+            (unsigned long long)sgi_fs_hostwrites,
+            (unsigned long long)sgi_fs_hostgos,
+            (unsigned long long)sgi_fs_hostmultigos,
+            (unsigned long long)sgi_fs_batchgos,
+            (unsigned long long)sgi_fs_batchwords);
+    {
+        int i;
+        for (i = 0; i < sgi_fs_nmodes; i++) {
+            fprintf(stderr, "MODEFS m0=%08x m1=%08x n=%llu px=%llu\n",
+                    sgi_fs_modes[i].m0, sgi_fs_modes[i].m1,
+                    (unsigned long long)sgi_fs_modes[i].n,
+                    (unsigned long long)sgi_fs_modes[i].px);
+        }
+    }
+    memset(sgi_fs_cmd, 0, sizeof(sgi_fs_cmd));
+    sgi_fs_fast = sgi_fs_fastpx = sgi_fs_slowpx = sgi_fs_hostpx = 0;
+    sgi_fs_hostwrites = sgi_fs_hostgos = sgi_fs_hostmultigos = 0;
+    sgi_fs_batchgos = sgi_fs_batchwords = 0;
+    sgi_fs_nmodes = 0;
+    if (sgi_rd_status || sgi_rd_user || sgi_rd_dcb || sgi_rd_host) {
+        fprintf(stderr, "READS status=%llu user=%llu dcb=%llu host=%llu\n",
+                (unsigned long long)sgi_rd_status,
+                (unsigned long long)sgi_rd_user,
+                (unsigned long long)sgi_rd_dcb,
+                (unsigned long long)sgi_rd_host);
+        sgi_rd_status = sgi_rd_user = sgi_rd_dcb = sgi_rd_host = 0;
+    }
+    if (sgi_pl_enabled()) {
+        fprintf(stderr, "PRIMDROP op1=%llu op2=%llu op3=%llu logged=%d\n",
+                (unsigned long long)sgi_pl_zerodropped_op[1],
+                (unsigned long long)sgi_pl_zerodropped_op[2],
+                (unsigned long long)sgi_pl_zerodropped_op[3],
+                sgi_pl_zerologged);
+    }
 }
 
 /* Board tracing is compiled out by default (zero run-time overhead).
@@ -124,6 +401,13 @@ enum {
 
 struct SGIGIO64State {
     SysBusDevice parent_obj;
+    /* Surface-draw worker (see sgi_gio64_go). */
+    QemuThread gfx_thread;
+    QemuMutex gfx_mtx;
+    QemuCond gfx_cond_work;
+    QemuCond gfx_cond_idle;
+    bool gfx_pending;
+    bool gfx_busy;
     MemoryRegion bus;
     /* RB2 pixel store, internal only: like MAME's card, the CPU has no
      * linear VRAM window; pixels move via REX3 draw/host-dataport. */
@@ -139,13 +423,11 @@ struct SGIGIO64State {
     QemuConsole *console;
     qemu_irq gio_irq[3];
     /* Frame timer: 60Hz VRINT while VC2 display control bit 0 is set
-     * (MAME screen vblank chain). The REX3 status bit is sticky (cleared
-     * by the REX3 status read), but the raw VSYNC line to the IOC2 is a
-     * vertical-blank pulse that deasserts on its own at frame end, so a
-     * masked guest polling LIO_1_ISR&LIO_GIO_2 makes progress (real HW
-     * drops the bit without a status read). */
+     * (MAME screen vblank chain). The REX3 status bit and the GIO_INT_2
+     * line to the IOC2 both stay latched until the guest reads the REX3
+     * STATUS register (MAME newport.cpp:1700-1706 assert, 2151-2152
+     * clear); there is no frame-end deassert. */
     QEMUTimer *vblank_timer;
-    QEMUTimer *vblank_pulse_timer;
     /* 1ms DCB timeout: clears BACKBUSY after a PCD access, matching
      * MAME's m_dcb_timeout_timer. */
     QEMUTimer *dcb_timer;
@@ -153,6 +435,14 @@ struct SGIGIO64State {
     uint32_t rex3_status;
     uint32_t rex3_regs[XL24_REX3_SIZE / sizeof(uint32_t)];
     uint64_t host_dataport;
+    /* HOSTRW word staging. A PIO write is one word drained by its GO
+     * (host_len == 1); a DMA-batched transfer stages N words that a single
+     * GO drains as a run (iris rex3.rs:3172-3206, rex3_generic.rs:1171-1199).
+     * The FM/Rex3 port is 64 bits, so only whole qwords stage. */
+    uint64_t host_words[16384];
+    uint32_t host_staged;
+    uint32_t host_len;
+    uint32_t host_cursor;
     uint32_t draw_mode1;
     uint32_t draw_mode0;
     /* REX3 geometry/state file (MAME newport_base_device::rex3_t). Start/end
@@ -209,6 +499,11 @@ struct SGIGIO64State {
     uint32_t dcb_mask;
     uint32_t line_stipple_pattern;
     uint32_t z_pattern;
+    /* Live pattern cursors (iris advance_lspat/zpat + rex3.pdf 3.8.1).
+     * Reset to 31 on DOSETUP only; block rows restart them (iris
+     * draw_block_g); lsrcount continues across rows. */
+    uint8_t pat_bit;
+    uint8_t zpat_bit;
     uint32_t color_back;
     uint8_t host_shift;
     int32_t curr_color_red;
@@ -519,30 +814,169 @@ static unsigned sgi_gio64_display_height(SGIGIO64State *state)
     return XL24_HEIGHT;
 }
 
+/* TEMP write attribution (env SGI_GIO_ROWMAP=1). Tracks per-pixel the last
+ * writer's mode0/low-byte and, separately, the last zpattern-op2 writer.
+ * Used to tell whether the settled-desktop blue bands were painted by the
+ * zpattern pass itself (pattern/phase bug) or overwritten later, or never
+ * covered at all. Remove before commit. */
+static int sgi_rowmap_on = -1;
+static unsigned sgi_rowmap_tick;
+static uint64_t sgi_row_pix[XL24_HEIGHT];
+static uint64_t sgi_row_zpat[XL24_HEIGHT];
+static uint32_t *sgi_px_lastmode;
+static uint32_t *sgi_px_zmode;
+static uint8_t *sgi_px_lastval;
+static uint8_t *sgi_px_zval;
+
+static bool sgi_rowmap_enabled(void)
+{
+    if (sgi_rowmap_on < 0) {
+        sgi_rowmap_on = getenv("SGI_GIO_ROWMAP") ? 1 : 0;
+    }
+    return sgi_rowmap_on != 0;
+}
+
+static void sgi_px_ensure(void)
+{
+    size_t n = (size_t)XL24_STRIDE * XL24_HEIGHT;
+
+    if (!sgi_px_lastmode) {
+        sgi_px_lastmode = g_malloc0(n * sizeof(uint32_t));
+        sgi_px_zmode = g_malloc0(n * sizeof(uint32_t));
+        sgi_px_lastval = g_malloc0(n);
+        sgi_px_zval = g_malloc0(n);
+    }
+}
+
+static inline void sgi_row_note(uint32_t mode0, int x, int y,
+                                uint32_t val, int n)
+{
+    bool is_zpat = (mode0 & 3) == 2 &&
+                   (mode0 & ((1U << 12) | (1U << 13)));
+    int i;
+
+    if (n <= 0 || y < 0 || y >= XL24_HEIGHT) {
+        return;
+    }
+    sgi_row_pix[y] += n;
+    if (is_zpat) {
+        sgi_row_zpat[y] += n;
+    }
+    sgi_px_ensure();
+    for (i = 0; i < n; i++) {
+        int xx = x + i;
+        size_t o;
+
+        if (xx < 0 || xx >= XL24_STRIDE) {
+            continue;
+        }
+        o = (size_t)y * XL24_STRIDE + xx;
+        sgi_px_lastmode[o] = mode0;
+        sgi_px_lastval[o] = val & 0xff;
+        if (is_zpat) {
+            sgi_px_zmode[o] = mode0;
+            sgi_px_zval[o] = val & 0xff;
+        }
+    }
+}
+
+static void sgi_gio64_rowmap_dump(SGIGIO64State *state)
+{
+    static const int cols[] = { 5, 100, 640, 1200, 1275 };
+    uint32_t *vram = state->vram_ptr;
+    int y, run0, ci;
+    char prev = 0;
+
+    fprintf(stderr, "ROWMAP-BEGIN\n");
+    run0 = 0;
+    for (y = 0; y <= XL24_HEIGHT; y++) {
+        char c;
+
+        if (y == XL24_HEIGHT) {
+            c = 1;
+        } else if (sgi_row_zpat[y]) {
+            c = 'Z';
+        } else if (sgi_row_pix[y]) {
+            c = 'z';
+        } else {
+            c = '.';
+        }
+        if (c != prev) {
+            if (prev) {
+                fprintf(stderr, "ROWMAP-CLASS %c %d %d\n", prev, run0, y - 1);
+            }
+            prev = c;
+            run0 = y;
+        }
+    }
+    for (ci = 0; ci < (int)ARRAY_SIZE(cols); ci++) {
+        int x = cols[ci];
+        char pv = 0;
+        uint32_t plm = 0, pzm = 0;
+        uint8_t plv = 0, pzv = 0;
+
+        run0 = 0;
+        for (y = 0; y <= XL24_HEIGHT; y++) {
+            char c = 1;
+            uint32_t lm = 0, zm = 0;
+            uint8_t lv = 0, zv = 0;
+
+            if (y < XL24_HEIGHT) {
+                size_t o = (size_t)y * XL24_STRIDE + x;
+
+                lv = vram[o] & 0xff;
+                lm = sgi_px_lastmode[o];
+                lv = sgi_px_lastval[o];
+                zm = sgi_px_zmode[o];
+                zv = sgi_px_zval[o];
+                c = (char)((lv << 1) & 0x7f);
+            }
+            if (y == XL24_HEIGHT || lm != plm || lv != plv ||
+                (zm ? 1 : 0) != (pzm ? 1 : 0)) {
+                if (y > 0) {
+                    fprintf(stderr,
+                            "COL %d y %d %d vram=%02x last=%08x lv=%02x "
+                            "z=%d zm=%08x zv=%02x\n",
+                            x, run0, y - 1, (unsigned)(vram[(size_t)run0 *
+                            XL24_STRIDE + x] & 0xff), plm, plv,
+                            pzm ? 1 : 0, pzm, pzv);
+                }
+                run0 = y;
+                plm = lm;
+                plv = lv;
+                pzm = zm;
+                pzv = zv;
+            }
+            (void)c;
+            (void)pv;
+        }
+    }
+    fprintf(stderr, "ROWMAP-END\n");
+}
+
 static void sgi_gio64_vblank(void *opaque)
 {
     SGIGIO64State *state = opaque;
 
+    if (sgi_rowmap_enabled() && (++sgi_rowmap_tick % 300) == 0) {
+        sgi_gio64_rowmap_dump(state);
+    }
+
     /* Raise VRINT only while VC2 display control bit 0 is set (MAME
-     * newport.cpp:816-824, 1700-1706). The status bit is sticky until the
-     * REX3 status read clears it (newport.cpp:2151), but the interrupt
-     * line presented to the IOC2 follows the vertical-blank interval and
-     * drops at frame end: schedule that deassert here. */
+     * newport.cpp:816-824, 1700-1706). MAME's vrint_w only ever asserts:
+     * the STATUS bit AND the GIO interrupt<2> line stay latched until the
+     * REX3 STATUS register is read (newport.cpp:2151-2152 clears both), it
+     * is NOT released at frame end. Holding the line is also what iris does
+     * (vblank_cb(true) on assert, vblank_cb(false) on the STATUS read; see
+     * docs/interrupt_map.md). Self-clearing here would lose the interrupt
+     * whenever the guest does not service it within the pulse. */
     if (state->vc2_regs[VC2_REG_DISPLAY_CTRL] & 1) {
         state->rex3_status |= REX3_STATUS_VRINT;
         qemu_set_irq(state->gio_irq[2], 1);
-        timer_mod_ns(state->vblank_pulse_timer,
-                     qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                     SGI_GIO64_VBLANK_PULSE_NS);
     }
     timer_mod_ns(state->vblank_timer,
                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                  1000000000ULL / 60);
-}
-
-static void sgi_gio64_vblank_end(void *opaque)
-{
-    qemu_set_irq(SGI_GIO64(opaque)->gio_irq[2], 0);
 }
 
 static void sgi_gio64_dcb_timeout(void *opaque)
@@ -652,8 +1086,17 @@ static uint32_t sgi_gio64_low_word(uint64_t value, unsigned size, hwaddr addr)
 
 static uint8_t sgi_gio64_clamp_color(int32_t value)
 {
-    value >>= 11;
-    return value < 0 ? 0 : value > 255 ? 255 : value;
+    /* MAME get_rgb_color / iris clamp_color_component: mask the integer
+     * to 9 bits first. DDA currents legitimately carry overflow/high
+     * bits (e.g. red 0x90xxxx has bit23 set); without the mask those
+     * slam every channel to 255 (redscale). Negative (bit31) or
+     * >= 0x180 reads as 0; above 0xff saturates. */
+    uint32_t v = ((uint32_t)value >> 11) & 0x1ff;
+
+    if (v >= 0x180 || value < 0) {
+        return 0;
+    }
+    return v > 0xff ? 0xff : (uint8_t)v;
 }
 
 /* MAME newport s_host_shifts (dataport shift step per host depth). */
@@ -662,6 +1105,24 @@ static unsigned sgi_gio64_host_shift(unsigned host_depth)
     static const unsigned steps[] = { 8, 8, 16, 32 };
 
     return steps[host_depth & 3];
+}
+
+/* iris loads hostrw[host_cursor] whenever the shifter is empty; here a
+ * fresh word is signalled by the shift being back at its initial 64-step
+ * value (host_advance wraps to exactly this). */
+static unsigned sgi_gio64_host_initial_shift(SGIGIO64State *state)
+{
+    return 64 - sgi_gio64_host_shift(state->host_depth);
+}
+
+/* len > 1 means a batched transfer: a PIO write is len == 1 and reproduces
+ * one-word-per-GO exactly (iris rex3_generic.rs:1171-1175). */
+
+static void sgi_gio64_host_stage(SGIGIO64State *state, uint64_t word)
+{
+    if (state->host_staged < ARRAY_SIZE(state->host_words)) {
+        state->host_words[state->host_staged++] = word;
+    }
 }
 
 /* MAME get_host_color shift advance: only packed transfers consume the
@@ -695,8 +1156,17 @@ static uint32_t sgi_gio64_host_color(SGIGIO64State *state)
     static const uint32_t masks[] = { 0xf, 0xff, 0xfff, 0xffffffff };
     static const unsigned widths[] = { 8, 8, 16, 32 };
     unsigned width = widths[state->host_depth & 3];
-    uint32_t value = (state->host_dataport >> state->host_shift) &
-                     masks[state->host_depth & 3];
+    uint32_t value;
+
+    /* Refill the shifter from the staged run when it just wrapped and the
+     * batch still has words left (iris rex3_generic.rs:1181-1199). */
+    if (state->host_len > 0 &&
+        state->host_shift == sgi_gio64_host_initial_shift(state) &&
+        state->host_cursor < state->host_len) {
+        state->host_dataport = state->host_words[state->host_cursor++];
+    }
+    value = (state->host_dataport >> state->host_shift) &
+            masks[state->host_depth & 3];
     uint32_t red;
     uint32_t green;
     uint32_t blue;
@@ -757,7 +1227,13 @@ static uint32_t sgi_gio64_host_color(SGIGIO64State *state)
     return (blue & 0xc0) | ((green & 0xe0) >> 2) | ((red & 0xe0) >> 5);
 }
 
-static uint32_t sgi_gio64_shaded_color(SGIGIO64State *state)
+/* 4x4 Bayer matrix (MAME s_bayer == iris BAYER_PACKED). */
+static const uint8_t sgi_gio64_bayer[4][4] = {
+    { 0, 12, 3, 15 }, { 8, 4, 11, 7 },
+    { 2, 14, 1, 13 }, { 10, 6, 9, 5 },
+};
+
+static uint32_t sgi_gio64_shaded_color(SGIGIO64State *state, int x, int y)
 {
     uint32_t red = sgi_gio64_clamp_color(state->curr_color_red);
     uint32_t green = sgi_gio64_clamp_color(state->curr_color_green);
@@ -766,6 +1242,104 @@ static uint32_t sgi_gio64_shaded_color(SGIGIO64State *state)
 
     if (!((state->draw_mode1 >> 15) & 1)) {
         return state->color_i & 0xff;
+    }
+    if ((state->draw_mode1 >> 16) & 1) {
+        /* Dithered RGB (MAME get_rgb_color dither path): round each
+         * channel against the Bayer threshold. */
+        uint32_t bayer = sgi_gio64_bayer[x & 3][y & 3];
+
+        switch ((state->draw_mode1 >> 3) & 3) {
+        case 0: {
+            /* uint8_t wrap matches MAME exactly. */
+            uint8_t sr = (red >> 3) - (red >> 4);
+            uint8_t sg = (green >> 2) - (green >> 4);
+            uint8_t sb = (blue >> 3) - (blue >> 4);
+            uint32_t dr = (sr >> 4) & 1;
+            uint32_t dg = (sg >> 4) & 3;
+            uint32_t db = (sb >> 4) & 1;
+
+            if ((sr & 0xf) > bayer) {
+                dr++;
+            }
+            if ((sg & 0xf) > bayer) {
+                dg++;
+            }
+            if ((sb & 0xf) > bayer) {
+                db++;
+            }
+            if (dr > 1) {
+                dr = 1;
+            }
+            if (dg > 3) {
+                dg = 3;
+            }
+            if (db > 1) {
+                db = 1;
+            }
+            uint32_t color = (db << 3) | (dg << 1) | dr;
+            return alpha | (color << 4) | color;
+        }
+        case 1: {
+            /* uint8_t wrap matches MAME exactly. */
+            uint8_t sr = (red >> 1) - (red >> 4);
+            uint8_t sg = (green >> 1) - (green >> 4);
+            uint8_t sb = (blue >> 2) - (blue >> 4);
+            uint32_t dr = (sr >> 4) & 7;
+            uint32_t dg = (sg >> 4) & 7;
+            uint32_t db = (sb >> 4) & 3;
+
+            if ((sr & 0xf) > bayer) {
+                dr++;
+            }
+            if ((sg & 0xf) > bayer) {
+                dg++;
+            }
+            if ((sb & 0xf) > bayer) {
+                db++;
+            }
+            if (dr > 7) {
+                dr = 7;
+            }
+            if (dg > 7) {
+                dg = 7;
+            }
+            if (db > 3) {
+                db = 3;
+            }
+            return alpha | (db << 6) | (dg << 3) | dr;
+        }
+        case 2: {
+            uint32_t sr = red - (red >> 4);
+            uint32_t sg = green - (green >> 4);
+            uint32_t sb = blue - (blue >> 4);
+            uint32_t dr = (sr >> 4) & 15;
+            uint32_t dg = (sg >> 4) & 15;
+            uint32_t db = (sb >> 4) & 15;
+
+            if ((sr & 0xf) > bayer) {
+                dr++;
+            }
+            if ((sg & 0xf) > bayer) {
+                dg++;
+            }
+            if ((sb & 0xf) > bayer) {
+                db++;
+            }
+            if (dr > 15) {
+                dr = 15;
+            }
+            if (dg > 15) {
+                dg = 15;
+            }
+            if (db > 15) {
+                db = 15;
+            }
+            uint32_t color = (db << 8) | (dg << 4) | dr;
+            return alpha | (color << 12) | color;
+        }
+        default:
+            return alpha | (blue << 16) | (green << 8) | red;
+        }
     }
     if (((state->draw_mode1 >> 3) & 3) == 2) {
         return ((blue & 0xf0) << 4) | (green & 0xf0) |
@@ -778,12 +1352,33 @@ static uint32_t sgi_gio64_shaded_color(SGIGIO64State *state)
             ((red & 0xe0) >> 5));
 }
 
+static int32_t sgi_gio64_sext_bits(uint32_t value, unsigned bits)
+{
+    return (int32_t)(value << (32 - bits)) >> (32 - bits);
+}
+
 static void sgi_gio64_iterate_shade(SGIGIO64State *state)
 {
-    state->curr_color_red += state->slope_red;
-    state->curr_color_green += state->slope_green;
-    state->curr_color_blue += state->slope_blue;
-    state->curr_color_alpha += state->slope_alpha;
+    /* MAME iterate_shade: slopes are 24-bit (red) / 20-bit (green, blue,
+     * alpha) two's complement. Adding the raw 32-bit stored int adds
+     * +8M for negative slopes and slams the channel to full within a
+     * pixel or two; sign-extend first. */
+    if (state->slope_red & 0x7fffff) {
+        state->curr_color_red +=
+            sgi_gio64_sext_bits((uint32_t)state->slope_red, 24);
+    }
+    if (state->slope_green & 0x7ffff) {
+        state->curr_color_green +=
+            sgi_gio64_sext_bits((uint32_t)state->slope_green, 20);
+    }
+    if (state->slope_blue & 0x7ffff) {
+        state->curr_color_blue +=
+            sgi_gio64_sext_bits((uint32_t)state->slope_blue, 20);
+    }
+    if (state->slope_alpha & 0x7ffff) {
+        state->curr_color_alpha +=
+            sgi_gio64_sext_bits((uint32_t)state->slope_alpha, 20);
+    }
 }
 
 static uint8_t sgi_gio64_blend_index(SGIGIO64State *state, uint8_t source,
@@ -848,6 +1443,91 @@ static bool sgi_gio64_clip_masks14(SGIGIO64State *state, int x, int y)
         }
     }
     return false;
+}
+
+/* Pattern prologue (iris pixel_draw + rex3.pdf 3.8.1): ENZPATTERN and
+ * ENLSPATTERN are independent. A zero bit rejects unless its opaque bit
+ * substitutes COLORBACK. Written iff (LSOPAQUE|LSPAT)&(ZOPAQUE|ZPAT). */
+static bool sgi_gio64_pattern_pass(SGIGIO64State *state, uint32_t mode0,
+                                   bool *use_bg)
+{
+    *use_bg = false;
+    if ((mode0 & (1U << 12)) &&
+        !((state->z_pattern >> state->zpat_bit) & 1)) {
+        if (mode0 & (1U << 16)) {
+            *use_bg = true;
+        } else {
+            return false;
+        }
+    }
+    if ((mode0 & (1U << 13)) &&
+        !((state->line_stipple_pattern >> state->pat_bit) & 1)) {
+        if (mode0 & (1U << 17)) {
+            *use_bg = true;
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Pattern advance (iris advance_zpat/advance_lspat): ZPAT rotates 32;
+ * LSPAT recirculates over LSLENGTH+17 bits with LSREPEAT-per-bit tracked
+ * by live LSRCOUNT. Advances only when enabled; LSRCOUNT is register
+ * state, never reset on GO. */
+static void sgi_gio64_pattern_advance(SGIGIO64State *state, uint32_t mode0)
+{
+    if (mode0 & (1U << 12)) {
+        state->zpat_bit = (state->zpat_bit - 1) & 31;
+    }
+    if (mode0 & (1U << 13)) {
+        unsigned lsrcount = state->ls_mode & 0xff;
+        unsigned lsrepeat = (state->ls_mode >> 8) & 0xff;
+
+        if (lsrepeat == 0) {
+            lsrepeat = 1;
+        }
+        if (lsrcount == 0) {
+            unsigned length = ((state->ls_mode >> 24) & 0xf) + 17;
+            unsigned wrap = 32 - length;
+
+            state->ls_mode = (state->ls_mode & ~0xffu) | (lsrepeat - 1);
+            if (state->pat_bit == wrap) {
+                state->pat_bit = 31;
+            } else {
+                state->pat_bit = (state->pat_bit - 1) & 31;
+            }
+        } else {
+            state->ls_mode = (state->ls_mode & ~0xffu) | (lsrcount - 1);
+        }
+    }
+}
+
+/* Alpha-vs-ALPHAREF compare (iris afunc): 0x7 disables. Operators
+ * 0-6 are never/lt/eq/le/gt/ne/ge. MAME has no compare. */
+static bool sgi_gio64_afunc(SGIGIO64State *state, unsigned src_alpha)
+{
+    unsigned cmp = (state->draw_mode1 >> 12) & 7;
+    unsigned ref = state->alpha_ref & 0xff;
+
+    switch (cmp) {
+    case 0:
+        return false;
+    case 1:
+        return src_alpha < ref;
+    case 2:
+        return src_alpha == ref;
+    case 3:
+        return src_alpha <= ref;
+    case 4:
+        return src_alpha > ref;
+    case 5:
+        return src_alpha != ref;
+    case 6:
+        return src_alpha >= ref;
+    default:
+        return true;
+    }
 }
 
 static uint32_t sgi_gio64_rop(uint8_t func, uint32_t src, uint32_t dst)
@@ -938,109 +1618,59 @@ static uint32_t sgi_gio64_blend_rgb(uint32_t src, uint32_t dst,
     return (shi << 16) | (mid << 8) | slo;
 }
 
+static uint32_t sgi_gio64_blend_factor(unsigned sel, unsigned c,
+                                         unsigned a)
+{
+    switch (sel) {
+    case 0:
+        return 0;
+    case 1:
+        return 255;
+    case 2:
+        return c;
+    case 3:
+        return 255 - c;
+    case 4:
+        return a;
+    case 5:
+        return 255 - a;
+    default:
+        return 0;
+    }
+}
+
 static uint32_t sgi_gio64_blend_rgb24(SGIGIO64State *state, uint32_t src,
                                       uint32_t dst)
 {
-    /* MAME newport blend_pixel for 24-bit direct pixels (words are
-     * 0x00BBGGRR). Factor selection matches draw_mode1 bits 19-24/27. */
-    float sa = ((src >> 24) & 0xff) / 255.0f;
-    float sb = ((src >> 16) & 0xff) / 255.0f;
-    float sg = ((src >> 8) & 0xff) / 255.0f;
-    float sr = ((src >> 0) & 0xff) / 255.0f;
-    float db, dg, dr;
+    /* Integer blend (iris blend): Cb = Cs*Fs + Cd*Fd over 255. Words are
+     * 0x00BBGGRR (byte0=R). BLENDALPHA (bit27) substitutes source-alpha
+     * (else 1) for the SOURCE factor only; the destination factor keeps
+     * the real alpha (iris blendalpha rule). BACKBLEND (bit25) uses
+     * COLORBACK as the destination. */
+    uint32_t sa_real = (src >> 24) & 0xff;
+    uint32_t sa_src = (state->draw_mode1 & (1U << 27)) ? sa_real : 255;
+    unsigned sfactor = (state->draw_mode1 >> 19) & 7;
+    unsigned dfactor = (state->draw_mode1 >> 22) & 7;
+    uint32_t out = 0;
+    int i;
 
     if (state->draw_mode1 & (1U << 25)) {
-        db = ((state->color_back >> 16) & 0xff) / 255.0f;
-        dg = ((state->color_back >> 8) & 0xff) / 255.0f;
-        dr = ((state->color_back >> 0) & 0xff) / 255.0f;
-    } else {
-        db = ((dst >> 16) & 0xff) / 255.0f;
-        dg = ((dst >> 8) & 0xff) / 255.0f;
-        dr = ((dst >> 0) & 0xff) / 255.0f;
+        dst = state->color_back;
     }
-    float sbb = 0.0f, sgb = 0.0f, srb = 0.0f;
-    float dbb = 0.0f, dgb = 0.0f, drb = 0.0f;
+    for (i = 0; i < 3; i++) {
+        unsigned shift = (unsigned)i * 8;
+        unsigned s_c = (src >> shift) & 0xff;
+        unsigned d_c = (dst >> shift) & 0xff;
+        unsigned sf = sgi_gio64_blend_factor(sfactor, d_c, sa_src);
+        unsigned df = sgi_gio64_blend_factor(dfactor, s_c, sa_real);
+        unsigned v = (s_c * sf + d_c * df) / 255;
 
-    switch ((state->draw_mode1 >> 19) & 7) {
-    case 1:
-        sbb = sb;
-        sgb = sg;
-        srb = sr;
-        break;
-    case 2:
-        sbb = sb * db;
-        sgb = sg * dg;
-        srb = sr * dr;
-        break;
-    case 3:
-        sbb = sb * (1.0f - db);
-        sgb = sg * (1.0f - dg);
-        srb = sr * (1.0f - dr);
-        break;
-    case 4:
-        if (state->draw_mode1 & (1U << 27)) {
-            sbb = sb * sa;
-            sgb = sg * sa;
-            srb = sr * sa;
-        } else {
-            sbb = sb;
-            sgb = sg;
-            srb = sr;
+        if (v > 255) {
+            v = 255;
         }
-        break;
-    case 5:
-        if (state->draw_mode1 & (1U << 27)) {
-            sbb = sb * (1.0f - sa);
-            sgb = sg * (1.0f - sa);
-            srb = sr * (1.0f - sa);
-        }
-        break;
-    default:
-        break;
+        out |= v << shift;
     }
-    switch ((state->draw_mode1 >> 22) & 7) {
-    case 1:
-        dbb = db;
-        dgb = dg;
-        drb = dr;
-        break;
-    case 2:
-        dbb = db * sb;
-        dgb = dg * sg;
-        drb = dr * sr;
-        break;
-    case 3:
-        dbb = db * (1.0f - sb);
-        dgb = dg * (1.0f - sg);
-        drb = dr * (1.0f - sr);
-        break;
-    case 4:
-        if (state->draw_mode1 & (1U << 27)) {
-            dbb = db * sa;
-            dgb = dg * sa;
-            drb = dr * sa;
-        } else {
-            dbb = db;
-            dgb = dg;
-            drb = dr;
-        }
-        break;
-    case 5:
-        if (state->draw_mode1 & (1U << 27)) {
-            dbb = db * (1.0f - sa);
-            dgb = dg * (1.0f - sa);
-            drb = dr * (1.0f - sa);
-        }
-        break;
-    default:
-        break;
-    }
-    float b = sbb + dbb, g = sgb + dgb, r = srb + drb;
-    uint32_t bi = b > 1.0f ? 255 : (uint32_t)(b * 255.0f);
-    uint32_t gi = g > 1.0f ? 255 : (uint32_t)(g * 255.0f);
-    uint32_t ri = r > 1.0f ? 255 : (uint32_t)(r * 255.0f);
-
-    return (bi << 16) | (gi << 8) | ri;
+    return out;
 }
 
 static void sgi_gio64_put_pixel(SGIGIO64State *state, uint32_t *vram,
@@ -1064,14 +1694,31 @@ static void sgi_gio64_put_pixel(SGIGIO64State *state, uint32_t *vram,
         !sgi_gio64_clip_mask0(state, x, y)) {
         return;
     }
+    /* YFLIP (iris calculate_fb_address): Y values negated, subtracted
+     * from YWIN. Mask0 stays raw; masks 1-4 stay absolute and test the
+     * physical coords. */
     x += (int)state->x_window - 0x1000;
-    y += (int)state->y_window - 0x1000;
+    if ((state->draw_mode1 >> 6) & 1) {
+        y = (int)state->y_window - y - 0x1000;
+    } else {
+        y += (int)state->y_window - 0x1000;
+    }
     if (x < 0 || x >= XL24_STRIDE || y < 0 || y >= XL24_HEIGHT) {
         return;
     }
     if ((state->clip_mode & 0x1e) &&
         !sgi_gio64_clip_masks14(state, x, y)) {
         return;
+    }
+    /* CIDMATCH mask of permitted destination CIDs (iris
+     * cid_allows_write): enforced for DRAW and Scr2Scr-dest, never for
+     * reads. Mask 0xF is test-off. */
+    if (((state->clip_mode >> 9) & 0xf) != 0xf) {
+        unsigned cid = aux[y * XL24_STRIDE + x] & 3;
+
+        if (!(((state->clip_mode >> 9) & 0xf) & (1U << cid))) {
+            return;
+        }
     }
     if (state->step_z & 1) {
         uint32_t *z = &state->zbuffer[y * XL24_STRIDE + x];
@@ -1118,12 +1765,184 @@ static void sgi_gio64_put_pixel(SGIGIO64State *state, uint32_t *vram,
     }
     mask &= XL24_GLOBAL_MASK;
     *pixel = (dst & ~mask) | (out & mask);
+    if (sgi_rowmap_enabled()) {
+        sgi_row_note(state->draw_mode0, x, y, *pixel, 1);
+    }
+    if (sgi_pl_enabled()) {
+        sgi_pl_stores++;
+        if (!sgi_pl_actvalid) {
+            sgi_pl_actx0 = sgi_pl_actx1 = x;
+            sgi_pl_acty0 = sgi_pl_acty1 = y;
+            sgi_pl_actvalid = true;
+        } else {
+            if (x < sgi_pl_actx0) sgi_pl_actx0 = x;
+            if (x > sgi_pl_actx1) sgi_pl_actx1 = x;
+            if (y < sgi_pl_acty0) sgi_pl_acty0 = y;
+            if (y > sgi_pl_acty1) sgi_pl_acty1 = y;
+        }
+    }
+}
+
+static int sgi_seq_on = -1;
+static uint64_t sgi_seq_n;
+static bool sgi_seq_enabled(void)
+{
+    if (sgi_seq_on < 0) {
+        sgi_seq_on = getenv("SGI_GIO_SEQLOG") ? 1 : 0;
+    }
+    return sgi_seq_on != 0;
 }
 
 static void sgi_gio64_rex3_command(SGIGIO64State *state)
 {
     uint32_t mode0 = state->draw_mode0;
     uint32_t opcode = mode0 & 3;
+
+    if (sgi_seq_enabled()) {
+        fprintf(stderr, "SEQ n=%llu m0=%08x m1=%08x pd=%u zpat=%08x "
+                "lspat=%08x ls=%08x xs=%d ys=%d xe=%d ye=%d xsv=%d "
+                "mv=(%d,%d) hlen=%u hstg=%u hs=%u cfg=%08x "
+                "win=(%d,%d) ci=%06x cv=%06x clip=%04x sm=%04x/%04x\n",
+                (unsigned long long)sgi_seq_n++, mode0, state->draw_mode1,
+                state->plane_depth, state->z_pattern,
+                state->line_stipple_pattern, state->ls_mode,
+                state->x_start_i, state->y_start_i,
+                state->x_end_i, state->y_end_i, (int)state->x_save,
+                state->x_move, state->y_move,
+                (unsigned)state->host_len, (unsigned)state->host_staged,
+                (unsigned)state->host_shift, state->draw_mode1,
+                (int)state->x_window - 0x1000, (int)state->y_window - 0x1000,
+                state->color_i & 0xffffff, state->color_vram & 0xffffff,
+                state->clip_mode & 0x1fff,
+                state->screenmask_x[0] & 0xffff, state->screenmask_y[0] & 0xffff);
+    }
+
+    /* Arm the host transfer: a loud PIO write is len == 1 (scalar path);
+     * a run of HOSTRW writes since the last GO is delivered as one batched
+     * transfer the draw walks (iris rex3.rs:3172-3206). */
+    if (state->host_staged > 0) {
+        state->host_len = state->host_staged;
+        state->host_cursor = 0;
+        state->host_staged = 0;
+        state->host_shift = sgi_gio64_host_initial_shift(state);
+    } else {
+        state->host_len = 0;
+        state->host_cursor = 0;
+    }
+    if (sgi_pl_enabled() && opcode >= 1 && opcode <= 3) {
+        uint8_t flags = ((mode0 >> 6) & 1) | (((mode0 >> 12) & 1) << 1) |
+                        (((mode0 >> 13) & 1) << 2) |
+                        (((state->draw_mode1 >> 15) & 1) << 3) |
+                        (((state->draw_mode1 >> 17) & 1) << 4) |
+                        (((mode0 >> 18) & 1) << 5);
+
+        sgi_pl_wx = (int)state->x_window - 0x1000;
+        sgi_pl_wy = (int)state->y_window - 0x1000;
+        sgi_pl_prevm0 = mode0;
+        sgi_pl_prevm1 = state->draw_mode1;
+        sgi_pl_prevpat = (mode0 & (1U << 12)) ? state->z_pattern :
+                         ((mode0 & (1U << 13)) ? state->line_stipple_pattern :
+                          0xffffffffu);
+        sgi_pl_prevxsave = (int)state->x_save;
+        sgi_pl_prevysave = 0;
+        sgi_pl_prevci = state->color_i;
+        sgi_pl_prevback = state->color_back;
+        sgi_pl_prevvram = state->color_vram;
+        /* Sampled (every 1024th RGB command): always fresh, tiny
+         * volume, no cap to exhaust. Replaces the per-mode buckets. */
+        {
+            static uint64_t glprobe_ctr;
+            bool take = sgi_glprobe_enabled() &&
+                        (state->draw_mode1 & (1U << 15)) &&
+                        ((glprobe_ctr++ & 1023) == 0);
+
+            if (take) {
+                fprintf(stderr, "GLPROBE op=%u am=%u m0=%08x m1=%08x "
+                        "bbox=(%d,%d)-(%d,%d) fullx=(%d,%d) win=(%d,%d) "
+                        "move=(%d,%d) clip=%04x sm0=%08x/%08x sm1=%08x/%08x "
+                        "wmask=%06x ci=%06x cr=%08x cg=%08x cb=%08x ca=%08x "
+                        "sr=%08x sg=%08x sb=%08x sa=%08x\n",
+                        opcode, (mode0 >> 2) & 7, mode0, state->draw_mode1,
+                        state->x_start_i, state->y_start_i,
+                        state->x_end_i, state->y_end_i,
+                        state->x_start, state->y_start,
+                        (int)state->x_window - 0x1000,
+                        (int)state->y_window - 0x1000,
+                        state->x_move, state->y_move,
+                        state->clip_mode & 0x1fff,
+                        state->screenmask_x[0], state->screenmask_y[0],
+                        state->screenmask_x[1], state->screenmask_y[1],
+                        state->write_mask & 0xffffff,
+                        state->color_i & 0xffffff,
+                        (uint32_t)state->curr_color_red,
+                        (uint32_t)state->curr_color_green,
+                        (uint32_t)state->curr_color_blue,
+                        (uint32_t)state->curr_color_alpha,
+                        (uint32_t)state->slope_red,
+                        (uint32_t)state->slope_green,
+                        (uint32_t)state->slope_blue,
+                        (uint32_t)state->slope_alpha);
+            }
+        }
+        sgi_pl_note((uint8_t)opcode, (uint8_t)((mode0 >> 2) & 7),
+                    (uint8_t)(state->plane_depth & 3), flags,
+                    state->x_start_i, state->y_start_i,
+                    state->x_end_i, state->y_end_i);
+    }
+    if (sgi_pl_enabled()) {
+        /* Reset for this command's stores (after the deferred check). */
+        sgi_pl_actvalid = false;
+        sgi_pl_cmd_s0 = sgi_pl_stores;
+    }
+    if (sgi_fs_enabled()) {
+        int i;
+        sgi_fs_cmd[mode0 & 3][(mode0 >> 2) & 7]++;
+        for (i = 0; i < sgi_fs_nmodes; i++) {
+            if (sgi_fs_modes[i].m0 == mode0 && sgi_fs_modes[i].m1 == state->draw_mode1) {
+                break;
+            }
+        }
+        if (i == sgi_fs_nmodes && sgi_fs_nmodes < 64) {
+            sgi_fs_nmodes++;
+            sgi_fs_modes[i].n = 0;
+            sgi_fs_modes[i].px = 0;
+        }
+        if (i < sgi_fs_nmodes) {
+            sgi_fs_modes[i].m0 = mode0;
+            sgi_fs_modes[i].m1 = state->draw_mode1;
+            sgi_fs_modes[i].n++;
+            sgi_fs_modes[i].px +=
+                (uint64_t)(abs(state->x_end_i - state->x_start_i) + 1) *
+                (abs(state->y_end_i - state->y_start_i) + 1);
+        }
+        if ((mode0 & 0x40) && (opcode == 2)) {
+            sgi_fs_hostgos++;
+            if (state->host_len > 1) {
+                sgi_fs_batchgos++;
+                sgi_fs_batchwords += state->host_len;
+            }
+        }
+        if ((mode0 & ((1U << 12) | (1U << 13))) && opcode == 2) {
+            int k;
+            for (k = 0; k < sgi_fs_nls; k++) {
+                if (sgi_fs_lsseen[k] == state->ls_mode) {
+                    break;
+                }
+            }
+            if (k == sgi_fs_nls && sgi_fs_nls < 32) {
+                sgi_fs_lsseen[sgi_fs_nls++] = state->ls_mode;
+                fprintf(stderr, "LSFS ls_mode=%04x zpat=%08x lspat=%08x "
+                        "m0=%08x m1=%08x ystride=%d\n",
+                        state->ls_mode, state->z_pattern,
+                        state->line_stipple_pattern, mode0, state->draw_mode1,
+                        (int)((mode0 >> 23) & 1));
+            }
+        }
+        if (qemu_clock_get_ms(QEMU_CLOCK_REALTIME) - sgi_fs_last_ms > 2000) {
+            sgi_fs_last_ms = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+            sgi_fs_report();
+        }
+    }
     int x_start = state->x_start_i;
     int y_start = state->y_start_i;
     int x_end = state->x_end_i;
@@ -1136,7 +1955,12 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
     uint32_t pattern = mode0 & (1U << 12) ? state->z_pattern :
                        (mode0 & (1U << 13) ? state->line_stipple_pattern :
                         UINT32_MAX);
-    uint8_t pattern_bit = 31;
+    /* New primitive (DOSETUP): restart pattern cursors (iris
+     * execute_go). Continuation GOs keep them. */
+    if (mode0 & (1U << 5)) {
+        state->pat_bit = 31;
+        state->zpat_bit = 31;
+    }
     /* With the Setup bit (mode0[5]) set, Read/Draw/Scr2Scr recompute the
      * octant from the current coordinates first (MAME do_rex3_command). */
     if ((mode0 & (1U << 5)) &&
@@ -1167,12 +1991,17 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
     if (opcode == 1) {
         uint64_t data = 0;
         unsigned plane = state->draw_mode1 & 7;
-        /* MAME read_pixel reads the active destination buffer (RGBCI or
-         * aux/CID by plane_enable). Clamp the row (MAME pixel_clip_pass);
-         * an out-of-range row reads zeros instead of OOB memory. */
+        /* MAME do_pixel_read: the source address carries the window
+         * offset (with YFLIP negation); reads are never clipped, only
+         * bounded (iris pixel_read). */
         const uint32_t *src_plane = (plane >= 4 && plane <= 6) ? aux : vram;
+        int read_row = ((state->draw_mode1 >> 6) & 1) ?
+                       (int)state->y_window - y_start - 0x1000 :
+                       y_start + (int)state->y_window - 0x1000;
+        int read_x0 = x_start + (int)state->x_window - 0x1000;
+        int read_x1 = x_end + (int)state->x_window - 0x1000;
 
-        if (y_start < 0 || y_start >= XL24_HEIGHT) {
+        if (read_row < 0 || read_row >= XL24_HEIGHT) {
             state->host_dataport = 0;
             state->host_shift = 64 - sgi_gio64_host_shift(state->host_depth);
             return;
@@ -1181,14 +2010,18 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
         if (state->plane_depth == 3) {
             /* 24-bit: MAME read_pixel returns whole words (src shift 0 on
              * the RGB/CI plane). */
-            for (uint32_t x = x_start; x <= x_end && x < XL24_STRIDE; x++) {
-                data = (data << 32) |
-                       src_plane[y_start * XL24_STRIDE + x];
+            for (int x = read_x0; x <= read_x1 && x < XL24_STRIDE; x++) {
+                if (x >= 0) {
+                    data = (data << 32) |
+                           src_plane[read_row * XL24_STRIDE + x];
+                }
             }
         } else {
-            for (uint32_t x = x_start; x <= x_end && x < XL24_STRIDE; x++) {
-                data = (data << 8) |
-                       (uint8_t)src_plane[y_start * XL24_STRIDE + x];
+            for (int x = read_x0; x <= read_x1 && x < XL24_STRIDE; x++) {
+                if (x >= 0) {
+                    data = (data << 8) |
+                           (uint8_t)src_plane[read_row * XL24_STRIDE + x];
+                }
             }
         }
         state->host_dataport = data;
@@ -1218,8 +2051,14 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
             (plane >= 4 && plane <= 6) ? aux : vram;
         int sx0 = MIN(x_start, x_end) + win_x;
         int sx1 = MAX(x_start, x_end) + win_x;
-        int sy0 = MIN(y_start, y_end) + win_y;
-        int sy1 = MAX(y_start, y_end) + win_y;
+        /* Source read uses the same YFLIP negation as writes (iris
+         * calculate_src_address). */
+        int sy0 = ((state->draw_mode1 >> 6) & 1) ?
+                  (int)state->y_window - MAX(y_start, y_end) - 0x1000 :
+                  MIN(y_start, y_end) + win_y;
+        int sy1 = ((state->draw_mode1 >> 6) & 1) ?
+                  (int)state->y_window - MIN(y_start, y_end) - 0x1000 :
+                  MAX(y_start, y_end) + win_y;
         int sw = 0, sh = 0;
         uint32_t *copy = NULL;
         /* Opaque row copies bypass per-pixel ROP/mask/clip/Z (the snapshot
@@ -1228,7 +2067,9 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
         bool row_copy = ((state->draw_mode1 >> 28) & 0xf) == 3 &&
                         !(state->draw_mode1 & (1U << 18)) &&
                         (write_mask & XL24_GLOBAL_MASK) == XL24_GLOBAL_MASK &&
-                        !(state->clip_mode & 0x1f) && !(state->step_z & 1) &&
+                        !(state->clip_mode & 0x1f) &&
+                        (((state->clip_mode >> 9) & 0xf) == 0xf) &&
+                        !(state->step_z & 1) &&
                         stop_on_x && stop_on_y &&
                         state->x_save == x_start &&
                         (x_end - x_start) * x_step >= 0 &&
@@ -1349,6 +2190,19 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
                     }
                 }
             }
+            if (sgi_pl_enabled()) {
+                static int sgi_pl_op3logged;
+                int _bw = abs(x_end - x_start) + 1;
+                int _bh = abs(y_end - y_start) + 1;
+
+                if (sgi_pl_op3logged < 2000 && _bw * _bh <= 4000) {
+                    sgi_pl_op3logged++;
+                    fprintf(stderr, "OP3SMALL m0=%08x m1=%08x "
+                            "bbox=(%d,%d)-(%d,%d) fast=1\n",
+                            mode0, state->draw_mode1,
+                            x_start, y_start, x_end, y_end);
+                }
+            }
             sgi_gio64_write_x_start(state, state->x_save << 11);
             sgi_gio64_write_y_start(state, (y_end + y_step) << 11);
             return;
@@ -1356,7 +2210,9 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
         do {
             do {
                 int src_x = start_x + win_x;
-                int src_y = start_y + win_y;
+                int src_y = ((state->draw_mode1 >> 6) & 1) ?
+                            (int)state->y_window - start_y - 0x1000 :
+                            start_y + win_y;
                 uint32_t src = 0;
 
                 if (copy && src_x >= sx0 && src_x <= sx1 &&
@@ -1377,6 +2233,19 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
                 break;
             }
         } while (start_y != end_y && stop_on_y);
+        if (sgi_pl_enabled()) {
+            static int sgi_pl_op3slogged;
+            int _bw = abs(x_end - x_start) + 1;
+            int _bh = abs(y_end - y_start) + 1;
+
+            if (sgi_pl_op3slogged < 2000 && _bw * _bh <= 4000) {
+                sgi_pl_op3slogged++;
+                fprintf(stderr, "OP3SMALL m0=%08x m1=%08x "
+                        "bbox=(%d,%d)-(%d,%d) fast=0\n",
+                        mode0, state->draw_mode1,
+                        x_start, y_start, x_end, y_end);
+            }
+        }
         /* Snapshot lives in the reusable scratch buffer. */
         sgi_gio64_write_x_start(state, start_x << 11);
         sgi_gio64_write_y_start(state, start_y << 11);
@@ -1394,7 +2263,7 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
         return;
     }
     if (mode0 & (1U << 18)) {
-        color = sgi_gio64_shaded_color(state);
+        color = sgi_gio64_shaded_color(state, x_start, y_start);
     }
 
     /* Address modes 5-7 are unimplemented in MAME too; log and skip so any
@@ -1424,6 +2293,12 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
         if (iterate_one) {
             if (mode0 & (1U << 6)) {
                 color = sgi_gio64_host_color(state);
+            } else if ((mode0 & (1U << 18)) ||
+                       ((state->draw_mode1 >> 15) & 1)) {
+                /* MAME do_iline/do_fline: shaded or RGB lines use the
+                 * assembled DDA color, not the (possibly stale)
+                 * color_i. No iteration without SHADE. */
+                color = sgi_gio64_shaded_color(state, x, y);
             }
             unsigned coverage = 255;
             if (address_mode == 4) {
@@ -1432,8 +2307,23 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
                            127 / MAX(span, 1);
                 coverage = MIN(coverage, 255U);
             }
-            sgi_gio64_put_pixel(state, vram, aux, x, y, color, write_mask,
-                                coverage);
+            /* Lines test patterns like every other primitive (iris pixel
+             * path; LSPATTERN is "used mainly for lines"). */
+            bool use_bg = false;
+            if (sgi_gio64_pattern_pass(state, mode0, &use_bg)) {
+                unsigned alpha = (mode0 & (1U << 6)) &&
+                                 (mode0 & (1U << 7)) ?
+                                 (color >> 24) & 0xff :
+                                 sgi_gio64_clamp_color(
+                                     state->curr_color_alpha);
+
+                if (sgi_gio64_afunc(state, alpha)) {
+                    sgi_gio64_put_pixel(state, vram, aux, x, y,
+                                        use_bg ? state->color_back : color,
+                                        write_mask, coverage);
+                }
+            }
+            sgi_gio64_pattern_advance(state, mode0);
             /* Single stepped pixel plus its endpoint (MAME steps once). */
             sgi_gio64_damage_rect(state, MIN(x, (int)x_end),
                                   MIN(y, (int)y_end),
@@ -1468,21 +2358,41 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
             if ((!skip_first || point != 0) && (!last || !skip_last)) {
                 if (mode0 & (1U << 6)) {
                     color = sgi_gio64_host_color(state);
+                } else if ((mode0 & (1U << 18)) ||
+                           ((state->draw_mode1 >> 15) & 1)) {
+                    /* MAME do_iline/do_fline: shaded or RGB lines use
+                     * the assembled DDA color. Iteration below only
+                     * runs with SHADE set. */
+                    color = sgi_gio64_shaded_color(state, x, y);
                 }
                 unsigned coverage = 255;
+                bool use_bg = false;
                 if (address_mode == 4) {
                     int span = MAX(dx, -dy) + 1;
                     coverage = 128 + (unsigned)(abs(error) % MAX(span, 1)) *
                                127 / MAX(span, 1);
                     coverage = MIN(coverage, 255U);
                 }
-                sgi_gio64_put_pixel(state, vram, aux, x, y, color, write_mask,
-                                    coverage);
+                if (sgi_gio64_pattern_pass(state, mode0, &use_bg)) {
+                    unsigned alpha = (mode0 & (1U << 6)) &&
+                                     (mode0 & (1U << 7)) ?
+                                     (color >> 24) & 0xff :
+                                     sgi_gio64_clamp_color(
+                                         state->curr_color_alpha);
+
+                    if (sgi_gio64_afunc(state, alpha)) {
+                        sgi_gio64_put_pixel(state, vram, aux, x, y,
+                                            use_bg ? state->color_back :
+                                            color,
+                                            write_mask, coverage);
+                    }
+                }
                 if (mode0 & (1U << 18)) {
                     sgi_gio64_iterate_shade(state);
-                    color = sgi_gio64_shaded_color(state);
+                    color = sgi_gio64_shaded_color(state, x, y);
                 }
             }
+            sgi_gio64_pattern_advance(state, mode0);
             if (last) {
                 break;
             }
@@ -1512,14 +2422,20 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
 
     int x_step = (state->bres_octant_inc1 >> 25) & 1 ? -1 : 1;
     int y_step = (state->bres_octant_inc1 >> 24) & 1 ? -1 : 1;
+    /* Iris: YSTRIDE (mode0 bit23) steps rows by 2 for block fills. */
+    if ((mode0 >> 23) & 1) {
+        y_step *= 2;
+    }
     /* Default color (MAME get_default_color): fast-clear sources the VRAM
      * color, with plane-depth replication. Kept whole (not truncated):
-     * 24-bit fills need all three bytes. */
-    uint32_t base = ((state->draw_mode1 >> 17) & 1) ? state->color_vram :
-                    state->color_i;
+     * 24-bit fills need all three bytes. FASTCLEAR honored only with CID
+     * checking off and non-host source (iris + rex3.pdf 3.5.5). */
+    bool cid_off = ((state->clip_mode >> 9) & 0xf) == 0xf;
+    bool fastclear = ((state->draw_mode1 >> 17) & 1) && cid_off &&
+                     !((mode0 >> 6) & 1);
+    uint32_t base = fastclear ? state->color_vram : state->color_i;
     bool shade = (mode0 >> 18) & 1;
     bool rgbmode = (state->draw_mode1 >> 15) & 1;
-    bool fastclear = (state->draw_mode1 >> 17) & 1;
     /* Iteration cap: guarantees termination even if a stale octant points
      * away from the end (MAME shares the bare shape; iris bounds its
      * walkers). Generous enough to never trigger on legitimate fills. */
@@ -1547,6 +2463,16 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
         break;
     }
 
+    if (opcode == 2 && (mode0 & 0x40) && sgi_cmdt_enabled() && x_start == 0 &&
+        y_start < 600 && sgi_cmdt_n < 1000) {
+        fprintf(stderr, "CMDT-E n=%llu x=%d y=%d xe=%d ye=%d xs=%d m1=%08x "
+                "hl=%d hs=%d st=%d pd=%u dp=%016llx wx=%d wy=%d\n",
+                (unsigned long long)sgi_cmdt_n++, x_start, y_start, x_end,
+                y_end, (int)state->x_save, state->draw_mode1, state->host_len,
+                state->host_shift, state->host_staged, state->plane_depth,
+                (unsigned long long)state->host_dataport,
+                (int)state->x_window - 0x1000, (int)state->y_window - 0x1000);
+    }
     /*
      * Block/span fill (MAME Draw/Block case): inclusive end extended by one
      * step, rows restart from x_save, loops gated by stop_on_x/stop_on_y.
@@ -1558,19 +2484,28 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
     bool stop_on_y = (mode0 >> 9) & 1;
     int prim_end_x = x_end + x_step;
 
+    /* Iris: length32 clamps spans >= 32 wide, symmetric in direction
+     * (MAME's block check lacks abs and is one-sided). */
     if ((mode0 >> 15) & 1) {
-        if ((x_end - x_start) * x_step >= 32) {
+        if (abs(x_end - x_start) >= 32) {
             prim_end_x = x_start + 32 * x_step;
         }
     }
-    /* Packed host blits consume one dataport per command, so the row must
-     * stop after that many pixels even when stop_on_x is clear. */
-    /* MAME newport.cpp:3358-3366,3430-3438 */
-    if (((mode0 >> 6) & 1) && ((state->draw_mode1 >> 7) & 1)) {
+    /* Packed host blits consume whole dataports: a loud PIO write is one
+     * word, a batched run is host_len words, so the row must stop after
+     * that many pixels even when stop_on_x is clear. Bounding by the run
+     * (not the corner bbox) is what keeps a batched GO from re-drawing the
+     * rest of the row from the stale last word. */
+    /* MAME newport.cpp:3358-3366,3430-3438; iris rex3_generic.rs:1484-1488 */
+    bool host_packed = (mode0 & (1U << 6)) && ((state->draw_mode1 >> 7) & 1);
+
+    if (host_packed) {
         static const int16_t max_host_lengths[2][4] =
             { { 4, 4, 2, 1 }, { 8, 8, 4, 2 } };
-        int max_length = max_host_lengths[(state->draw_mode1 >> 10) & 1]
-                                          [(state->draw_mode1 >> 8) & 3];
+        int per_word = max_host_lengths[(state->draw_mode1 >> 10) & 1]
+                                       [(state->draw_mode1 >> 8) & 3];
+        int words = state->host_len > 1 ? (int)state->host_len : 1;
+        int max_length = per_word * words;
         int length = abs(prim_end_x - x_start);
 
         stop_on_x = true;
@@ -1582,11 +2517,20 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
     if (((mode0 >> 19) & 1) && x_step < 0) {
         return;
     }
-    /* Fills stay inside the corner bbox (rows restart at x_save). */
-    sgi_gio64_damage_rect(state, MIN(MIN(x_start, x_end), (int)state->x_save),
-                          MIN(y_start, y_end),
-                          MAX(MAX(x_start, x_end), (int)state->x_save),
-                          MAX(y_start, y_end));
+    /* Fills stay inside the corner bbox (rows restart at x_save). A host
+     * blit only touches the clamped transfer span, so bound its damage to
+     * that instead of the (often full-screen) bbox. */
+    if (((mode0 >> 6) & 1) && ((state->draw_mode1 >> 7) & 1)) {
+        sgi_gio64_damage_rect(state, MIN(x_start, prim_end_x),
+                              MIN(y_start, y_end),
+                              MAX(x_start, prim_end_x), MAX(y_start, y_end));
+    } else {
+        sgi_gio64_damage_rect(state,
+                              MIN(MIN(x_start, x_end), (int)state->x_save),
+                              MIN(y_start, y_end),
+                              MAX(MAX(x_start, x_end), (int)state->x_save),
+                              MAX(y_start, y_end));
+    }
     /* Inclusive end, extended by one step like MAME. */
     x_end += x_step;
     y_end += y_step;
@@ -1602,8 +2546,10 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
     if (((state->draw_mode1 >> 28) & 0xf) == 3 &&
         !(state->draw_mode1 & (1U << 18)) &&
         !(mode0 & ((1U << 18) | (1U << 6))) &&
-        pattern == 0xffffffffU &&
-        !(state->clip_mode & 0x1f) && !(state->step_z & 1) &&
+        !(mode0 & ((1U << 12) | (1U << 13))) &&
+        !(state->clip_mode & 0x1f) && cid_off && !(state->step_z & 1) &&
+        ((state->draw_mode1 >> 12) & 7) == 7 &&
+        !((state->draw_mode1 >> 16) & 1) &&
         state->x_save == x_start && stop_on_x &&
         !((mode0 >> 15) & 1) &&
         (state->draw_mode1 & 7) <= 6) {
@@ -1634,7 +2580,7 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
         if (((state->draw_mode1 >> 17) & 1)) {
             fcol = base;
         } else if ((state->draw_mode1 >> 15) & 1) {
-            fcol = sgi_gio64_shaded_color(state);
+            fcol = sgi_gio64_shaded_color(state, x_start, y_start);
             if (state->plane_depth != 3) {
                 fcol = sgi_gio64_expand_pixel(state, fcol);
             }
@@ -1677,9 +2623,30 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
                             dst[i] = (d & ~fmask) | (fcol & fmask);
                         }
                     }
+                    if (sgi_rowmap_enabled()) {
+                        sgi_row_note(state->draw_mode0, cx0, dy, dst[0], row_w);
+                    }
+                    if (sgi_pl_enabled()) {
+                        sgi_pl_stores += (uint64_t)row_w;
+                        if (!sgi_pl_actvalid) {
+                            sgi_pl_actx0 = cx0; sgi_pl_actx1 = cx1;
+                            sgi_pl_acty0 = sgi_pl_acty1 = dy;
+                            sgi_pl_actvalid = true;
+                        } else {
+                            if (cx0 < sgi_pl_actx0) sgi_pl_actx0 = cx0;
+                            if (cx1 > sgi_pl_actx1) sgi_pl_actx1 = cx1;
+                            if (dy < sgi_pl_acty0) sgi_pl_acty0 = dy;
+                            if (dy > sgi_pl_acty1) sgi_pl_acty1 = dy;
+                        }
+                    }
                 }
                 fy += address_mode == 1 ? y_step : 0;
             } while (fy != y_end && stop_on_y && address_mode == 1);
+            if (sgi_fs_enabled()) {
+                sgi_fs_fast++;
+                sgi_fs_fastpx += (uint64_t)(rx1 - rx0 + 1) *
+                                 (uint64_t)(ry1 - ry0 + 1);
+            }
             /* End state matches the slow loop (x restarted to x_save). */
             sgi_gio64_write_x_start(state, state->x_save << 11);
             sgi_gio64_write_y_start(state, fy << 11);
@@ -1688,37 +2655,61 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
         }
     }
 
+    if (sgi_pl_enabled() && opcode == 2 && ((mode0 >> 12) & 1) &&
+        sgi_pl_looplogged < 5000) {
+        sgi_pl_looplogged++;
+        fprintf(stderr, "LOOP xs=%d xe=%d ys=%d ye=%d xstep=%d ystep=%d "
+                "stopx=%d stopy=%d pe=%d pat=%08x xsave=%d\n",
+                x_start, x_end, y_start, y_end, x_step, y_step,
+                stop_on_x ? 1 : 0, stop_on_y ? 1 : 0, prim_end_x,
+                pattern, (int)state->x_save);
+    }
     int x = x_start;
     int y = y_start;
-    /* MAME restores the shade DDA from the entry colors after each row so
-     * gradients restart instead of continuing across rows. */
-    int32_t row_red = state->curr_color_red;
-    int32_t row_green = state->curr_color_green;
-    int32_t row_blue = state->curr_color_blue;
-    int32_t row_alpha = state->curr_color_alpha;
-    /* do-while over rows like MAME; the single-pixel stop_on_x-clear case
-     * draws once and stops instead of spinning. */
+    /* Iris draw_block_g: the shade DDA runs continuously across rows
+     * (no per-row base reload); block rows restart the pattern cursors
+     * at bit 31 while lsrcount continues. Span continues the stream. */
     do {
-        /* Block mode restarts the stipple bit per row; Span advances it. */
         if (address_mode == 1) {
-            pattern_bit = 31;
+            state->pat_bit = 31;
+            state->zpat_bit = 31;
         }
-        state->curr_color_red = row_red;
-        state->curr_color_green = row_green;
-        state->curr_color_blue = row_blue;
-        state->curr_color_alpha = row_alpha;
         do {
-            if (x >= 0 && x < XL24_STRIDE) {
-                if (!(pattern & (1U << pattern_bit))) {
-                    if (mode0 & (3U << 16)) {
+            /* No draw-coords range guard (MAME/iris call the pixel body
+             * unconditionally): x is pre-window, so a nonzero window
+             * offset makes on-screen pixels look out of range and drops
+             * them. put_pixel clips the physical coords itself. */
+            if (sgi_fs_enabled()) {
+                if (mode0 & (1U << 6)) {
+                    sgi_fs_hostpx++;
+                } else {
+                    sgi_fs_slowpx++;
+                }
+            }
+            bool use_bg;
+
+            if (sgi_gio64_pattern_pass(state, mode0, &use_bg)) {
+                if (use_bg) {
+                    if (sgi_gio64_afunc(state,
+                                        (state->color_back >> 24) & 0xff)) {
                         sgi_gio64_put_pixel(state, vram, aux, x, y,
                                             state->color_back, write_mask,
                                             255);
                     }
                 } else if (mode0 & (1U << 6)) {
+                    /* Host pixel consumed on pattern-pass exactly like
+                     * MAME/iris (keeps the FIFO in sync even when the
+                     * compare below rejects). */
                     color = sgi_gio64_host_color(state);
-                    sgi_gio64_put_pixel(state, vram, aux, x, y, color, write_mask,
-                                        255);
+                    unsigned alpha = (mode0 & (1U << 7)) ?
+                                     (color >> 24) & 0xff :
+                                     sgi_gio64_clamp_color(
+                                         state->curr_color_alpha);
+
+                    if (sgi_gio64_afunc(state, alpha)) {
+                        sgi_gio64_put_pixel(state, vram, aux, x, y, color,
+                                            write_mask, 255);
+                    }
                 } else {
                     uint32_t c = base;
 
@@ -1726,13 +2717,16 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
                         if (shade) {
                             sgi_gio64_iterate_shade(state);
                         }
-                        c = sgi_gio64_shaded_color(state);
+                        c = sgi_gio64_shaded_color(state, x, y);
                     }
-                    sgi_gio64_put_pixel(state, vram, aux, x, y, c, write_mask,
-                                        255);
+                    if (sgi_gio64_afunc(state, sgi_gio64_clamp_color(
+                                                state->curr_color_alpha))) {
+                        sgi_gio64_put_pixel(state, vram, aux, x, y, c,
+                                            write_mask, 255);
+                    }
                 }
             }
-            pattern_bit = (pattern_bit - 1) & 31;
+            sgi_gio64_pattern_advance(state, mode0);
             x += x_step;
             if (--iter_budget == 0) {
                 qemu_log_mask(LOG_UNIMP, "sgi-gio64: span/block budget "
@@ -1753,6 +2747,13 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
             }
         } while (x != prim_end_x && x != x_end && stop_on_x);
         if ((x_step > 0 && x >= x_end) || (x_step < 0 && x <= x_end)) {
+            /* A row boundary is a forced word boundary: drop any pixels
+             * left in the current word so the next row starts fresh (iris
+             * rex3_generic.rs:1459-1471). */
+            if (((mode0 >> 6) & 1) && ((state->draw_mode1 >> 7) & 1) &&
+                state->host_shift != sgi_gio64_host_initial_shift(state)) {
+                state->host_shift = sgi_gio64_host_initial_shift(state);
+            }
             x = state->x_save;
             y += address_mode == 1 ? y_step : 0;
         } else if (!stop_on_x) {
@@ -1762,6 +2763,53 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
             break;
         }
     } while (y != y_end && stop_on_y && address_mode == 1);
+    if (sgi_pl_enabled()) {
+        uint64_t st = sgi_pl_stores;
+        int wx = (int)state->x_window - 0x1000;
+        int wy = (int)state->y_window - 0x1000;
+        int ix0 = x_start + wx, ix1 = x_end + wx;
+        int iy0 = y_start + wy, iy1 = y_end + wy;
+        int nx0 = ix0 < ix1 ? ix0 : ix1, nx1 = ix0 < ix1 ? ix1 : ix0;
+        int ny0 = iy0 < iy1 ? iy0 : iy1, ny1 = iy0 < iy1 ? iy1 : iy0;
+
+        /* st is since boot; compare vs snapshot at command top. */
+        uint64_t cst = st - sgi_pl_cmd_s0;
+
+        /* Sampled (every 256th): identical drops repeat by the
+         * thousand; counting stays exact, printing stays small. */
+        static uint64_t synczero_ctr;
+        if (cst == 0 && ((synczero_ctr++ & 255) == 0)) {
+            fprintf(stderr, "SYNCZERO m0=%08x bbox=(%d,%d)-(%d,%d) pat=%08x "
+                    "clip=%04x stepz=%08x sm0=%08x/%08x sm1=%08x/%08x\n",
+                    mode0, nx0, ny0, nx1, ny1, pattern,
+                    state->clip_mode & 0x1fff, state->step_z,
+                    state->screenmask_x[0], state->screenmask_y[0],
+                    state->screenmask_x[1], state->screenmask_y[1]);
+        } else if (sgi_pl_actvalid &&
+                   (sgi_pl_actx1 < nx0 || sgi_pl_actx0 > nx1 ||
+                    sgi_pl_acty1 < ny0 || sgi_pl_acty0 > ny1)) {
+            fprintf(stderr, "SYNCMIS m0=%08x want=(%d,%d)-(%d,%d) "
+                    "got=(%d,%d)-(%d,%d) pat=%08x\n",
+                    mode0, nx0, ny0, nx1, ny1,
+                    sgi_pl_actx0, sgi_pl_acty0, sgi_pl_actx1, sgi_pl_acty1,
+                    pattern);
+        } else if (cst > 0 && cst <= 2000 &&
+                   (nx1 - nx0 + 1) * (ny1 - ny0 + 1) <= 4000) {
+            static int sgi_pl_oklogged;
+
+            if (sgi_pl_oklogged < 2000) {
+                sgi_pl_oklogged++;
+                fprintf(stderr, "SMALLOK op=2 m0=%08x m1=%08x "
+                        "bbox=(%d,%d)-(%d,%d) stores=%llu\n",
+                        mode0, state->draw_mode1, nx0, ny0, nx1, ny1,
+                        (unsigned long long)cst);
+            }
+        }
+    }
+    if (opcode == 2 && (mode0 & 0x40) && sgi_cmdt_enabled()) {
+        fprintf(stderr, "CMDT-X x=%d y=%d xs=%d hs=%d\n", x, y,
+                (int)state->x_save, state->host_shift);
+    }
     sgi_gio64_write_x_start(state, x << 11);
     sgi_gio64_write_y_start(state, y << 11);
     sgi_gio64_fb_dirty(state, (state->draw_mode1 & 7) >= 4 &&
@@ -1770,6 +2818,69 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
                        MIN(y_start, y_end),
                        MAX(MAX(x_start, x_end), (int)state->x_save),
                        MAX(y_start, y_end));
+}
+
+/*
+ * Surface-draw worker. Surface fills and blits (DRAW with BLOCK or SPAN
+ * address mode, no COLORHOST) run on this thread, one job at a time. Every
+ * device entry point (REX3 register read/write, scanout, reset) first calls
+ * sgi_gio64_gfx_sync, so the vCPU never observes or changes REX3 state while
+ * a job is running. Pixel and host-data operations stay synchronous.
+ * SGI_GFX_SYNC=1 disables the worker for A/B comparison.
+ */
+static bool sgi_gfx_threaded;
+
+static void sgi_gio64_gfx_sync(SGIGIO64State *s)
+{
+    qemu_mutex_lock(&s->gfx_mtx);
+    while (s->gfx_busy || s->gfx_pending) {
+        qemu_cond_wait(&s->gfx_cond_idle, &s->gfx_mtx);
+    }
+    qemu_mutex_unlock(&s->gfx_mtx);
+}
+
+static void *sgi_gio64_gfx_worker(void *opaque)
+{
+    SGIGIO64State *s = opaque;
+
+    qemu_mutex_lock(&s->gfx_mtx);
+    for (;;) {
+        while (!s->gfx_pending) {
+            qemu_cond_wait(&s->gfx_cond_work, &s->gfx_mtx);
+        }
+        s->gfx_pending = false;
+        s->gfx_busy = true;
+        qemu_mutex_unlock(&s->gfx_mtx);
+
+        sgi_gio64_rex3_command(s);
+
+        qemu_mutex_lock(&s->gfx_mtx);
+        s->gfx_busy = false;
+        qemu_cond_broadcast(&s->gfx_cond_idle);
+    }
+    return NULL;
+}
+
+/* Called after a REX3 register write with GO set. */
+static void sgi_gio64_go(SGIGIO64State *s)
+{
+    uint32_t mode0 = s->draw_mode0;
+    uint32_t adrmode = (mode0 >> 2) & 7;
+    bool surface = (mode0 & 3) == 2 && (adrmode == 0 || adrmode == 1) &&
+                   !(mode0 & (1u << 6));
+
+    if (!sgi_gfx_threaded || !surface) {
+        sgi_gio64_gfx_sync(s);
+        sgi_gio64_rex3_command(s);
+        return;
+    }
+    qemu_mutex_lock(&s->gfx_mtx);
+    while (s->gfx_busy || s->gfx_pending) {
+        qemu_cond_wait(&s->gfx_cond_idle, &s->gfx_mtx);
+    }
+    s->gfx_pending = true;
+    qemu_cond_signal(&s->gfx_cond_work);
+    qemu_mutex_unlock(&s->gfx_mtx);
 }
 
 static uint64_t sgi_gio64_xl24_read_reg(void *opaque, hwaddr addr,
@@ -1854,6 +2965,9 @@ static uint64_t sgi_gio64_xl24_read_reg(void *opaque, hwaddr addr,
                (high_word ? state->write_mask : state->draw_color);
     case 0x0230:
         /* Size-4 reads get the addressed half, not the whole register. */
+        if (sgi_fs_enabled()) {
+            sgi_rd_host++;
+        }
         return size == 8 ? state->host_dataport :
                (high_word ? (uint32_t)(state->host_dataport >> 32) :
                 (uint32_t)state->host_dataport);
@@ -1861,6 +2975,9 @@ static uint64_t sgi_gio64_xl24_read_reg(void *opaque, hwaddr addr,
         return size == 8 ? (uint64_t)state->dcb_mode << 32 :
                (high_word ? state->dcb_mode : 0);
     case 0x0240:
+        if (sgi_fs_enabled()) {
+            sgi_rd_dcb++;
+        }
         if (high_word) {
             uint64_t ret = 0;
 
@@ -1978,6 +3095,13 @@ static uint64_t sgi_gio64_xl24_read_reg(void *opaque, hwaddr addr,
     {
         uint32_t status = state->rex3_status;
 
+        if (sgi_fs_enabled()) {
+            if (size == 8 || high_word) {
+                sgi_rd_status++;
+            } else {
+                sgi_rd_user++;
+            }
+        }
         if (size == 8) {
             state->rex3_status &= ~REX3_STATUS_VRINT;
             qemu_set_irq(state->gio_irq[2], 0);
@@ -2050,6 +3174,7 @@ static uint64_t sgi_gio64_xl24_read_reg(void *opaque, hwaddr addr,
 
 static uint64_t sgi_gio64_xl24_read(void *opaque, hwaddr addr, unsigned size)
 {
+    sgi_gio64_gfx_sync(opaque);
     uint64_t value = sgi_gio64_xl24_read_reg(opaque, addr, size);
 
     if (sgi_gio_trace_enabled() && sgi_gio_trace_wanted(addr)) {
@@ -2057,7 +3182,7 @@ static uint64_t sgi_gio64_xl24_read(void *opaque, hwaddr addr, unsigned size)
                 (unsigned)addr, size, (unsigned long long)value);
     }
     if (addr & 0x800) {
-        sgi_gio64_rex3_command(opaque);
+        sgi_gio64_go(opaque);
     }
     return value;
 }
@@ -2065,8 +3190,42 @@ static uint64_t sgi_gio64_xl24_read(void *opaque, hwaddr addr, unsigned size)
 static void sgi_gio64_xl24_write(void *opaque, hwaddr addr,
                                  uint64_t value, unsigned size)
 {
+    sgi_gio64_gfx_sync(opaque);
     SGIGIO64State *state = opaque;
     hwaddr reg = addr & ~7ULL;
+
+    if (sgi_seq_enabled()) {
+        hwaddr creg = addr & ~0x800ULL;
+
+        if (creg < 0x1000 && (reg & 0x7ff) != 0x230) {
+            fprintf(stderr, "SWR n=%llu off=%05x val=%016llx size=%u go=%u\n",
+                    (unsigned long long)sgi_seq_n, (unsigned)addr,
+                    (unsigned long long)value, (unsigned)size,
+                    (unsigned)((addr & 0x800) != 0));
+        } else if (reg >= 0x1300 && reg <= 0x1340) {
+            /* SWR is gated to <0x1000, hiding SMASK1-4 / CLIPMODE /
+             * CONFIG / DCBRESET writes. Log them explicitly. */
+            fprintf(stderr, "SMW off=%05x val=%016llx size=%u go=%u\n",
+                    (unsigned)addr, (unsigned long long)value, (unsigned)size,
+                    (unsigned)((addr & 0x800) != 0));
+        }
+    }
+
+    /* TEMP: prove whether sub-word (8/16-bit) REX3 writes occur. The
+     * half-word helpers clobber sibling bits on sub-word stores; if the
+     * guest never uses size<4, decode is safe. Capped; PRIMLOG-gated. */
+    if (sgi_pl_enabled() && size < 4) {
+        static unsigned sgi_pl_subw;
+
+        if (sgi_pl_subw < 40) {
+            sgi_pl_subw++;
+            fprintf(stderr, "SUBWORD W off=%05x sz=%u val=%llx "
+                    "slave=%u regsel=%u mask=%08x\n",
+                    (unsigned)addr, size, (unsigned long long)value,
+                    state->dcb_slave_select, state->dcb_reg_select,
+                    state->dcb_mask);
+        }
+    }
 
     /* Draw-state setup is invisible until a command runs (the go-bit
      * command marks its own damage rect below); only scanout-config or
@@ -2341,14 +3500,30 @@ static void sgi_gio64_xl24_write(void *opaque, hwaddr addr,
         break;
     }
     case 0x0230: {
+        if (sgi_fs_enabled()) {
+            sgi_fs_hostwrites++;
+        }
         if (size == 8) {
             state->host_dataport = value;
+            /* Whole qwords stage for the next GO's batched transfer; the
+             * 32-bit halves stay on the scalar fallback (iris rex3.rs:3210-
+             * 3231 arms a single word for those). */
+            sgi_gio64_host_stage(state, value);
         } else if (addr & 4) {
             state->host_dataport =
                 (state->host_dataport & 0xffffffff00000000ULL) | value;
         } else {
             state->host_dataport =
                 (state->host_dataport & 0xffffffffULL) | (value << 32);
+        }
+        /* Iris hostrw_arm_single: every HOSTRW write, including 32-bit
+         * halves, arms a one-word transfer (host_len == 1 at GO).
+         * Overwrite slot 0 (never append) so high/low half pairs resolve
+         * to the assembled word; leave an in-flight multi-word batch
+         * alone. */
+        if (state->host_staged <= 1) {
+            state->host_words[0] = state->host_dataport;
+            state->host_staged = 1;
         }
         /* MAME: host_shift restarts at 64 - s_host_shifts[hostdepth]. */
         state->host_shift = 64 - sgi_gio64_host_shift(state->host_depth);
@@ -2422,10 +3597,17 @@ static void sgi_gio64_xl24_write(void *opaque, hwaddr addr,
         bool do_low = size == 8 || (addr & 4);
 
         if (do_high) {
+            /* LSSAVE restores working LSPATTERN/LSRCOUNT from the saved
+             * set (LSRCNTSAVE lives in LSMODE bits 23:16). */
             state->line_stipple_pattern = state->ls_pattern_saved;
+            state->ls_mode = (state->ls_mode & ~0xffu) |
+                             ((state->ls_mode >> 16) & 0xffu);
         }
         if (do_low) {
+            /* LSRESTORE saves working LSPATTERN/LSRCOUNT. */
             state->ls_pattern_saved = state->line_stipple_pattern;
+            state->ls_mode = (state->ls_mode & ~(0xffu << 16)) |
+                             ((state->ls_mode & 0xffu) << 16);
         }
         break;
     }
@@ -2691,6 +3873,33 @@ static void sgi_gio64_xl24_write(void *opaque, hwaddr addr,
                     state->xmap_mode[head][
                         (state->dcb_data_msw >> 24) & 31] =
                         state->dcb_data_msw & 0xffffff;
+                    if (sgi_modlog_enabled()) {
+                        fprintf(stderr, "XMAPMODE h=%u idx=%u val=%06x\n",
+                                head, (state->dcb_data_msw >> 24) & 31,
+                                state->dcb_data_msw & 0xffffff);
+                        /* Visual change: re-arm the DID dump so the next
+                         * frame captures the live map, not boot zeros. */
+                        sgi_modlog_dumped = false;
+                        /* One-shot: the first RGB-visual entry write
+                         * (Ideas viewport, da09xx -- boot writes
+                         * defaults which must NOT arm) re-arms the
+                         * segment map so the next frame captures live
+                         * segments instead of boot rows. Later swaps
+                         * must not reset it. Same for the zero-store
+                         * log (its cap would otherwise fill early). */
+                        {
+                            unsigned idx =
+                                (state->dcb_data_msw >> 24) & 31;
+                            uint32_t v = state->dcb_data_msw & 0xffffff;
+                            if ((idx == 12 || idx == 13) &&
+                                (v & 0xffff00) == 0xda0900 &&
+                                !sgi_modlog_seg_armed) {
+                                sgi_modlog_seg_armed = true;
+                                sgi_modlog_seg_n = 0;
+                                sgi_pl_zerologged = 0;
+                            }
+                        }
+                    }
                     sgi_gio64_damage_full(state);
                     break;
                 case 7:
@@ -2807,29 +4016,124 @@ static void sgi_gio64_xl24_write(void *opaque, hwaddr addr,
     }
 
     if (addr & 0x800) {
-        sgi_gio64_rex3_command(state);
+        sgi_gio64_go(state);
     }
 
 }
 
+/*
+ * 8-byte accesses. The VDMA engine writes one qword per HOSTRW GO (iris
+ * dma_write64_bulk); the memory core must not split it into two 32-bit
+ * writes, since each half would run its own GO. Only the HOSTRW port takes
+ * the whole qword; every other register keeps the 32-bit split (high word
+ * first) it always had.
+ */
+static bool sgi_gio64_is_hostrw_port(hwaddr addr)
+{
+    return ((addr & 0x1fff) & ~0x800u) == 0x230;
+}
+
+static uint64_t sgi_gio64_xl24_read_wrap(void *opaque, hwaddr addr,
+                                         unsigned size)
+{
+    if (size == 8) {
+        uint64_t hi = sgi_gio64_xl24_read(opaque, addr, 4);
+        uint64_t lo = sgi_gio64_xl24_read(opaque, addr + 4, 4);
+
+        return (hi << 32) | (lo & 0xffffffffu);
+    }
+    return sgi_gio64_xl24_read(opaque, addr, size);
+}
+
+static void sgi_gio64_xl24_write_wrap(void *opaque, hwaddr addr,
+                                      uint64_t value, unsigned size)
+{
+    if (size == 8 && !sgi_gio64_is_hostrw_port(addr)) {
+        sgi_gio64_xl24_write(opaque, addr, value >> 32, 4);
+        sgi_gio64_xl24_write(opaque, addr + 4, value & 0xffffffffu, 4);
+        return;
+    }
+    sgi_gio64_xl24_write(opaque, addr, value, size);
+}
+
 static const MemoryRegionOps sgi_gio64_xl24_ops = {
-    .read = sgi_gio64_xl24_read,
-    .write = sgi_gio64_xl24_write,
+    .read = sgi_gio64_xl24_read_wrap,
+    .write = sgi_gio64_xl24_write_wrap,
     .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 8,
+    },
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 8,
+    },
 };
 
 /* Open-bus response for undecoded GIO offsets (empty EXP slots, reserved
  * GFX ranges). Reads return all-1s so PROM polling terminates, matching
  * unwired MAME address space; writes are ignored. */
+/* TEMP VRAM change tracker (env SGI_GIO_VRAMHASH=1). FNV-hashes VRAM+aux
+ * at most every 2s and logs on change, distinguishing overdrawn-white
+ * (hash shows content then reverts to white) from never-issued (hash never
+ * shows content). Capped; default off. */
+static int sgi_gio_vramhash_on = -1;
+static uint64_t sgi_gio_vramhash_last;
+static uint64_t sgi_gio_auxhash_last;
+static int64_t sgi_gio_vramhash_ms;
+static unsigned sgi_gio_vramhash_n;
+static bool sgi_gio_vramhash_enabled(void)
+{
+    if (sgi_gio_vramhash_on < 0) {
+        sgi_gio_vramhash_on = getenv("SGI_GIO_VRAMHASH") ? 1 : 0;
+    }
+    return sgi_gio_vramhash_on != 0;
+}
+
+static uint64_t sgi_gio_fnv(const uint32_t *p, size_t n)
+{
+    uint64_t h = 1469598103934665603ULL;
+    size_t i;
+
+    for (i = 0; i < n; i++) {
+        h ^= p[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+/* TEMP unmapped-window trace (env SGI_GIO_UNMAPPED=1). Logs GIO accesses
+ * outside the REX3 window (EXP0/EXP1/reserved GFX) so missing-path
+ * hypotheses are provable instead of silent. Capped; default off. */
+static int sgi_gio_unmapped_on = -1;
+static unsigned sgi_gio_unmapped_n;
+static bool sgi_gio_unmapped_enabled(void)
+{
+    if (sgi_gio_unmapped_on < 0) {
+        sgi_gio_unmapped_on = getenv("SGI_GIO_UNMAPPED") ? 1 : 0;
+    }
+    return sgi_gio_unmapped_on != 0;
+}
+
 static uint64_t sgi_gio64_unmapped_read(void *opaque, hwaddr addr,
                                         unsigned size)
 {
+    if (sgi_gio_unmapped_enabled() && sgi_gio_unmapped_n < 50) {
+        sgi_gio_unmapped_n++;
+        fprintf(stderr, "GIOUNMAP R off=%07x sz=%u\n",
+                (unsigned)addr, size);
+    }
     return size == 8 ? UINT64_MAX : (1ULL << (size * 8)) - 1;
 }
 
 static void sgi_gio64_unmapped_write(void *opaque, hwaddr addr,
                                      uint64_t value, unsigned size)
 {
+    if (sgi_gio_unmapped_enabled() && sgi_gio_unmapped_n < 50) {
+        sgi_gio_unmapped_n++;
+        fprintf(stderr, "GIOUNMAP W off=%07x sz=%u val=%016llx\n",
+                (unsigned)addr, size, (unsigned long long)value);
+    }
 }
 
 static const MemoryRegionOps sgi_gio64_unmapped_ops = {
@@ -2975,6 +4279,7 @@ static void sgi_gio64_decode_xmap(uint32_t table_entry, uint8_t *pix_mode,
 
 static bool sgi_gio64_update_display(void *opaque)
 {
+    sgi_gio64_gfx_sync(opaque);
     SGIGIO64State *state = opaque;
     DisplaySurface *surface = qemu_console_surface(state->console);
     uint32_t *pixels = surface_data(surface);
@@ -2993,6 +4298,9 @@ static bool sgi_gio64_update_display(void *opaque)
     uint16_t popup_msb =
         (uint16_t)(state->xmap_popup_cmap[0] & 0xff) << 5;
     bool is_8bpp = (state->xmap_config[0] >> 2) & 1;
+    /* XMAP config bit 0 (Pup_En, xmap9.pdf Table 3i): pop-up planes
+     * replace overlay/underlay for the whole screen when set; when
+     * clear the pup bits are ordinary aux bits. */
 
     if (surface_width(surface) != width || surface_height(surface) != height) {
         qemu_console_resize(state->console, width, height);
@@ -3000,6 +4308,33 @@ static bool sgi_gio64_update_display(void *opaque)
         pixels = surface_data(surface);
         /* Resized surface holds no valid pixels: repaint everything. */
         sgi_gio64_damage_full(state);
+    }
+    /* TEMP diagnostic: with SGI_GIO_FULLREFRESH=1, re-raster every frame so
+     * CPU-written VRAM becomes visible. */
+    if (sgi_gio_fullrefresh_enabled()) {
+        state->display_dirty = true;
+        state->dmg_full = true;
+    }
+    if (sgi_gio_vramhash_enabled()) {
+        int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+
+        if (now - sgi_gio_vramhash_ms > 2000) {
+            size_t n = (size_t)XL24_STRIDE * XL24_HEIGHT;
+            uint64_t vh = sgi_gio_fnv(vram, n);
+            uint64_t ah = sgi_gio_fnv(auxplane, n);
+
+            sgi_gio_vramhash_ms = now;
+            if (vh != sgi_gio_vramhash_last ||
+                ah != sgi_gio_auxhash_last) {
+                sgi_gio_vramhash_last = vh;
+                sgi_gio_auxhash_last = ah;
+                if (sgi_gio_vramhash_n < 100) {
+                    sgi_gio_vramhash_n++;
+                    fprintf(stderr, "VRAMHASH vram=%016llx aux=%016llx\n",
+                            (unsigned long long)vh, (unsigned long long)ah);
+                }
+            }
+        }
     }
     /* Nothing has touched the scanout since the last frame: the surface
      * still holds the last rendered image, so skip both the full-frame
@@ -3028,6 +4363,63 @@ static bool sgi_gio64_update_display(void *opaque)
      * byte, 12-bit the low 12 bits, 24-bit direct the low 24 bits as
      * 0x00BBGGRR. A second store holds the aux/CID plane (overlay/popup
      * bits, MAME m_cidaux), composited below. */
+    /* Fire every ~30s once the RGB visual exists (same arming as the
+     * segment map), so peeks stay fresh instead of going stale. */
+    {
+        int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+        static int64_t peek_last;
+        bool peek_due = sgi_vrampeek_enabled() && sgi_modlog_seg_armed &&
+                        (!sgi_vrampeek_done || now - peek_last >= 30000);
+
+        if (!peek_due) {
+            goto no_peek;
+        }
+        peek_last = now;
+        sgi_vrampeek_done = true;
+        size_t vw3 =
+            memory_region_size(&state->vram) / sizeof(uint32_t);
+        /* GL draw zone (67,56) and Ideas panel corner (700,650). */
+        for (int py = 56; py < 60; py++) {
+            for (int px = 64; px < 72; px++) {
+                size_t o = (size_t)py * XL24_STRIDE + px;
+                fprintf(stderr, "PEEK y=%d x=%d vram=%08x aux=%08x\n", py,
+                        px, o < vw3 ? state->vram_ptr[o] : 0xeeeeeeee,
+                        o < vw3 ? state->aux_ptr[o] : 0xeeeeeeee);
+            }
+        }
+        for (int py = 648; py < 652; py++) {
+            for (int px = 696; px < 704; px++) {
+                size_t o = (size_t)py * XL24_STRIDE + px;
+                fprintf(stderr, "PEEK y=%d x=%d vram=%08x aux=%08x\n", py,
+                        px, o < vw3 ? state->vram_ptr[o] : 0xeeeeeeee,
+                        o < vw3 ? state->aux_ptr[o] : 0xeeeeeeee);
+            }
+        }
+    no_peek:;
+    }
+    /* Bound the full-map dumps; swaps re-arm constantly. */
+    static unsigned sgi_modlog_ndump;
+    if (sgi_modlog_enabled() && !sgi_modlog_dumped &&
+        sgi_modlog_ndump < 4) {
+        sgi_modlog_ndump++;
+        sgi_modlog_dumped = true;
+        size_t vwords = memory_region_size(&state->vram) / sizeof(uint32_t);
+        fprintf(stderr, "DIDCFG cfg=%02x curcmap=%02x pupcmap=%02x\n",
+                state->xmap_config[0] & 0xff,
+                state->xmap_cursor_cmap[0] & 0xff,
+                state->xmap_popup_cmap[0] & 0xff);
+        for (int dy = 0; dy < height; dy += 8) {
+            uint16_t did = sgi_gio64_vc2_begin_did(state, dy);
+            uint32_t tbl = state->xmap_mode[0][did & 0x1f];
+            size_t o64 = (size_t)dy * XL24_STRIDE + 64;
+            uint32_t mv = o64 < vwords ? state->vram_ptr[o64] : 0;
+            uint32_t av = o64 < vwords ? state->aux_ptr[o64] : 0;
+            fprintf(stderr, "DIDROW y=%d did=%04x tbl=%06x pm=%d ps=%d aux=%d "
+                    "main=%08x auxw=%08x\n",
+                    dy, did, tbl & 0xffffff, (tbl >> 8) & 3,
+                    (tbl >> 10) & 3, (tbl >> 16) & 7, mv, av);
+        }
+    }
     for (y = 0; y < height; y++) {
         uint16_t did = sgi_gio64_vc2_begin_did(state, y);
         uint32_t table = state->xmap_mode[0][did & 0x1f];
@@ -3089,6 +4481,39 @@ static bool sgi_gio64_update_display(void *opaque)
                 table = state->xmap_mode[0][did & 0x1f];
                 sgi_gio64_decode_xmap(table, &pix_mode, &pix_size,
                                       &aux_mode, &aux_msb, &ci_msb);
+                /* TEMP segment probe (with MODELOG): log non-background
+                 * segments (GL viewports, windows) with DID, mode and
+                 * pixel words. Each row's first segment is the
+                 * background; skipping it keeps the cap for windows. */
+                {
+                    static int seg_row = -1;
+                    static bool seg_bg_done;
+                    bool log_seg = false;
+
+                    if (y != seg_row) {
+                        seg_row = y;
+                        seg_bg_done = false;
+                    }
+                    if (seg_bg_done) {
+                        log_seg = true;
+                    } else {
+                        seg_bg_done = true;
+                    }
+                    if (log_seg && sgi_modlog_enabled() &&
+                        sgi_modlog_seg_n < 600) {
+                        size_t so = (size_t)y * XL24_STRIDE + x + 2;
+                        size_t vw2 =
+                            memory_region_size(&state->vram) /
+                            sizeof(uint32_t);
+                        sgi_modlog_seg_n++;
+                        fprintf(stderr, "SEG y=%d x=%d did=%04x tbl=%06x "
+                                "pm=%d ps=%d auxm=%d main=%08x auxw=%08x\n",
+                                y, x, did, table & 0xffffff, pix_mode,
+                                pix_size, aux_mode,
+                                so < vw2 ? state->vram_ptr[so] : 0,
+                                so < vw2 ? state->aux_ptr[so] : 0);
+                    }
+                }
                 if (dbg && y == 500) {
                     fprintf(stderr, "DTBL y=500 x=%d did=%03x table=%08x "
                             "pm=%d ps=%d cim=%03x\n", x, did & 0x1f,
@@ -3109,19 +4534,19 @@ static bool sgi_gio64_update_display(void *opaque)
                 size_t aoff = (size_t)y * XL24_STRIDE + x;
                 uint32_t cidaux = aoff < vram_words ? auxplane[aoff] : 0;
 
-                /* iris parity (works 100%): popup iff pup!=0. MAME fires
-                 * on bits 6/7 with pup==0 (opaque black pen 0); that
-                 * mispaints transparent regions black. */
-                if (((cidaux >> 2) & 3) != 0) {
+                /* Popup iff pup!=0 (iris compositor: no Pup_En gate;
+                 * MAME fires on bits 6/7 with pup==0 (opaque black
+                 * pen 0); that mispaints transparent regions black. */
+                if ((((cidaux >> 2) & 3) != 0)) {
                     rgb = cmap[popup_msb | ((cidaux >> 2) & 3)];
                     replaced = true;
                 } else if (aux_mode != 0) {
+                    /* Overlay components only, transparent when zero
+                     * (xmap9.pdf 3.3; iris compositor). No underlay:
+                     * iris never displays underlay modes (falls through
+                     * to main) and is the correct reference. */
                     if (is_8bpp) {
                         switch (aux_mode) {
-                        case 1: /* 2-bit underlay, always opaque */
-                            rgb = cmap[aux_msb | ((cidaux >> 8) & 3)];
-                            replaced = true;
-                            break;
                         case 2: { /* 2-bit overlay, transparent if zero */
                             uint32_t pix_in = (cidaux >> 8) & 3;
 
@@ -3141,16 +4566,15 @@ static bool sgi_gio64_update_display(void *opaque)
                             }
                             break;
                         }
-                        case 7: { /* 1-bit overlay + 1-bit underlay */
+                        case 7: { /* 1-bit overlay, transparent if zero;
+                                     * the 1-bit underlay half is a
+                                     * main-zero fallback (see below). */
                             uint32_t pix_in = (cidaux >> 8) & 1;
 
                             if (pix_in) {
                                 rgb = cmap[aux_msb | pix_in];
-                            } else {
-                                rgb = cmap[aux_msb |
-                                           ((cidaux >> 9) & 1)];
+                                replaced = true;
                             }
-                            replaced = true;
                             break;
                         }
                         default:
@@ -3158,10 +4582,6 @@ static bool sgi_gio64_update_display(void *opaque)
                         }
                     } else {
                         switch (aux_mode) {
-                        case 1: /* 8-bit underlay */
-                            rgb = cmap[aux_msb | ((cidaux >> 8) & 0xff)];
-                            replaced = true;
-                            break;
                         case 2: { /* 8-bit overlay, transparent if zero */
                             uint32_t pix_in =
                                 ((cidaux >> 8) & 0xf) |
@@ -3183,16 +4603,15 @@ static bool sgi_gio64_update_display(void *opaque)
                             }
                             break;
                         }
-                        case 7: { /* 4-bit overlay + 4-bit underlay */
+                        case 7: { /* 4-bit overlay, transparent if zero;
+                                     * the 4-bit underlay half is a
+                                     * main-zero fallback (see below). */
                             uint32_t pix_in = (cidaux >> 8) & 0xf;
 
                             if (pix_in) {
                                 rgb = cmap[aux_msb | pix_in];
-                            } else {
-                                rgb = cmap[aux_msb |
-                                           ((cidaux >> 12) & 0xf)];
+                                replaced = true;
                             }
-                            replaced = true;
                             break;
                         }
                         default:
@@ -3317,6 +4736,10 @@ static int sgi_gio64_post_load(void *opaque, int version_id)
 
     state->display_dirty = true;
     state->dmg_full = true;
+    /* In-flight host transfer is not migratable; restart clean. */
+    state->host_staged = 0;
+    state->host_len = 0;
+    state->host_cursor = 0;
     /* Timers are transient; re-arm them so VRINT IRQs and the DCB
      * timeout resume after migration. */
     state->vram_ptr = memory_region_get_ram_ptr(&state->vram);
@@ -3328,11 +4751,6 @@ static int sgi_gio64_post_load(void *opaque, int version_id)
     timer_mod_ns(state->vblank_timer,
                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                  1000000000ULL / 60);
-    if (!state->vblank_pulse_timer) {
-        state->vblank_pulse_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
-                                                 sgi_gio64_vblank_end,
-                                                 state);
-    }
     if (!state->dcb_timer) {
         state->dcb_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                         sgi_gio64_dcb_timeout, state);
@@ -3505,6 +4923,13 @@ static void sgi_gio64_realize(DeviceState *device, Error **errp)
 {
     SGIGIO64State *state = SGI_GIO64(device);
 
+    sgi_gfx_threaded = getenv("SGI_GFX_SYNC") == NULL;
+    qemu_mutex_init(&state->gfx_mtx);
+    qemu_cond_init(&state->gfx_cond_work);
+    qemu_cond_init(&state->gfx_cond_idle);
+    qemu_thread_create(&state->gfx_thread, "sgi-gio64-gfx",
+                       sgi_gio64_gfx_worker, state, QEMU_THREAD_DETACHED);
+
     qdev_init_gpio_out_named(device, state->gio_irq, "gio",
                              ARRAY_SIZE(state->gio_irq));
     state->vblank_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
@@ -3512,8 +4937,6 @@ static void sgi_gio64_realize(DeviceState *device, Error **errp)
     timer_mod_ns(state->vblank_timer,
                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                  1000000000ULL / 60);
-    state->vblank_pulse_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
-                                             sgi_gio64_vblank_end, state);
     state->dcb_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                     sgi_gio64_dcb_timeout, state);
     state->display_dirty = true;
@@ -3528,6 +4951,7 @@ static void sgi_gio64_realize(DeviceState *device, Error **errp)
 
 static void sgi_gio64_reset(DeviceState *device)
 {
+    sgi_gio64_gfx_sync(SGI_GIO64(device));
     SGIGIO64State *state = SGI_GIO64(device);
 
     /*
@@ -3539,6 +4963,10 @@ static void sgi_gio64_reset(DeviceState *device)
     state->rex3_status = 3;
     memset(state->rex3_regs, 0, sizeof(state->rex3_regs));
     state->host_dataport = 0;
+    /* A host transfer lives inside one GO, so reset has nothing to resume. */
+    state->host_staged = 0;
+    state->host_len = 0;
+    state->host_cursor = 0;
     state->display_dirty = true;
     state->dmg_full = true;
     state->draw_mode1 = 0x3002f001;
@@ -3597,6 +5025,8 @@ static void sgi_gio64_reset(DeviceState *device)
     state->dcb_mask = 0xffffffff;
     state->line_stipple_pattern = 0;
     state->z_pattern = 0;
+    state->pat_bit = 31;
+    state->zpat_bit = 31;
     state->color_back = 0;
     state->host_shift = 0;
     state->curr_color_red = 0;
