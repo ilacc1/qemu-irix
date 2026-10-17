@@ -444,6 +444,89 @@ static void sgi_wd_dma_bump_wd_count(SGIWD33C93State *state)
     }
 }
 
+/*
+ * Batched DMA copy. The per-byte loops below translate and store one byte at
+ * a time. When the byte-lane swizzle is off, a run of bytes that stays in one
+ * 4 KiB page of guest virtual address space is contiguous in physical memory,
+ * so it can be moved with one memory access. Descriptor bookkeeping is applied
+ * once per run. Runs never cross a page or a descriptor boundary; any byte
+ * that needs the descriptor walk, a fault, or swizzled lanes goes through the
+ * original per-byte code.
+ */
+static uint32_t sgi_wd_dma_run_len(SGIWD33C93State *state, int len,
+                                   uint32_t count_limit)
+{
+    uint32_t n = MIN((uint32_t)len, count_limit);
+
+    return MIN(n, 0x1000u - (state->dma_current & 0xfffu));
+}
+
+static void sgi_wd_dma_run_account(SGIWD33C93State *state, uint32_t n)
+{
+    uint32_t i;
+
+    state->dma_current += n;
+    state->dma_got += n;
+    state->dma_count -= n;
+    for (i = 0; i < n; i++) {
+        sgi_wd_dma_bump_wd_count(state);
+    }
+}
+
+/* Returns the number of bytes moved (0 = not handled, use per-byte path). */
+static uint32_t sgi_wd_dma_write_run(SGIWD33C93State *state, CPUState *cs,
+                                     uint8_t *buf, int len)
+{
+    uint32_t va = state->dma_current;
+    uint32_t n;
+
+    if ((state->dma_control & 0x02) || sgi_wd_trace_enabled()) {
+        return 0;
+    }
+    n = sgi_wd_dma_run_len(state, len, state->dma_count);
+    if (n < 2) {
+        return 0;
+    }
+    if (cs && va >= 0x80000000U) {
+        if (cpu_memory_rw_debug(cs, (vaddr)va, buf, n, 1) != 0) {
+            return 0;
+        }
+    } else {
+        address_space_write(&address_space_memory, sgi_wd_pa(va),
+                            MEMTXATTRS_UNSPECIFIED, buf, n);
+    }
+    sgi_wd_dma_run_account(state, n);
+    return n;
+}
+
+/* Read direction: stop one byte short of the count so the zero crossing
+ * (IRQ, descriptor fetch, EOX) is still handled by the per-byte code. */
+static uint32_t sgi_wd_dma_read_run(SGIWD33C93State *state, CPUState *cs,
+                                    uint8_t *buf, int len)
+{
+    uint32_t va = state->dma_current;
+    uint32_t n;
+
+    if ((state->dma_control & 0x02) || sgi_wd_trace_enabled() ||
+        state->dma_count < 2) {
+        return 0;
+    }
+    n = sgi_wd_dma_run_len(state, len, state->dma_count - 1);
+    if (n < 2) {
+        return 0;
+    }
+    if (cs && va >= 0x80000000U) {
+        if (cpu_memory_rw_debug(cs, (vaddr)va, buf, n, 0) != 0) {
+            return 0;
+        }
+    } else {
+        address_space_read(&address_space_memory, sgi_wd_pa(va),
+                           MEMTXATTRS_UNSPECIFIED, buf, n);
+    }
+    sgi_wd_dma_run_account(state, n);
+    return n;
+}
+
 static int sgi_wd_dma_read(void *opaque, uint8_t *buf, int len)
 {
     SGIWD33C93State *state = opaque;
@@ -460,6 +543,12 @@ static int sgi_wd_dma_read(void *opaque, uint8_t *buf, int len)
     uint32_t start_va = state->dma_current;
 
     while (len > 0) {
+        uint32_t run = sgi_wd_dma_read_run(state, cs, buf, len);
+        if (run) {
+            buf += run;
+            len -= run;
+            continue;
+        }
         uint8_t v = 0;
         bool ok = false;
         if (cs && state->dma_current >= 0x80000000U) {
@@ -598,6 +687,12 @@ static int sgi_wd_dma_write(void *opaque, uint8_t *buf, int len)
     int want = len;
     state->dma_moved += len;
     while (len > 0 && sgi_wd_dma_next(state)) {
+        uint32_t run = sgi_wd_dma_write_run(state, cs, buf, len);
+        if (run) {
+            buf += run;
+            len -= run;
+            continue;
+        }
         uint8_t v = *buf++;
         bool ok = false;
         if (cs && state->dma_current >= 0x80000000U) {
@@ -989,7 +1084,7 @@ static void sgi_wd_patch_byte(SGIWD33C93State *state, uint32_t va, uint8_t v)
  * Standard INQUIRY page 0 identity, as MAME returns it for indy_4020.
  * Disk: MAME nscsi hd.cpp built-in Seagate defaults (vendor " SEAGATE",
  * product "          ST225N", revision "1.00", response format 1/CCS).
- * CD: indy attaches NSCSI_CDROM_SGI (indy_indigo2.cpp), Sony "CDU-76S"
+ * CD: indy attaches NSCSI_CDROM_SGI, Sony "CDU-76S"
  * revision "1.0", response format 2 (SPC-3). Bounded by the initiator's
  * allocation so short allocations cannot scribble past the buffer.
  */
