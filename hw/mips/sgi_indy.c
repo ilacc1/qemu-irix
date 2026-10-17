@@ -1,5 +1,5 @@
 /*
- * QEMU SGI Indigo2 support
+ * QEMU SGI Indy support
  *
  * Copyright (c) 2024 QEMU Project
  *
@@ -56,10 +56,10 @@
 
 #define BIOS_SIZE (4 * MiB)
 /* IP22 PROMs (ip22prom.*.bin) are 512 KiB. */
-#define INDIGO2_BIOS_SIZE 0x80000
+#define INDY_BIOS_SIZE 0x80000
 
 #define SGI_GIO64_BASE 0x1f000000ULL
-/* Single GIO64 bus owner for 0x1f000000-0x1f9fffff (MAME indy_indigo2.cpp:230). */
+/* Single GIO64 bus owner: REX3 Newport slot 0x1f000000-0x1f3fffff (4 MiB, iris physical.rs). */
 #define SGI_IO_BASE 0x1fb00000ULL
 #define SGI_IO_SIZE 0x00010000ULL /* 64KB */
 #define SGI_MEM_BASE 0x00000000ULL
@@ -71,7 +71,7 @@
 
 static SGIWD33C93State *sgi_wd33c93[2];
 
-static void mips_sgi_indigo2_init(MachineState *machine);
+static void mips_sgi_indy_init(MachineState *machine);
 
 static void main_cpu_reset(void *opaque)
 {
@@ -1405,7 +1405,7 @@ static void sgi_hal2_vm_state(void *opaque, bool running, RunState state)
     }
 }
 
-static void sgi_indigo2_board_reset(void *opaque)
+static void sgi_indy_board_reset(void *opaque)
 {
     /*
      * Board glue here is file-global static state, so reset it explicitly:
@@ -1441,7 +1441,7 @@ static void sgi_indigo2_board_reset(void *opaque)
     sgi_hpc3_enet_update_irq();
 }
 
-static void mips_sgi_indigo2_init(MachineState *machine)
+static void mips_sgi_indy_init(MachineState *machine)
 {
     const char *bios_name = TARGET_BIG_ENDIAN ? "sgi_bios.bin" : "sgiel_bios.bin";
     MemoryRegion *address_space = get_system_memory();
@@ -1463,20 +1463,15 @@ static void mips_sgi_indigo2_init(MachineState *machine)
     MemoryRegion *hpc_misc = g_new(MemoryRegion, 1);
     MemoryRegion *eisa_io = g_new(MemoryRegion, 1);
     MemoryRegion *vino_stub = g_new(MemoryRegion, 1);
-    MemoryRegion *i8042_alias = g_new(MemoryRegion, 1);
     NICInfo *nd;
     DeviceState *rc4030;
     rc4030_dma *dmas;
     IOMMUMemoryRegion *rc4030_dma_mr;
-    DeviceState *scsi_ors[2];
     int n;
 
     cpuclk = clock_new(OBJECT(machine), "cpu-refclk");
-    /* Indy (IP24) is an R4000 at 200MHz (MAME indy_4020); Indigo2 (IP22)
-     * runs its R4400-class CPU at 150MHz with a stock R4000 stand-in. */
-    bool is_indy = !!object_dynamic_cast(OBJECT(machine),
-                                        MACHINE_TYPE_NAME("indy"));
-    clock_set_hz(cpuclk, is_indy ? 200000000ULL : 150000000ULL);
+    /* Indy R4000 at 200MHz (MAME indy_4020). */
+    clock_set_hz(cpuclk, 200000000ULL);
 
     g_free(sgi_hal2_audiodev);
     sgi_hal2_audiodev = machine->audiodev ? g_strdup(machine->audiodev) : NULL;
@@ -1484,7 +1479,7 @@ static void mips_sgi_indigo2_init(MachineState *machine)
     cpu = mips_cpu_create_with_clock(machine->cpu_type, cpuclk, TARGET_BIG_ENDIAN);
     env = &cpu->env;
     qemu_register_reset(main_cpu_reset, cpu);
-    qemu_register_reset(sgi_indigo2_board_reset, NULL);
+    qemu_register_reset(sgi_indy_board_reset, NULL);
     qemu_add_vm_change_state_handler(sgi_hal2_vm_state, NULL);
 
     mcc = MIPS_CPU_GET_CLASS(cpu);
@@ -1493,15 +1488,11 @@ static void mips_sgi_indigo2_init(MachineState *machine)
     memory_region_add_subregion(address_space, SGI_MEM_BASE, machine->ram);
     memory_region_init_io(eisa_io, NULL, &eisa_io_ops, NULL,
                           "sgi-ip22-eisa-io", 0x20000);
-    if (is_indy) {
         /* IP24 maps VINO video capture at 0x00080000 (MAME ip24_map); no
          * VINO model exists yet, so answer all-ones (no device) there. */
         memory_region_init_io(vino_stub, NULL, &eisa_io_ops, NULL,
                               "sgi-ip24-vino-stub", 0x20000);
         memory_region_add_subregion(address_space, 0x00080000, vino_stub);
-    } else {
-        memory_region_add_subregion(address_space, 0x00080000, eisa_io);
-    }
     for (n = 0; n < ARRAY_SIZE(sgi_hpc3_pbus_dma); n++) {
         sgi_hpc3_pbus_dma[n].timer = timer_new_ns(QEMU_CLOCK_HOST,
                                                    sgi_hpc3_pbus_tick,
@@ -1516,7 +1507,7 @@ static void mips_sgi_indigo2_init(MachineState *machine)
     object_property_set_link(OBJECT(dev), "ram", OBJECT(machine->ram),
                              &error_fatal);
     /* Indy (IP24) has no EISA; reprograms MC System ID bit 4 (MAME mc). */
-    qdev_prop_set_bit(dev, "eisa-present", !is_indy);
+    qdev_prop_set_bit(dev, "eisa-present", false);
     sysbus = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(sysbus, &error_fatal);
     mcdev = dev;
@@ -1529,17 +1520,17 @@ static void mips_sgi_indigo2_init(MachineState *machine)
      * the PROM from a second address, so the PROM's own relocation and
      * pointer patching diverged from MAME.
      */
-    memory_region_init_rom(bios, NULL, "sgi_indigo2.bios", INDIGO2_BIOS_SIZE, &error_fatal);
+    memory_region_init_rom(bios, NULL, "sgi_indy.bios", INDY_BIOS_SIZE, &error_fatal);
     memory_region_add_subregion(address_space, 0x1fc00000ULL, bios);
 
     filename = qemu_find_file(QEMU_FILE_TYPE_BIOS, machine->firmware ?: bios_name);
     if (filename) {
-        bios_size = load_image_targphys(filename, 0x1fc00000ULL, INDIGO2_BIOS_SIZE, NULL);
+        bios_size = load_image_targphys(filename, 0x1fc00000ULL, INDY_BIOS_SIZE, NULL);
         g_free(filename);
     } else {
         bios_size = -1;
     }
-    if ((bios_size < 0 || bios_size > INDIGO2_BIOS_SIZE) && machine->firmware && !qtest_enabled()) {
+    if ((bios_size < 0 || bios_size > INDY_BIOS_SIZE) && machine->firmware && !qtest_enabled()) {
         error_report("Could not load SGI bios '%s'", machine->firmware);
         exit(1);
     }
@@ -1555,18 +1546,17 @@ static void mips_sgi_indigo2_init(MachineState *machine)
     /* IOC2 (PIO6 base + PIO4 INT2) drives CPU INT0/INT1 directly, as in
      * MAME. The ESCC/i8042 sub-windows stay on top of PIO6; the rc4030 is
      * only a QEMU DMA backend and must not gate IP22 interrupts. */
-    /* Indy (IP24) uses the GUINNESS IOC2: interrupt registers in the PIO6
-     * window (MAME ioc2_guinness_device::map), no PIO4 INT2 window.
-     * Indigo2 (IP22) uses FULL_HOUSE with the separate INT2 window. */
+    /* Indy uses the GUINNESS IOC2: interrupt registers in the PIO6 window
+     * (MAME ioc2_guinness_device::map), no PIO4 INT2 window. */
     dev = qdev_new(TYPE_SGI_IOC2);
-    qdev_prop_set_bit(dev, "guinness", is_indy);
+    qdev_prop_set_bit(dev, "guinness", true);
     sysbus = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(sysbus, &error_fatal);
     /*
-     * MAME indy_indigo2.cpp:258-261 pio6_map:
+     * pio6_map:
      *   map(0x00, 0x2f).m("ioc2", ioc2_guinness_device::map)
      *                    .umask16(0x00ff);
-     * installed on AS_PIO6 (indy_indigo2.cpp:381).  MAME reaches the
+     * installed on AS_PIO6.  MAME reaches the
      * device through AS_PIO6, which hpc3.cpp's 32-bit pio_data_r() drives
      * as `read_word(offset & 0xff, 0x00ff) & 0xff`; QEMU has no separate
      * pio6 address space, so the PIO window dispatcher decodes the same
@@ -1577,12 +1567,6 @@ static void mips_sgi_indigo2_init(MachineState *machine)
      * ever lives in the low lane of each dword.
      */
     sgi_hpc3_set_ioc2(DEVICE(dev));
-    if (!is_indy) {
-        memory_region_add_subregion_overlap(address_space, SGI_HPC3_BASE + 0x58614,
-                                            sysbus_mmio_get_region(sysbus, 0), 5);
-        memory_region_add_subregion_overlap(address_space, SGI_HPC3_BASE + 0x58400,
-                                            sysbus_mmio_get_region(sysbus, 1), 5);
-    }
     /* MAME ioc2 raise_local_irq(channel) drives m_maincpu->set_input_line(channel);
      * MAME mips3 maps line N to Cause bit 10+N, i.e. channel 0 -> IP2 and
      * channel 1 -> IP3, matching QEMU env->irq[2]/env->irq[3]. */
@@ -1594,7 +1578,7 @@ static void mips_sgi_indigo2_init(MachineState *machine)
     sgi_ioc2_enet_edlc_irq = qdev_get_gpio_in(DEVICE(dev), 2);
     sgi_ioc2_enet_hpc_irq = qdev_get_gpio_in(DEVICE(dev), 3);
     ioc2dev = dev;
-    /* MAME indy_indigo2.cpp:318: MEMCTL DMA-done to IOC2 local0 0x10. */
+    /* MEMCTL DMA-done to IOC2 local0 0x10. */
     qdev_connect_gpio_out(mcdev, 0,
                             qdev_get_gpio_in(ioc2dev, SGI_IOC2_IN_MC_DMA));
     /* Single GIO64 owner (MAME gio64_device); rc4030 MMIO must not shadow it. */
@@ -1628,68 +1612,27 @@ static void mips_sgi_indigo2_init(MachineState *machine)
 
     /*
      * The WD33C93 owns its SCSI bus and drives it itself, so the machine no
-     * longer instantiates a separate ESP backend and links it in.  That also
-     * removes the reason the Indigo2 path had to re-buffer INT (the ESP level
-     * held across transfers); the gate is kept so the IOC2 connection is
-     * unchanged from the wiring that is known to boot.
+     * longer instantiates a separate ESP backend and links it in.
      */
-    if (!is_indy) {
-        DeviceState *scsi_or = qdev_new(TYPE_OR_IRQ);
-        qdev_prop_set_uint16(scsi_or, "num-lines", 2);
-        qdev_realize_and_unref(scsi_or, NULL, &error_fatal);
-        qdev_connect_gpio_out(scsi_or, 0, qdev_get_gpio_in(ioc2dev, 0));
-        scsi_ors[0] = scsi_or;
-    }
     dev = qdev_new("sgi-wd33c93");
     sgi_wd33c93[0] = SGI_WD33C93(dev);
     sysbus = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(sysbus, &error_fatal);
     sysbus_mmio_map(sysbus, 0, SGI_SCSI_BASE);
 
-    if (is_indy) {
         qdev_connect_gpio_out(DEVICE(sgi_wd33c93[0]), 0,
                               qdev_get_gpio_in(ioc2dev, 0));
-    } else {
-        /* MAME indy_indigo2.cpp:296: the WD33C93 INT alone drives IOC2 SCSI0. */
-        qdev_connect_gpio_out(DEVICE(sgi_wd33c93[0]), 0,
-                              qdev_get_gpio_in(scsi_ors[0], 0));
-    }
 
     sgi_wd33c93_scsi_bus_init(sgi_wd33c93[0]);
 
-    /* Indy (IP24) has a single SCSI channel (MAME ip24 has no scsibus2);
-     * Indigo2 has a second, initially empty, channel at HPC3 HD1. */
-    if (!is_indy) {
-        /* MAME indy_indigo2.cpp:440: WD33C93 INT drives IOC2 SCSI1 (ioc2.cpp:738). */
-        {
-            DeviceState *scsi_or = qdev_new(TYPE_OR_IRQ);
-            qdev_prop_set_uint16(scsi_or, "num-lines", 2);
-            qdev_realize_and_unref(scsi_or, NULL, &error_fatal);
-            qdev_connect_gpio_out(scsi_or, 0, qdev_get_gpio_in(ioc2dev, 1));
-            scsi_ors[1] = scsi_or;
-        }
-        dev = qdev_new("sgi-wd33c93");
-        sgi_wd33c93[1] = SGI_WD33C93(dev);
-        sysbus = SYS_BUS_DEVICE(dev);
-        sysbus_realize_and_unref(sysbus, &error_fatal);
-        memory_region_add_subregion_overlap(address_space, SGI_HPC3_BASE + 0x48000,
-                                            sysbus_mmio_get_region(sysbus, 0), 2);
 
-        qdev_connect_gpio_out(DEVICE(sgi_wd33c93[1]), 0,
-                              qdev_get_gpio_in(scsi_ors[1], 0));
-    }
-
-    /* MAME indy_indigo2.cpp:359: HPC3 DMA-done to IOC2 local1 0x10. */
+    /* HPC3 DMA-done to IOC2 local1 0x10. */
     {
         DeviceState *dma_or = qdev_new(TYPE_OR_IRQ);
         qdev_prop_set_uint16(dma_or, "num-lines", 3);
         qdev_realize_and_unref(dma_or, NULL, &error_fatal);
         qdev_connect_gpio_out_named(DEVICE(sgi_wd33c93[0]), "dma-done", 0,
                                     qdev_get_gpio_in(dma_or, 0));
-        if (!is_indy) {
-            qdev_connect_gpio_out_named(DEVICE(sgi_wd33c93[1]), "dma-done", 0,
-                                        qdev_get_gpio_in(dma_or, 1));
-        }
         /* PBUS (audio) descriptor-done joins the same dma_complete level
          * (MAME do_pbus_dma bit 29); the OR reproduces intstat!=0. */
         sgi_hpc3_pbus_done_irq = qdev_get_gpio_in(dma_or, 2);
@@ -1699,10 +1642,6 @@ static void mips_sgi_indigo2_init(MachineState *machine)
     dev = qdev_new(TYPE_SGI_HPC3_SCSI);
     object_property_set_link(OBJECT(dev), "wd0", OBJECT(sgi_wd33c93[0]),
                              &error_fatal);
-    if (!is_indy) {
-        object_property_set_link(OBJECT(dev), "wd1", OBJECT(sgi_wd33c93[1]),
-                                 &error_fatal);
-    }
     sysbus = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(sysbus, &error_fatal);
     memory_region_add_subregion_overlap(address_space, SGI_HPC3_BASE + 0x10000,
@@ -1722,13 +1661,11 @@ static void mips_sgi_indigo2_init(MachineState *machine)
      */
     dev = qdev_new(TYPE_SGI_HPC3);
     qdev_prop_set_chr(dev, "chr", serial_hd(2));
-    /* The Indy modelled here is MAME indy_4020: R4000 at 200MHz (4x50MHz),
-     * ip24() with DS1386_8K, 16KiB icache/dcache, 50MHz system clock.  Its
-     * DS1386_8K gives the 8KiB BBRAM below; the IP22 Indigo2 uses a 64-byte
-     * DS1286.  NVRAM seed dir is the MAME machine name, so indy_4020 here. */
-    qdev_prop_set_uint32(dev, "bbram-size", is_indy ? 0x2000 : 64);
-    qdev_prop_set_string(dev, "nvram-dir", is_indy ? "indy_4020"
-                                                   : "indigo2_4415");
+    /* The modelled Indy is MAME indy_4020: R4000 at 200MHz (4x50MHz),
+     * ip24() with DS1386_8K, 16KiB icache/dcache, 50MHz system clock.
+     * The DS1386_8K gives the 8KiB BBRAM; NVRAM seed dir is indy_4020. */
+    qdev_prop_set_uint32(dev, "bbram-size", 0x2000);
+    qdev_prop_set_string(dev, "nvram-dir", "indy_4020");
     sysbus = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(sysbus, &error_fatal);
     memory_region_add_subregion_overlap(address_space, SGI_HPC3_BASE + 0x58000,
@@ -1750,8 +1687,8 @@ static void mips_sgi_indigo2_init(MachineState *machine)
      * 0xAA/0x00 at reset): the PROM waits for mouse BAT with status
      * OBF+AUX and declares no mouse after ~500K polls without it.
      */
-    qdev_prop_set_bit(DEVICE(i8042), "keyboard-bat", is_indy);
-    qdev_prop_set_bit(DEVICE(i8042), "mouse-bat", is_indy);
+    qdev_prop_set_bit(DEVICE(i8042), "keyboard-bat", true);
+    qdev_prop_set_bit(DEVICE(i8042), "mouse-bat", true);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(i8042), &error_fatal);
 
     /* MAME ioc2.cpp kbdc_irq merger: kbd+aux IRQs OR into one line. */
@@ -1776,18 +1713,11 @@ static void mips_sgi_indigo2_init(MachineState *machine)
      * `addr & mask`.  See sgi_hpc3_pio6_kbd_reg().
      */
     sgi_hpc3_set_pio6_kbd(DEVICE(i8042));
-    if (!is_indy) {
-        memory_region_init_alias(i8042_alias, NULL, "sgi_ip22.i8042_pio6",
-                                 sysbus_mmio_get_region(SYS_BUS_DEVICE(i8042), 0),
-                                 0, 2);
-        memory_region_add_subregion_overlap(address_space, SGI_HPC3_BASE + 0x58610,
-                                            i8042_alias, 20);
-    }
 
     /* IOC2-compatible Z8530 SCC in HPC3 PIO6. */
     dev = qdev_new(TYPE_ESCC);
     qdev_prop_set_uint32(dev, "frequency", 10000000);
-    qdev_prop_set_uint32(dev, "it_shift", is_indy ? 2 : 0);
+    qdev_prop_set_uint32(dev, "it_shift", 2);
     qdev_prop_set_bit(dev, "bit_swap", false);
     qdev_prop_set_chr(dev, "chrA", serial_hd(0));
     qdev_prop_set_chr(dev, "chrB", serial_hd(1));
@@ -1797,7 +1727,7 @@ static void mips_sgi_indigo2_init(MachineState *machine)
     sysbus_realize_and_unref(sysbus, &error_fatal);
     memory_region_add_subregion_overlap(address_space,
                                         SGI_HPC3_BASE +
-                                        (is_indy ? 0x59830 : 0x5860c),
+                                        0x59830,
                                         sysbus_mmio_get_region(sysbus, 0), 1000);
     sysbus_connect_irq(sysbus, 0, qdev_get_gpio_in(ioc2dev, 7));
 
@@ -1809,7 +1739,7 @@ static void mips_sgi_indigo2_init(MachineState *machine)
         memcpy(sgi_edlc_station, nd->macaddr.a, sizeof(sgi_edlc_station));
         sgi_ethernet_nic = qemu_new_nic(&sgi_edlc_net_info,
                                         &sgi_ethernet_conf,
-                                        "seeq80c03", "indigo2",
+                                        "seeq80c03", "indy",
                                         &sgi_ethernet_guard,
                                         NULL);
         nd->instantiated = 1;
@@ -1820,24 +1750,12 @@ static void mips_sgi_indigo2_init(MachineState *machine)
     g_free(dmas);
 }
 
-static void mips_sgi_indigo2_class_init(ObjectClass *oc, const void *data)
-{
-    MachineClass *mc = MACHINE_CLASS(oc);
-
-    mc->desc = "SGI Indigo2";
-    mc->init = mips_sgi_indigo2_init;
-    mc->block_default_type = IF_SCSI;
-    mc->no_cdrom = 1;
-    mc->default_cpu_type = MIPS_CPU_TYPE_NAME("R4000");
-    mc->default_ram_id = "sgi_indigo2.ram";
-}
-
 static void mips_sgi_indy_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
 
     mc->desc = "SGI Indy";
-    mc->init = mips_sgi_indigo2_init;
+    mc->init = mips_sgi_indy_init;
     mc->max_cpus = 1;
     mc->default_cpu_type = MIPS_CPU_TYPE_NAME("R4000SC");
     mc->default_ram_size = 128 * MiB;
@@ -1845,22 +1763,15 @@ static void mips_sgi_indy_class_init(ObjectClass *oc, const void *data)
     machine_add_audiodev_property(mc);
 }
 
-static const TypeInfo mips_sgi_indigo2_type = {
-    .name = MACHINE_TYPE_NAME("indigo2"),
-    .parent = TYPE_MACHINE,
-    .class_init = mips_sgi_indigo2_class_init,
-};
-
 static const TypeInfo mips_sgi_indy_type = {
     .name = MACHINE_TYPE_NAME("indy"),
     .parent = TYPE_MACHINE,
     .class_init = mips_sgi_indy_class_init,
 };
 
-static void mips_sgi_indigo2_machine_init(void)
+static void mips_sgi_indy_machine_init(void)
 {
-    type_register_static(&mips_sgi_indigo2_type);
     type_register_static(&mips_sgi_indy_type);
 }
 
-type_init(mips_sgi_indigo2_machine_init)
+type_init(mips_sgi_indy_machine_init)

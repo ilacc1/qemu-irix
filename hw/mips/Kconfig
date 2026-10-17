@@ -87,7 +87,7 @@ config MIPS_BOSTON
 config FW_CFG_MIPS
     bool
 
-config SGI_INDIGO2
+config SGI_INDY
     bool
     default y
     depends on MIPS64

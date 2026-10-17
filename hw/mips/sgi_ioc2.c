@@ -572,7 +572,7 @@ static uint64_t sgi_ioc2_read_inner(void *opaque, hwaddr addr, unsigned size)
     SgiIoc2State *state = SGI_IOC2(opaque);
     /*
      * MAME decode is byte-wide for both IOC2 variants: pio6_map maps the
-     * device with .umask16(0x00ff) (MAME indy_indigo2.cpp:258-261 for
+     * device with .umask16(0x00ff) (for
      * GUINNESS, :274-277 for FULL HOUSE) and MAME hpc3.cpp:721-733 hands
      * every PIO register to the device as
      * read_word(offset & 0xff, 0x00ff) & 0xff, so the register index is

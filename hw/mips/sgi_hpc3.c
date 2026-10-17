@@ -742,7 +742,7 @@ static uint64_t sgi_hpc3_pio_read_do(void *opaque, hwaddr addr, unsigned size)
         return rv;
     }
     if (channel == 0) {
-        /* MAME indy_indigo2.cpp:245 pio0_map is the HAL2:
+        /* pio0_map is the HAL2:
          *   map(0x00, 0xff).rw(m_hal2, hal2_device::read/write)
          * and hal2.h numbers its registers in dwords
          * (STATUS_REG = 0x0010/4 = 4, REVISION_REG = 0x0020/4 = 8), so
@@ -1205,11 +1205,10 @@ static void sgi_hpc3_console_receive(void *opaque, const uint8_t *buf,
 
 /* NVRAM seed resolution + write-back, so PROM env survives relaunch.
  * The seed dir is the MAME machine name for this board (PROM-specific
- * env): indy_4020 for the Indy/IP24 (the R4000/200MHz model this board
- * implements), indigo2_4415 for the IP22. */
+ * env): indy_4020 for the Indy/IP24. */
 static char sgi_hpc3_nvram_eeprom_path[4096];
 static char sgi_hpc3_nvram_rtc_path[4096];
-static char sgi_hpc3_nvram_dir[128] = "indigo2_4415";
+static char sgi_hpc3_nvram_dir[128] = "indy_4020";
 static SgiHpc3State *sgi_hpc3_nvram_state;
 
 static FILE *sgi_hpc3_open_nvram(const char *name, char *out, size_t outlen);
@@ -1279,7 +1278,7 @@ static void sgi_hpc3_realize(DeviceState *device, Error **errp)
     rtc_file = sgi_hpc3_open_nvram("rtc", rtc_path, sizeof(rtc_path));
     if (rtc_file) {
         /* IP22 carries a DS1286 (64 bytes), the Indy/IP24 a DS1386_8K
-         * (8KiB, MAME indy_indigo2.cpp); load the whole seed image. */
+         * (8KiB, ); load the whole seed image. */
         size_t got = fread(state->bbram, 1, state->bbram_size, rtc_file);
         if (got > 0) {
             memset(state->bbram + got, 0, state->bbram_size - got);
