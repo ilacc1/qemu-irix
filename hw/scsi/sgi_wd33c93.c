@@ -473,6 +473,18 @@ static void sgi_wd_dma_run_account(SGIWD33C93State *state, uint32_t n)
     }
 }
 
+/* SGI_WD_SYNC=1 disables the batched run fast path, forcing every byte
+ * through the original per-byte code. */
+static bool sgi_wd_sync_enabled(void)
+{
+    static int cached = -1;
+
+    if (cached < 0) {
+        cached = getenv("SGI_WD_SYNC") ? 1 : 0;
+    }
+    return cached != 0;
+}
+
 /* Returns the number of bytes moved (0 = not handled, use per-byte path). */
 static uint32_t sgi_wd_dma_write_run(SGIWD33C93State *state, CPUState *cs,
                                      uint8_t *buf, int len)
@@ -480,7 +492,8 @@ static uint32_t sgi_wd_dma_write_run(SGIWD33C93State *state, CPUState *cs,
     uint32_t va = state->dma_current;
     uint32_t n;
 
-    if ((state->dma_control & 0x02) || sgi_wd_trace_enabled()) {
+    if (sgi_wd_sync_enabled() || (state->dma_control & 0x02) ||
+        sgi_wd_trace_enabled()) {
         return 0;
     }
     n = sgi_wd_dma_run_len(state, len, state->dma_count);
@@ -507,8 +520,8 @@ static uint32_t sgi_wd_dma_read_run(SGIWD33C93State *state, CPUState *cs,
     uint32_t va = state->dma_current;
     uint32_t n;
 
-    if ((state->dma_control & 0x02) || sgi_wd_trace_enabled() ||
-        state->dma_count < 2) {
+    if (sgi_wd_sync_enabled() || (state->dma_control & 0x02) ||
+        sgi_wd_trace_enabled() || state->dma_count < 2) {
         return 0;
     }
     n = sgi_wd_dma_run_len(state, len, state->dma_count - 1);
