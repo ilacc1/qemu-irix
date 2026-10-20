@@ -46,6 +46,8 @@
 
 #include "block/block-io.h"
 #include "block/block_int.h"
+#include "block/thread-pool.h"
+#include "qemu/coroutine.h"
 #include "qapi/error.h"
 
 #include <zlib.h>
@@ -102,6 +104,21 @@ typedef struct BDRVChdState {
     uint32_t hunk_buf_size;
     uint8_t *comp_buf;
     uint32_t comp_buf_size;
+
+    /* Serialises use of hunk_buf/comp_buf across coroutines: the file read
+     * and the inflate can both yield. */
+    CoMutex hunk_lock;
+
+    /* Decompressed-hunk cache (ZLIB hunks). LRU by stamp; protected by
+     * hunk_lock like the staging buffers. */
+    struct ChdCacheSlot {
+        uint32_t hunk;
+        uint64_t stamp;
+        bool valid;
+        uint8_t *buf;
+    } *cache;
+    uint32_t cache_nslots;
+    uint64_t cache_clock;
 } BDRVChdState;
 
 static uint64_t chd_be64(const uint8_t *p)
@@ -304,10 +321,14 @@ out:
     return ret;
 }
 
+static void chd_cache_init(BDRVChdState *s);
+
 static int chd_open(BlockDriverState *bs, QDict *options, int flags,
                     Error **errp)
 {
     BDRVChdState *s = bs->opaque;
+
+    qemu_co_mutex_init(&s->hunk_lock);
     uint8_t hdr[CHD_MAX_HEADER_SIZE];
     uint64_t logical_bytes = 0;
     uint64_t map_offset = 0;
@@ -428,6 +449,7 @@ static int chd_open(BlockDriverState *bs, QDict *options, int flags,
         goto fail;
     }
 
+    chd_cache_init(s);
     return 0;
 
 fail:
@@ -437,10 +459,94 @@ fail:
     return ret;
 }
 
+/*
+ * Decompressed-hunk cache. Size from SGI_CHD_CACHE_MB (default 256). Without
+ * it, every read of a compressed hunk decompresses the whole hunk again, even
+ * when the previous request just did so.
+ */
+static uint32_t chd_cache_bytes(void)
+{
+    const char *e = getenv("SGI_CHD_CACHE_MB");
+    unsigned long mb = e ? strtoul(e, NULL, 0) : 256;
+
+    return (uint32_t)MIN(mb, 4096UL) * 1024 * 1024;
+}
+
+static void chd_cache_init(BDRVChdState *s)
+{
+    uint64_t bytes = chd_cache_bytes();
+
+    if (!s->hunk_bytes || bytes < s->hunk_bytes) {
+        return;
+    }
+    s->cache_nslots = bytes / s->hunk_bytes;
+    s->cache = g_new0(struct ChdCacheSlot, s->cache_nslots);
+}
+
+static struct ChdCacheSlot *chd_cache_find(BDRVChdState *s, uint32_t hunk)
+{
+    uint32_t i;
+
+    for (i = 0; i < s->cache_nslots; i++) {
+        if (s->cache[i].valid && s->cache[i].hunk == hunk) {
+            s->cache[i].stamp = ++s->cache_clock;
+            return &s->cache[i];
+        }
+    }
+    return NULL;
+}
+
+static void chd_cache_insert(BDRVChdState *s, uint32_t hunk,
+                             const uint8_t *data)
+{
+    struct ChdCacheSlot *victim = NULL;
+    uint32_t i;
+
+    for (i = 0; i < s->cache_nslots; i++) {
+        if (!s->cache[i].valid) {
+            victim = &s->cache[i];
+            break;
+        }
+        if (!victim || s->cache[i].stamp < victim->stamp) {
+            victim = &s->cache[i];
+        }
+    }
+    if (!victim) {
+        return;
+    }
+    if (!victim->buf) {
+        victim->buf = g_malloc(s->hunk_bytes);
+    }
+    memcpy(victim->buf, data, s->hunk_bytes);
+    victim->hunk = hunk;
+    victim->valid = true;
+    victim->stamp = ++s->cache_clock;
+}
+
+static void chd_cache_invalidate(BDRVChdState *s, uint32_t first,
+                                 uint32_t last)
+{
+    uint32_t i;
+
+    for (i = 0; i < s->cache_nslots; i++) {
+        if (s->cache[i].valid && s->cache[i].hunk >= first &&
+            s->cache[i].hunk <= last) {
+            s->cache[i].valid = false;
+        }
+    }
+}
+
 static void chd_close(BlockDriverState *bs)
 {
     BDRVChdState *s = bs->opaque;
+    uint32_t i;
 
+    if (s->cache) {
+        for (i = 0; i < s->cache_nslots; i++) {
+            g_free(s->cache[i].buf);
+        }
+        g_free(s->cache);
+    }
     g_free(s->hunk_offset);
     g_free(s->hunk_codec);
     g_free(s->hunk_length);
@@ -482,9 +588,26 @@ static int chd_ensure_comp_buf(BlockDriverState *bs, BDRVChdState *s,
  * name another hunk rather than container data; follow them with a small depth
  * limit so a malformed image cannot send us round in circles.
  */
+/* Runs in the thread pool: no BQL, touches only the buffers passed in. */
+typedef struct ChdInflateJob {
+    uint8_t *dst;
+    uLongf dst_len;
+    const uint8_t *src;
+    uLong src_len;
+    int zr;
+} ChdInflateJob;
+
+static int chd_inflate_job(void *opaque)
+{
+    ChdInflateJob *job = opaque;
+
+    job->zr = uncompress(job->dst, &job->dst_len, job->src, job->src_len);
+    return job->zr;
+}
+
 static int coroutine_fn GRAPH_RDLOCK
 chd_read_hunk(BlockDriverState *bs, BDRVChdState *s, uint32_t hunk,
-              uint32_t depth)
+                          uint32_t depth)
 {
     uint32_t complen = s->hunk_length[hunk];
     int ret;
@@ -530,6 +653,14 @@ chd_read_hunk(BlockDriverState *bs, BDRVChdState *s, uint32_t hunk,
     }
 
     /* CHD_CODEC_ZLIB */
+    if (s->cache) {
+        struct ChdCacheSlot *hit = chd_cache_find(s, hunk);
+
+        if (hit) {
+            memcpy(s->hunk_buf, hit->buf, s->hunk_bytes);
+            return 0;
+        }
+    }
     ret = chd_ensure_comp_buf(bs, s, complen);
     if (ret < 0) {
         return ret;
@@ -541,20 +672,74 @@ chd_read_hunk(BlockDriverState *bs, BDRVChdState *s, uint32_t hunk,
     }
 
     {
-        uLongf dlen = s->hunk_bytes;
-        int zr = uncompress(s->hunk_buf, &dlen, s->comp_buf, complen);
+        ChdInflateJob job = {
+            .dst = s->hunk_buf,
+            .dst_len = s->hunk_bytes,
+            .src = s->comp_buf,
+            .src_len = complen,
+        };
+        /* Inflate off the main loop; this coroutine sleeps until it is done. */
+        thread_pool_submit_co(chd_inflate_job, &job);
 
-        if (zr != Z_OK || dlen != s->hunk_bytes) {
-            error_report("chd: zlib error %d expanding hunk %u", zr, hunk);
+        if (job.zr != Z_OK || job.dst_len != s->hunk_bytes) {
+            error_report("chd: zlib error %d expanding hunk %u", job.zr, hunk);
             return -EIO;
         }
+    }
+    if (s->cache) {
+        chd_cache_insert(s, hunk, s->hunk_buf);
     }
     return 0;
 }
 
 static int coroutine_fn GRAPH_RDLOCK
+chd_co_preadv_body(BlockDriverState *bs, int64_t offset, int64_t bytes,
+                   QEMUIOVector *qiov, BdrvRequestFlags flags);
+static int coroutine_fn GRAPH_RDLOCK
+chd_co_pwritev_body(BlockDriverState *bs, int64_t offset, int64_t bytes,
+                    QEMUIOVector *qiov, BdrvRequestFlags flags);
+
+/*
+ * One request at a time: the hunk buffers and the decompressed-hunk cache are
+ * shared state, so each request holds hunk_lock for its whole duration.
+ */
+static int coroutine_fn GRAPH_RDLOCK
 chd_co_preadv(BlockDriverState *bs, int64_t offset, int64_t bytes,
               QEMUIOVector *qiov, BdrvRequestFlags flags)
+{
+    BDRVChdState *s = bs->opaque;
+    int ret;
+
+    qemu_co_mutex_lock(&s->hunk_lock);
+    ret = chd_co_preadv_body(bs, offset, bytes, qiov, flags);
+    qemu_co_mutex_unlock(&s->hunk_lock);
+    return ret;
+}
+
+static int coroutine_fn GRAPH_RDLOCK
+chd_co_pwritev(BlockDriverState *bs, int64_t offset, int64_t bytes,
+               QEMUIOVector *qiov, BdrvRequestFlags flags)
+{
+    BDRVChdState *s = bs->opaque;
+    int ret;
+
+    qemu_co_mutex_lock(&s->hunk_lock);
+    if (s->cache && bytes > 0) {
+        chd_cache_invalidate(s, offset / s->hunk_bytes,
+                             (offset + bytes - 1) / s->hunk_bytes);
+    }
+    ret = chd_co_pwritev_body(bs, offset, bytes, qiov, flags);
+    if (s->cache && bytes > 0) {
+        chd_cache_invalidate(s, offset / s->hunk_bytes,
+                             (offset + bytes - 1) / s->hunk_bytes);
+    }
+    qemu_co_mutex_unlock(&s->hunk_lock);
+    return ret;
+}
+
+static int coroutine_fn GRAPH_RDLOCK
+chd_co_preadv_body(BlockDriverState *bs, int64_t offset, int64_t bytes,
+                   QEMUIOVector *qiov, BdrvRequestFlags flags)
 {
     BDRVChdState *s = bs->opaque;
     int64_t cur = offset;
@@ -635,8 +820,8 @@ chd_publish_hunk(BlockDriverState *bs, BDRVChdState *s, uint32_t hunk,
 }
 
 static int coroutine_fn GRAPH_RDLOCK
-chd_co_pwritev(BlockDriverState *bs, int64_t offset, int64_t bytes,
-               QEMUIOVector *qiov, BdrvRequestFlags flags)
+chd_co_pwritev_body(BlockDriverState *bs, int64_t offset, int64_t bytes,
+                    QEMUIOVector *qiov, BdrvRequestFlags flags)
 {
     BDRVChdState *s = bs->opaque;
     int64_t cur = offset;
