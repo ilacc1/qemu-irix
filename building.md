@@ -60,7 +60,7 @@ configuration.
 
 For reference, this fork has been built and verified with:
 
-| Tool | Linux (Ubuntu 26.04) | Windows (bundled MSYS2) |
+| Tool | Linux (Ubuntu 26.04) | Windows (MSYS2) |
 |------|----------------------|-------------------------|
 | C compiler | gcc 15.2.0 | mingw-w64 gcc 16.2.0 |
 | Python | 3.14 | 3.14 |
@@ -228,16 +228,13 @@ readme.md).
 
 ## 3. Building on Windows
 
-The Windows build uses **MSYS2** with the **MinGW-w64** toolchain. This
-repository ships a self-contained MSYS2 under `msys64\`, but the instructions
-below work with any MSYS2 installation.
+The Windows build uses **MSYS2** with the **MinGW-w64** toolchain, which
+you install yourself (it is not bundled with this repository).
 
 ### 3.1 Install MSYS2 and the toolchain
 
-If you are not using the bundled `msys64\`, install MSYS2 from
-<https://www.msys2.org/> (default location `C:\msys64`).
-
-Open the **MSYS2 MINGW64** shell (`mingw64.exe`), or start it explicitly:
+Install MSYS2 from <https://www.msys2.org/> (default location
+`C:\msys64`), then open the **MSYS2 MINGW64** shell (`mingw64.exe`):
 
 ```
 C:\msys64\mingw64.exe
@@ -261,13 +258,19 @@ pacman -S --needed \
     mingw-w64-x86_64-gtk3
 ```
 
-With the bundled MSYS2 in this repo, run the shell as:
+`run-irix.bat` finds your MSYS2 through the `MSYS2_ROOT` environment
+variable and falls back to `msys64` next to the script. If your MSYS2
+lives anywhere else, set it before running the launcher, e.g. in
+`cmd.exe`:
 
 ```
-C:\apps\0irix\qemu-irix\msys64\mingw64.exe
+set MSYS2_ROOT=C:\msys64
+run-irix.bat
 ```
 
-(or call `msys64\usr\bin\bash.exe -lc "..."` with `MSYSTEM=MINGW64`).
+(or set it permanently under System Properties → Environment Variables).
+The build itself only needs the MINGW64 shell above; the variable is
+just how the launcher locates the GTK runtime DLLs.
 
 Make sure you are in the **MINGW64** environment, not plain MSYS. Check with:
 
