@@ -46,18 +46,22 @@ attached as the install/overlay CD:
 | File | Purpose | Where it goes |
 |------|---------|---------------|
 | `ip24prom.070-9101-011.bin` | IP24 PROM BIOS (bios set `b10`, the `indy_4020` default), 524288 bytes | In the repo: `indy/` |
-| `irix65_4020.chd` | The bootable IRIX 6.5 disk (CHD format) | You supply it; path set via `IRIX_DISK` (Linux) or `IRIX_DISK`/`DISK` in `run-irix.bat` |
-| IRIX 6.5.22 Overlay ISO (optional) | Install/overlay CD on SCSI ID 4, attached only when configured | Anywhere; path set via `IRIX_CDROM` (Linux) or `CDROM` in `run-irix.bat` |
+| `A CHD image of Irix` | The bootable IRIX 6.5 disk (CHD format) | You supply it; path set via `IRIX_DISK` (Linux) or `IRIX_DISK`/`DISK` in `run-irix.bat` |
+| CDROM ISO (optional) | CD on SCSI ID 4, attached only when configured | Anywhere; path set via `IRIX_CDROM` (Linux) or `CDROM` in `run-irix.bat` |
 | `nvram/{eeprom,rtc}` | PROM NVRAM seed (IP24 uses a DS1386 8 KiB RTC) | In the repo: `indy/nvram/`; seeded automatically into `build/nvram/indy_4020/` on first run |
 
 The PROM image is the `ip24prom.070-9101-011.bin` member of the MAME
-`indy_4020` ROM set and is already extracted into `indy/` for you.
+indy_40xx ROM set and is already extracted into `indy/` for you.
 
-Do **not** substitute a different PROM, a different `indy_4020` revision, or a
+Do **not** substitute a different PROM, or a
 disk image from another machine — the emulation is matched to this exact
-configuration.
+configuration. indy_4015 will work fine.
 
-### 1.3 Toolchain versions used to develop this fork
+Alternatively you can of course try creating a clean install on CHD or on qemu native formats (qcow, raw).
+I have not tried it but see no obvious reason why it wouldn't work. You will need to fight with qemu 
+to load/eject mulitple CDROM images during installation.
+
+### 1.3 Toolchain versions 
 
 For reference, this fork has been built and verified with:
 
@@ -228,9 +232,6 @@ readme.md).
 ---
 
 ## 3. Building on Windows
-
-The Windows build uses **MSYS2** with the **MinGW-w64** toolchain, which
-you install yourself (it is not bundled with this repository).
 
 ### 3.1 Install MSYS2 and the toolchain
 
@@ -413,7 +414,7 @@ Check the binary reports the `indy` machine:
   holds `ip24prom.070-9101-011.bin` and you are using the `indy`
   machine, not `indigo2` or another SGI board.
 - **Disk will not mount / XFS recovery loops.** The CHD must be the
-  `indy_4020` IRIX 6.5 disk; a disk from another SGI model does not match this
+  `indy_40xx` IRIX 6.5 disk; a disk from another SGI model does not match this
   board.
 
 ---

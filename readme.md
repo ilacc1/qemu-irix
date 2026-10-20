@@ -1,17 +1,9 @@
 # qemu-irix
 
 A fork of [QEMU](https://github.com/qemu/QEMU) that boots **IRIX 6.5** on
-emulated **Silicon Graphics Indy (IP24)** hardware. It exists for one
-practical reason: the existing IRIX emulators either burn your CPU while the
-machine is idle or run the guest slow. This fork is built to
-fix both, and to add the CHD disk format to qemu - the format the Irix 
-emulation community uses.
+emulated **Silicon Graphics Indy (IP24)** hardware. 
 
-Current target, exclusively: **Indy (IP24), R4000SC @ 200 MHz**, matching the
-MAME `indy_4020` configuration (200 MHz, default `b10` PROM, `indy_4020`
-NVRAM). No other Indy variants and no IP22/Indigo2 target.
-
-All the new code is agent generated. Authors make no claim as to accuracy 
+All the new code is agent generated. Author makes no claim as to accuracy 
 or suitability for any use. 
 
 ## Why another IRIX emulator
