@@ -392,6 +392,13 @@ enum {
 #define VC2_CURSOR_MODE_GLYPH 0U
 #define VC2_CURSOR_MODE_BIT (1U << 8)
 #define VC2_CURSOR_SIZE_64 (1U << 9)
+/* Hardware-cursor x origin bias, in pixels. The VC2 fetch window is
+ * [CURSOR_X-31, CURSOR_X] with no bias (MAME newport.cpp get_cursor_pixel),
+ * but IRIX places the drawn pointer a further 7px left of that window's
+ * right edge; without it the arrow sits ~7px right of the click point.
+ * iris derives this as hpos_to_visible(40) - 31 - 2 = 7 (disp.rs
+ * decode_vc2_timings), where the -2 is IRIX's own two blank left columns. */
+#define SGI_GIO64_CURSOR_X_ADJUST 7
 /* XL24 (Newport) IDs. XMAP9 rev 3 matches MAME's xl24 wiring; CMAP rev 0x74
  * is what the PROM needs: high nibble 7 for the graphics info, low 3 bits
  * >= 2 for VC2 programming (MAME's 0x02 selects the wrong video tables). */
@@ -408,6 +415,7 @@ struct SGIGIO64State {
     QemuCond gfx_cond_idle;
     bool gfx_pending;
     bool gfx_busy;
+    bool gfx_ready;
     MemoryRegion bus;
     /* RB2 pixel store, internal only: like MAME's card, the CPU has no
      * linear VRAM window; pixels move via REX3 draw/host-dataport. */
@@ -630,7 +638,7 @@ static void sgi_gio64_damage_full(SGIGIO64State *state)
 /* Cursor moves only repaint the small fetch window (see cursor_pixel). */
 static void sgi_gio64_damage_cursor(SGIGIO64State *state)
 {
-    int cx = state->vc2_regs[VC2_REG_CURSOR_X];
+    int cx = state->vc2_regs[VC2_REG_CURSOR_X] - SGI_GIO64_CURSOR_X_ADJUST;
     int cy = state->vc2_regs[VC2_REG_CURSOR_Y];
 
     sgi_gio64_damage_union(state, cx - 31, cy - 31, cx, cy);
@@ -2839,11 +2847,20 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
  */
 static bool sgi_gfx_threaded;
 
+/* Upper bound on any wait for the worker, so a stuck worker degrades to
+ * synchronous drawing instead of wedging the vCPU. */
+#define SGI_GFX_WAIT_MS 100
+
 static void sgi_gio64_gfx_sync(SGIGIO64State *s)
 {
     qemu_mutex_lock(&s->gfx_mtx);
     while (s->gfx_busy || s->gfx_pending) {
-        qemu_cond_wait(&s->gfx_cond_idle, &s->gfx_mtx);
+        if (!qemu_cond_timedwait(&s->gfx_cond_idle, &s->gfx_mtx,
+                                 SGI_GFX_WAIT_MS)) {
+            /* Worker stalled: take over. gfx_busy means it is mid-draw and
+             * must not be doubled up on; bailing out keeps the vCPU live. */
+            break;
+        }
     }
     qemu_mutex_unlock(&s->gfx_mtx);
 }
@@ -2853,6 +2870,8 @@ static void *sgi_gio64_gfx_worker(void *opaque)
     SGIGIO64State *s = opaque;
 
     qemu_mutex_lock(&s->gfx_mtx);
+    s->gfx_ready = true;
+    qemu_cond_signal(&s->gfx_cond_idle);
     for (;;) {
         while (!s->gfx_pending) {
             qemu_cond_wait(&s->gfx_cond_work, &s->gfx_mtx);
@@ -2885,7 +2904,13 @@ static void sgi_gio64_go(SGIGIO64State *s)
     }
     qemu_mutex_lock(&s->gfx_mtx);
     while (s->gfx_busy || s->gfx_pending) {
-        qemu_cond_wait(&s->gfx_cond_idle, &s->gfx_mtx);
+        if (!qemu_cond_timedwait(&s->gfx_cond_idle, &s->gfx_mtx,
+                                 SGI_GFX_WAIT_MS)) {
+            /* Worker stalled: run this draw synchronously instead. */
+            qemu_mutex_unlock(&s->gfx_mtx);
+            sgi_gio64_rex3_command(s);
+            return;
+        }
     }
     s->gfx_pending = true;
     qemu_cond_signal(&s->gfx_cond_work);
@@ -4180,11 +4205,13 @@ static uint16_t sgi_gio64_vc2_next_did(SGIGIO64State *state)
 }
 
 /* VC2 cursor fetch, ported from vc2_device::is_cursor_active/
- * get_cursor_pixel (newport.cpp:777-814). */
+ * get_cursor_pixel (newport.cpp:777-814), plus the IRIX x-origin bias
+ * SGI_GIO64_CURSOR_X_ADJUST that iris carries as cursor_x_adjust. */
 static uint8_t sgi_gio64_cursor_pixel(SGIGIO64State *state, int x, int y)
 {
     uint16_t ctrl = state->vc2_regs[VC2_REG_DISPLAY_CTRL];
-    uint16_t cx = state->vc2_regs[VC2_REG_CURSOR_X];
+    uint16_t cx = state->vc2_regs[VC2_REG_CURSOR_X] -
+                  SGI_GIO64_CURSOR_X_ADJUST;
     uint16_t cy = state->vc2_regs[VC2_REG_CURSOR_Y];
     bool enabled = (ctrl & VC2_CURSOR_FUNC_ENABLE) &&
                    (ctrl & VC2_CURSOR_ENABLE) &&
@@ -4935,6 +4962,19 @@ static void sgi_gio64_realize(DeviceState *device, Error **errp)
     qemu_cond_init(&state->gfx_cond_idle);
     qemu_thread_create(&state->gfx_thread, "sgi-gio64-gfx",
                        sgi_gio64_gfx_worker, state, QEMU_THREAD_DETACHED);
+    /* Wait until the worker is parked in its loop, so the first GO cannot be
+     * queued before the worker exists to consume it. Bounded: if the worker
+     * does not start in time, fall back to synchronous draws rather than
+     * hang the vCPU. */
+    qemu_mutex_lock(&state->gfx_mtx);
+    while (!state->gfx_ready) {
+        if (!qemu_cond_timedwait(&state->gfx_cond_idle, &state->gfx_mtx,
+                                 SGI_GFX_WAIT_MS)) {
+            sgi_gfx_threaded = false;
+            break;
+        }
+    }
+    qemu_mutex_unlock(&state->gfx_mtx);
 
     qdev_init_gpio_out_named(device, state->gio_irq, "gio",
                              ARRAY_SIZE(state->gio_irq));
