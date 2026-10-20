@@ -79,8 +79,10 @@ CDROM_ISO=${IRIX_CDROM:-}
 PIO_TELNET_PORT=${IRIX_TELNET_PORT:-4444}
 MON_SOCK=${IRIX_MONITOR:-$ROOT_DIR/run/mon.sock}
 # The disk image is supplied by the user (not distributed with this
-# repository): point IRIX_DISK at your IRIX 6.5 CHD for the Indy.
-DISK=${IRIX_DISK:-}
+# repository): point IRIX_DISK at your IRIX 6.5 CHD for the Indy, e.g.
+#   IRIX_DISK=~/irix65_4020.chd ./run-irix.sh
+# A file named irix65_4020.chd next to this script is used by default.
+DISK=${IRIX_DISK:-$ROOT_DIR/irix65_4020.chd}
 
 # Guest RAM. The PROM sizes memory from the MC SIMM registers, not from
 # -m; -m only bounds the backing store (see header).
@@ -89,14 +91,16 @@ MC_SIMMS=${IRIX_MC_SIMMS:-0x0eee}
 MC_REV=${IRIX_MC_REV:-3}
 MC_ARGS=(-global "sgi-mc.simms=$MC_SIMMS" -global "sgi-mc.mc-rev=$MC_REV")
 
-if [ -z "$DISK" ]; then
-    echo "No disk image set. Export IRIX_DISK=/path/to/irix65.chd and retry." >&2
+if [ ! -f "$DISK" ]; then
+    echo "Disk image not found: $DISK" >&2
+    echo "Put irix65_4020.chd next to this script or export IRIX_DISK=/path/to/irix65.chd and retry." >&2
     exit 1
 fi
 
-if [ ! -f "$DISK" ]; then
-    echo "Disk image not found: $DISK" >&2
-    exit 1
+# Prefer the bundled lib/ closure over host libraries when present
+# (binary distributions ship it; source checkouts do not have it).
+if [ -d "$ROOT_DIR/lib" ]; then
+    export LD_LIBRARY_PATH="$ROOT_DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
 
 if [ -n "$CDROM_ISO" ] && [ ! -f "$CDROM_ISO" ]; then
@@ -192,7 +196,7 @@ echo "GTK window shows the PROM menu. Type there (window focused)."
 echo "PIO console (early boot only): telnet 127.0.0.1 $PIO_TELNET_PORT"
 echo "Monitor socket: $MON_SOCK"
 exec env -u GTK_PATH -u GTK_EXE_PREFIX -u GTK_IM_MODULE_FILE \
-    -u LD_LIBRARY_PATH -u LD_PRELOAD \
+    -u LD_PRELOAD \
     "$ROOT_DIR/build/qemu-system-mips64" \
     "${MACHINE_ARG[@]}" \
     "${AUDIO_ARGS[@]}" \

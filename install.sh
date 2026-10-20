@@ -1,76 +1,50 @@
 #!/usr/bin/env bash
 #
-# qemu-irix 0.1.0 — Ubuntu dependency installer.
+# qemu-irix 0.1.0 — Ubuntu dependency checker.
 #
-# Installs the runtime libraries qemu-system-mips64 needs (GTK3, GLib,
-# Pixman, audio), makes the binaries executable, and checks the TAP
-# setup for bridged networking. Run once after unpacking:
+# The runtime libraries qemu-system-mips64 needs ship inside this
+# distribution (lib/), so there is nothing to download. This script
+# just verifies the bundle is complete, makes the binaries executable,
+# and checks the TAP setup for bridged networking. Run once after
+# unpacking:
 #
 #   ./install.sh
 #
-# The IRIX disk image itself is NOT included: point IRIX_DISK at your
-# IRIX 6.5 CHD, e.g.  IRIX_DISK=~/irix65_4020.chd ./run-irix.sh
+# The IRIX disk image itself is NOT included: put irix65_4020.chd next
+# to run-irix.sh, or point IRIX_DISK at it, e.g.
+#   IRIX_DISK=~/irix65_4020.chd ./run-irix.sh
 set -euo pipefail
 
 cd "$(dirname "$0")"
 
-# soname -> Ubuntu package for the libraries the emulator links.
-declare -A PKGMAP=(
-    [libgtk-3.so.0]=libgtk-3-0
-    [libgdk-3.so.0]=libgtk-3-0
-    [libgdk_pixbuf-2.0.so.0]=libgdk-pixbuf-2.0-0
-    [libcairo.so.2]=libcairo2
-    [libcairo-gobject.so.2]=libcairo-gobject2
-    [libpango-1.0.so.0]=libpango-1.0-0
-    [libpangocairo-1.0-0.so.0]=libpango-1.0-0
-    [libatk-1.0.so.0]=libatk1.0-0t64
-    [libatk-bridge-2.0.so.0]=libatk-bridge2.0-0t64
-    [libglib-2.0.so.0]=libglib2.0-0t64
-    [libgobject-2.0.so.0]=libglib2.0-0t64
-    [libgio-2.0.so.0]=libglib2.0-0t64
-    [libgmodule-2.0.so.0]=libglib2.0-0t64
-    [libpixman-1.so.0]=libpixman-1-0
-    [libpulse.so.0]=libpulse0
-    [libasound.so.2]=libasound2t64
-    [libslirp.so.0]=libslirp0
-    [libcurl.so.4]=libcurl4
-    [libaio.so.1]=libaio1t64
-    [liburing.so.2]=liburing2
-)
-
 BIN=build/qemu-system-mips64
-MISSING_PKGS=()
-if [ -x "$BIN" ]; then
-    while read -r soname _; do
-        pkg="${PKGMAP[$soname]:-}"
-        if [ -z "$pkg" ]; then
-            echo "NOTE: $soname has no package mapping — install it manually if ldd reports it missing."
-            continue
-        fi
-        if ! dpkg -s "$pkg" >/dev/null 2>&1; then
-            MISSING_PKGS+=("$pkg")
-        fi
-    done < <(ldd "$BIN" 2>/dev/null | grep "not found" | awk '{print $1}')
-    # Also cover linked-but-present libs whose package may still be absent
-    # on minimal systems: check the mapped set directly.
-    while read -r soname _; do
-        pkg="${PKGMAP[$soname]:-}"
-        if [ -n "$pkg" ] && ! dpkg -s "$pkg" >/dev/null 2>&1; then
-            MISSING_PKGS+=("$pkg")
-        fi
-    done < <(ldd "$BIN" 2>/dev/null | awk '{print $1}' | grep -E '^lib(g(tk|dk|lib|object|io|module)|pixman|pulse|asound|slirp|curl|aio|uring|cairo|pango|atk|gdk_pixbuf)' | sort -u)
-    MISSING_PKGS=($(printf '%s\n' "${MISSING_PKGS[@]}" | sort -u))
+
+if [ ! -x "$BIN" ]; then
+    echo "ERROR: $BIN not found - re-extract the distribution tarball." >&2
+    exit 1
 fi
 
-if [ "${#MISSING_PKGS[@]}" -gt 0 ]; then
-    echo "Installing missing runtime libraries: ${MISSING_PKGS[*]}"
-    sudo apt-get update
-    sudo apt-get install -y "${MISSING_PKGS[@]}"
-else
-    echo "All runtime libraries present."
+# The bundle carries its own libs; the loader must resolve everything
+# through lib/ (plus the host libc, which always stays system-side).
+export LD_LIBRARY_PATH="$PWD/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+STILL_MISSING=$(ldd "$BIN" 2>/dev/null | grep "not found" | awk '{print $1}' | sort -u || true)
+if [ -n "$STILL_MISSING" ]; then
+    echo "ERROR: unresolved libraries even with the bundled lib/: $STILL_MISSING" >&2
+    echo "Re-extract the distribution tarball." >&2
+    exit 1
 fi
+echo "All runtime libraries present (bundled lib/)."
 
 chmod +x "$BIN" run-irix.sh install.sh 2>/dev/null || true
+
+if [ ! -f indy/ip24prom.070-9101-011.bin ]; then
+    echo "ERROR: indy/ip24prom.070-9101-011.bin missing - re-extract the tarball." >&2
+    exit 1
+fi
+if [ ! -f indy/nvram/rtc ]; then
+    echo "ERROR: indy/nvram/rtc missing - re-extract the tarball." >&2
+    exit 1
+fi
 
 # Bridged networking needs a TAP interface owned by you (default tap-iris).
 # This only REPORTS; setup is documented in networking.md. run-irix.sh
@@ -84,8 +58,9 @@ else
     echo "Setup guide: https://github.com/ilacc1/qemu-irix/blob/master/networking.md"
 fi
 
-if [ -z "${IRIX_DISK:-}" ]; then
-    echo "Reminder: set IRIX_DISK to your IRIX 6.5 disk image before running, e.g.:"
+if [ ! -f "${IRIX_DISK:-irix65_4020.chd}" ]; then
+    echo "Reminder: put irix65_4020.chd next to run-irix.sh, or set IRIX_DISK"
+    echo "to your IRIX 6.5 disk image before running, e.g.:"
     echo "  IRIX_DISK=\$HOME/irix65_4020.chd ./run-irix.sh"
 fi
 

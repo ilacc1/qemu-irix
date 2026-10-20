@@ -22,3 +22,5 @@ GTAGS
 *.gcov
 # Local agent notes; present for tooling, never published.
 /Agents.md
+# Release packaging output (built by release.sh / release.bat).
+/dist/
