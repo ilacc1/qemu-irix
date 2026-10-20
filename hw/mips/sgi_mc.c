@@ -45,6 +45,8 @@ struct SgiMcState {
     uint32_t rpss_counter;
     uint64_t rpss_last_ns;
     uint32_t memcfg[2];
+    uint32_t simms;
+    uint8_t mc_rev;
     uint32_t dma_regs[6];
     uint32_t dma_run;
     bool dma_run_unread;
@@ -346,19 +348,22 @@ static void sgi_mc_unmap_banks(SgiMcState *state, unsigned reg)
  *
  * MAME mc.cpp exposes these as the user-configurable SIMMS port (per
  * bank nibble: 1=4x1M, a=4x2M, 3=4x4M, c=4x8M, 5=4x16M, e=4x32M); the
- * installed size per rank is 1U << (field + 21 - rank). This machine
- * carries 4x32M dual-rank SIMMs in banks A+B (128MB each, 256MB total).
- * (MAME's own default is bank A 4x4M only; its ip24 0x03 default covers
- * the VALID register, a different port.) The machine's `-m` size only
- * bounds the backing store; the PROM sizes memory from these registers.
+ * installed size per rank is 1U << (field + 21 - rank). By default this
+ * machine carries 4x32M dual-rank SIMMs in banks A+B (128MB each, 256MB
+ * total); the `simms` property (settable via -global) overrides the whole
+ * nibble set to model other SIMM populations. (MAME's own default is bank
+ * A 4x4M only; its ip24 0x03 default covers the VALID register, a
+ * different port.) The machine's `-m` size only bounds the backing store;
+ * the PROM sizes memory from these registers.
  */
-#define SGI_MC_SIMMS 0x00ee
+#define SGI_MC_SIMMS_DEFAULT 0x00ee
 
-static void sgi_mc_installed_bank(unsigned bank, hwaddr ram_size,
+static void sgi_mc_installed_bank(SgiMcState *state, unsigned bank,
+                                  hwaddr ram_size,
                                   hwaddr *start, hwaddr *size,
                                   unsigned *rank)
 {
-    uint32_t simms = SGI_MC_SIMMS;
+    uint32_t simms = state->simms;
     unsigned field = (simms >> (bank * 4)) & 0x7;
     unsigned inst_rank = (simms >> (bank * 4 + 3)) & 1;
     hwaddr inst_size = 1ULL << (field + 21 - inst_rank);
@@ -424,7 +429,7 @@ static void sgi_mc_map_banks(SgiMcState *state, unsigned reg, uint32_t data)
         if (!rank_size) {
             continue;
         }
-        sgi_mc_installed_bank(bank_index, ram_size,
+        sgi_mc_installed_bank(state, bank_index, ram_size,
                               &inst_start, &inst_size, &inst_rank);
         if (!inst_size) {
             continue;
@@ -498,14 +503,17 @@ static uint64_t sgi_mc_read_inner(void *opaque, hwaddr addr, unsigned size)
         return state->watchdog;
     case 0x001c:
     case 0x0018:
-        /* System ID: rev C 0x03, bit 4 = EISA present (IP22 only).
-         * Big-endian kernels read it at 0x1c (mc.h SYSID), little-endian
-         * at 0x18; report rev C on both so mc_rev_level is 3 and the
-         * kernel does not warn about pre-rev-C MC with 16M DRAM parts.
-         * 0x13 on Indy misidentifies the board as IP22 from the very
-         * first PROM probe (wrong HAL2/IOC2 tables, wrong ARCS inventory,
-         * kernel never programs Local masks). */
-        return 0x03 | (state->eisa_present ? 0x10 : 0x00);
+        /* System ID: rev C 0x03 by default, bit 4 = EISA present (IP22
+         * only). Big-endian kernels read it at 0x1c (mc.h SYSID),
+         * little-endian at 0x18; report rev C on both so mc_rev_level is 3
+         * and the kernel does not warn about pre-rev-C MC with 16M DRAM
+         * parts. The `mc-rev` property overrides the revision nibble (e.g.
+         * rev E 0x05 makes the kernel use its >=5 sizing shift). Note that
+         * 0x13 on Indy misidentifies the board as IP22 from the very first
+         * PROM probe (wrong HAL2/IOC2 tables, wrong ARCS inventory, kernel
+         * never programs Local masks), which is why the EISA bit is kept
+         * clear on Indy. */
+        return state->mc_rev | (state->eisa_present ? 0x10 : 0x00);
     case 0x0028:
     case 0x002c:
         return state->rpss_divider;
@@ -883,6 +891,8 @@ static const Property sgi_mc_properties[] = {
     DEFINE_PROP_LINK("ram", SgiMcState, ram, TYPE_MEMORY_REGION,
                      MemoryRegion *),
     DEFINE_PROP_BOOL("eisa-present", SgiMcState, eisa_present, true),
+    DEFINE_PROP_UINT32("simms", SgiMcState, simms, SGI_MC_SIMMS_DEFAULT),
+    DEFINE_PROP_UINT8("mc-rev", SgiMcState, mc_rev, 0x03),
 };
 
 static void sgi_mc_class_init(ObjectClass *klass, const void *data)
