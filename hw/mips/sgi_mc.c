@@ -218,7 +218,10 @@ static void sgi_mc_dma_complete(void *opaque)
     bool to_host = state->dma_mode & (1U << 1);
     bool fill = state->dma_mode & (1U << 3);
     bool forwards = state->dma_mode & (1U << 4);
-    uint32_t gio_addr = state->dma_gio_addr;
+    /* iris VdmaJob::latch: gio_addr = state.gio_adr & !7. The GIO port is
+     * always addressed as a whole qword, so the low alignment bits are not
+     * part of the address (a misaligned port would split the transaction). */
+    uint32_t gio_addr = state->dma_gio_addr & ~7U;
 
     if (!line_count) {
         line_count = 1;
@@ -254,17 +257,29 @@ static void sgi_mc_dma_complete(void *opaque)
                     address_space_write(&address_space_memory, translated,
                                         MEMTXATTRS_UNSPECIFIED, buffer, length);
                 } else if (to_host) {
+                    /* iris dma_generic_bytes: the GIO side of a transfer is
+                     * always a whole 64-bit transaction. The read direction
+                     * consumes a full qword and scatters only `length` valid
+                     * bytes into memory. */
                     address_space_read(&address_space_memory,
                                        gio_addr,
-                                       MEMTXATTRS_UNSPECIFIED, buffer, length);
+                                       MEMTXATTRS_UNSPECIFIED, buffer, 8);
                     address_space_write(&address_space_memory, translated,
                                         MEMTXATTRS_UNSPECIFIED, buffer, length);
                 } else {
+                    /* Mem -> GIO: pack a ragged tail into a full qword
+                     * (buffer is zero-initialised, so the tail is zero-filled
+                     * exactly as iris does) and issue ONE 8-byte write.
+                     * Writing only `length` bytes makes the memory core split
+                     * a short tail (454 % 8 == 6) into 4+2 transactions; each
+                     * fragment re-arms the REX3 host port, so a line costs 58
+                     * draws instead of 57 and the stream runs one qword ahead
+                     * per row: the +8 px/row shear down the SysMgr pane. */
                     address_space_read(&address_space_memory, translated,
                                        MEMTXATTRS_UNSPECIFIED, buffer, length);
                     address_space_write(&address_space_memory,
                                         gio_addr,
-                                        MEMTXATTRS_UNSPECIFIED, buffer, length);
+                                        MEMTXATTRS_UNSPECIFIED, buffer, 8);
                 }
                 memory_addr += forwards ? length : -length;
                 remaining -= length;
