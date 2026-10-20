@@ -47,6 +47,7 @@
 #include "qapi/error.h"
 #include "qemu/error-report.h"
 #include "qemu/audio.h"
+#include "qemu/main-loop.h"
 #include "qemu/help_option.h"
 #include "qemu/timer.h"
 #ifdef CONFIG_TCG
@@ -1405,6 +1406,27 @@ static void sgi_hal2_vm_state(void *opaque, bool running, RunState state)
     }
 }
 
+/* Boot handshake: proves the main loop is alive before guest code runs.
+ * Reset runs on the vCPU thread while the main loop is already polling,
+ * so a bottom half scheduled here runs promptly; the wait is bounded so
+ * a wedged loop degrades to proceeding anyway. A same-thread handshake
+ * in machine init would deadlock, and TCP listen() is already synchronous
+ * long before the vCPUs start, so neither works as a readiness gate. */
+static QemuMutex sgi_boot_mtx;
+static QemuCond sgi_boot_cond;
+static bool sgi_boot_signalled;
+static QEMUBH *sgi_boot_bh;
+static bool sgi_boot_init;
+
+static void sgi_boot_bh_cb(void *opaque)
+{
+    (void)opaque;
+    qemu_mutex_lock(&sgi_boot_mtx);
+    sgi_boot_signalled = true;
+    qemu_cond_signal(&sgi_boot_cond);
+    qemu_mutex_unlock(&sgi_boot_mtx);
+}
+
 static void sgi_indy_board_reset(void *opaque)
 {
     /*
@@ -1414,6 +1436,21 @@ static void sgi_indy_board_reset(void *opaque)
      * is preserved.
      */
     (void)opaque;
+    if (!sgi_boot_init) {
+        sgi_boot_init = true;
+        qemu_mutex_init(&sgi_boot_mtx);
+        qemu_cond_init(&sgi_boot_cond);
+        sgi_boot_bh = qemu_bh_new(sgi_boot_bh_cb, NULL);
+    }
+    sgi_boot_signalled = false;
+    qemu_bh_schedule(sgi_boot_bh);
+    qemu_mutex_lock(&sgi_boot_mtx);
+    while (!sgi_boot_signalled) {
+        if (!qemu_cond_timedwait(&sgi_boot_cond, &sgi_boot_mtx, 5000)) {
+            break;
+        }
+    }
+    qemu_mutex_unlock(&sgi_boot_mtx);
     sgi_hpc3_intstat = 0;
     sgi_hpc3_misc = 0;
     memset(&sgi_hpc3_enet_dma, 0, sizeof(sgi_hpc3_enet_dma));
