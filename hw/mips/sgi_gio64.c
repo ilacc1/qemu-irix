@@ -394,8 +394,8 @@ enum {
 #define VC2_CURSOR_SIZE_64 (1U << 9)
 /* Hardware-cursor x origin bias, in pixels. The VC2 fetch window is
  * [CURSOR_X-31, CURSOR_X] with no bias (MAME newport.cpp get_cursor_pixel),
- * but IRIX places the drawn pointer a further 7px left of that window's
- * right edge; without it the arrow sits ~7px right of the click point.
+ * but IRIX draws the pointer a further 7px to the right of that window's
+ * right edge; without it the arrow sits ~7px left of the click point.
  * iris derives this as hpos_to_visible(40) - 31 - 2 = 7 (disp.rs
  * decode_vc2_timings), where the -2 is IRIX's own two blank left columns. */
 #define SGI_GIO64_CURSOR_X_ADJUST 7
@@ -638,7 +638,7 @@ static void sgi_gio64_damage_full(SGIGIO64State *state)
 /* Cursor moves only repaint the small fetch window (see cursor_pixel). */
 static void sgi_gio64_damage_cursor(SGIGIO64State *state)
 {
-    int cx = state->vc2_regs[VC2_REG_CURSOR_X] - SGI_GIO64_CURSOR_X_ADJUST;
+    int cx = state->vc2_regs[VC2_REG_CURSOR_X] + SGI_GIO64_CURSOR_X_ADJUST;
     int cy = state->vc2_regs[VC2_REG_CURSOR_Y];
 
     sgi_gio64_damage_union(state, cx - 31, cy - 31, cx, cy);
@@ -4210,7 +4210,7 @@ static uint16_t sgi_gio64_vc2_next_did(SGIGIO64State *state)
 static uint8_t sgi_gio64_cursor_pixel(SGIGIO64State *state, int x, int y)
 {
     uint16_t ctrl = state->vc2_regs[VC2_REG_DISPLAY_CTRL];
-    uint16_t cx = state->vc2_regs[VC2_REG_CURSOR_X] -
+    uint16_t cx = state->vc2_regs[VC2_REG_CURSOR_X] +
                   SGI_GIO64_CURSOR_X_ADJUST;
     uint16_t cy = state->vc2_regs[VC2_REG_CURSOR_Y];
     bool enabled = (ctrl & VC2_CURSOR_FUNC_ENABLE) &&
