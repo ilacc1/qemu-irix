@@ -22,6 +22,8 @@
 #include "qapi/error.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
+#include "system/reset.h"
+#include "system/rtc.h"
 #include "qom/object.h"
 #include "ui/input.h"
 
@@ -988,6 +990,55 @@ static uint8_t sgi_hpc3_inc_bcd(uint8_t *v, uint8_t max, uint8_t min_value,
     return 0;
 }
 
+/*
+ * Seed the DS1386 time fields from the host wall clock (local time, the
+ * QEMU mc146818 convention). Register layout follows the tick function
+ * below: 0x00 hundredths, 0x01 seconds, 0x02 minutes, 0x04 hours (bit
+ * 0x40 selects 12h with AM/PM in 0x80, otherwise 00-23), 0x06 weekday
+ * 01-07, 0x08 date, 0x09 month (top two bits are enables, preserved),
+ * 0x0a year. Control (0x0b), enables, and all env bytes are untouched.
+ */
+static uint8_t sgi_hpc3_to_bcd(unsigned v)
+{
+    return (uint8_t)(((v / 10) << 4) | (v % 10));
+}
+
+static void sgi_hpc3_resync_host_time(SgiHpc3State *state)
+{
+    struct tm tm;
+    unsigned hour;
+    uint8_t enables;
+
+    if (state->bbram_size < 0x0b) {
+        return;
+    }
+    qemu_get_timedate(&tm, 0);
+    state->bbram[0x00] = 0x00;
+    state->bbram[0x01] = sgi_hpc3_to_bcd((unsigned)tm.tm_sec);
+    state->bbram[0x02] = sgi_hpc3_to_bcd((unsigned)tm.tm_min);
+    hour = (unsigned)tm.tm_hour;
+    if (state->bbram[0x04] & 0x40) {
+        state->bbram[0x04] &= ~0x9f;
+        if (hour == 0) {
+            state->bbram[0x04] |= 0x12;
+        } else if (hour < 12) {
+            state->bbram[0x04] |= sgi_hpc3_to_bcd(hour);
+        } else if (hour == 12) {
+            state->bbram[0x04] |= 0x80 | 0x12;
+        } else {
+            state->bbram[0x04] |= 0x80 | sgi_hpc3_to_bcd(hour - 12);
+        }
+    } else {
+        state->bbram[0x04] &= ~0x3f;
+        state->bbram[0x04] |= sgi_hpc3_to_bcd(hour);
+    }
+    state->bbram[0x06] = sgi_hpc3_to_bcd((unsigned)tm.tm_wday + 1);
+    state->bbram[0x08] = sgi_hpc3_to_bcd((unsigned)tm.tm_mday);
+    enables = state->bbram[0x09] & 0xc0;
+    state->bbram[0x09] = enables | sgi_hpc3_to_bcd((unsigned)tm.tm_mon + 1);
+    state->bbram[0x0a] = sgi_hpc3_to_bcd((unsigned)(tm.tm_year % 100));
+}
+
 /* Mirror of MAME ds1386_device::advance_hundredths() (ds1386.cpp:200). */
 static void sgi_hpc3_bbram_tick(void *opaque)
 {
@@ -1212,6 +1263,7 @@ static char sgi_hpc3_nvram_dir[128] = "indy_4020";
 static SgiHpc3State *sgi_hpc3_nvram_state;
 
 static FILE *sgi_hpc3_open_nvram(const char *name, char *out, size_t outlen);
+static void sgi_hpc3_nvram_reset_flush(void *opaque);
 static void sgi_hpc3_note_nvram_paths(const char *eeprom, const char *rtc);
 static void sgi_hpc3_note_nvram_state(SgiHpc3State *state);
 
@@ -1292,6 +1344,22 @@ static void sgi_hpc3_realize(DeviceState *device, Error **errp)
         sgi_hpc3_note_nvram_paths(NULL, rtc_path);
     }
     sgi_hpc3_note_nvram_state(state);
+
+    /*
+     * Clock follows the host: seed the time fields from wall time at every
+     * boot (local time, QEMU mc146818 convention). The guest is then free
+     * to change the clock mid-session; the next boot re-syncs. Env bytes
+     * are never touched here, and persistence of whatever the guest
+     * commits happens on reset/exit via the write-back below.
+     */
+    sgi_hpc3_resync_host_time(state);
+
+    /*
+     * Persist NVRAM like the real thing: on every system reset (the PROM
+     * setenv-then-reset workflow) and at exit, not just at exit. A kill
+     * in between then loses one session of NVRAM history at most.
+     */
+    qemu_register_reset(sgi_hpc3_nvram_reset_flush, NULL);
 }
 
 static const VMStateDescription vmstate_sgi_hpc3 = {
@@ -1543,6 +1611,14 @@ static FILE *sgi_hpc3_open_nvram(const char *name, char *out, size_t outlen)
     return f;
 }
 
+static void sgi_hpc3_write_back_nvram(void);
+
+static void sgi_hpc3_nvram_reset_flush(void *opaque)
+{
+    (void)opaque;
+    sgi_hpc3_write_back_nvram();
+}
+
 static void sgi_hpc3_write_back_nvram(void)
 {
     SgiHpc3State *state = sgi_hpc3_nvram_state;
@@ -1553,29 +1629,47 @@ static void sgi_hpc3_write_back_nvram(void)
     }
     /* These paths are QEMU's own writable copies under <exe>/nvram/, never
      * the pristine seeds in reference/mame, so persisting PROM env cannot
-     * modify the reference tree. */
+     * modify the reference tree. Writes happen only when the content
+     * differs from what was last written back. */
     if (sgi_hpc3_nvram_eeprom_path[0] && state->eeprom &&
         access(sgi_hpc3_nvram_eeprom_path, W_OK) == 0) {
         uint16_t *data = eeprom93xx_data(state->eeprom);
         uint8_t bytes[256];
-        f = fopen(sgi_hpc3_nvram_eeprom_path, "wb");
-        if (f) {
-            /* MAME file format: native (LE) 16-bit cells. */
-            for (unsigned word = 0; word < 128; word++) {
-                bytes[word * 2] = data[word] & 0xff;
-                bytes[word * 2 + 1] = (data[word] >> 8) & 0xff;
+        static uint8_t last[sizeof(bytes)];
+        static bool have_last;
+
+        /* MAME file format: native (LE) 16-bit cells. */
+        for (unsigned word = 0; word < 128; word++) {
+            bytes[word * 2] = data[word] & 0xff;
+            bytes[word * 2 + 1] = (data[word] >> 8) & 0xff;
+        }
+        if (!have_last || memcmp(bytes, last, sizeof(bytes)) != 0) {
+            f = fopen(sgi_hpc3_nvram_eeprom_path, "wb");
+            if (f) {
+                fwrite(bytes, 1, sizeof(bytes), f);
+                fclose(f);
+                memcpy(last, bytes, sizeof(bytes));
+                have_last = true;
             }
-            fwrite(bytes, 1, sizeof(bytes), f);
-            fclose(f);
         }
     }
     if (sgi_hpc3_nvram_rtc_path[0] && sgi_hpc3_nvram_state &&
         access(sgi_hpc3_nvram_rtc_path, W_OK) == 0) {
         /* Persist the full DS1286/DS1386_8K image MAME uses. */
-        f = fopen(sgi_hpc3_nvram_rtc_path, "wb");
-        if (f) {
-            fwrite(state->bbram, 1, state->bbram_size, f);
-            fclose(f);
+        static uint8_t last[0x2000];
+        static bool have_last;
+
+        if (!have_last || state->bbram_size > sizeof(last) ||
+            memcmp(state->bbram, last, state->bbram_size) != 0) {
+            f = fopen(sgi_hpc3_nvram_rtc_path, "wb");
+            if (f) {
+                fwrite(state->bbram, 1, state->bbram_size, f);
+                fclose(f);
+                if (state->bbram_size <= sizeof(last)) {
+                    memcpy(last, state->bbram, state->bbram_size);
+                    have_last = true;
+                }
+            }
         }
     }
 }
