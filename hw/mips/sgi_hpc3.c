@@ -1403,6 +1403,43 @@ static char *sgi_hpc3_try_seed(const char *nvram_root, const char *name)
     return path;
 }
 
+/* Directory holding the running QEMU executable, without a trailing
+ * separator.  Portable across Linux (/proc/self/exe) and Windows
+ * (GetModuleFileNameA), which is what lets NVRAM live beside the binary
+ * on both. */
+static bool sgi_hpc3_exe_dir(char *dir, size_t size)
+{
+    char exe[4096];
+    ssize_t n;
+    char *slash;
+
+#ifdef _WIN32
+    n = GetModuleFileNameA(NULL, exe, sizeof(exe) - 1);
+#else
+    n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+#endif
+    if (n <= 0) {
+        return false;
+    }
+    exe[n] = '\0';
+    slash = strrchr(exe, '/');
+#ifdef _WIN32
+    {
+        char *bslash = strrchr(exe, '\\');
+
+        if (bslash && (!slash || bslash > slash)) {
+            slash = bslash;
+        }
+    }
+#endif
+    if (!slash || strlen(exe) >= size) {
+        return false;
+    }
+    *slash = '\0';
+    strcpy(dir, exe);
+    return true;
+}
+
 static char *sgi_hpc3_find_seed(const char *name)
 {
     static const char *const roots[] = {
@@ -1411,21 +1448,15 @@ static char *sgi_hpc3_find_seed(const char *name)
     };
     char exe[4096];
     char *found = NULL;
-    ssize_t exe_len;
     unsigned i;
 
     /* 1. Relative to the QEMU executable (qemu/build -> repo root). */
-    exe_len = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
-    if (exe_len > 0) {
-        char *slash = strrchr(exe, '/');
-        if (slash) {
-            char *root;
-            *slash = '\0';
-            root = g_strdup_printf("%s/../../reference/mame/run/nvram",
-                                  exe);
-            found = sgi_hpc3_try_seed(root, name);
-            g_free(root);
-        }
+    if (sgi_hpc3_exe_dir(exe, sizeof(exe))) {
+        char *root = g_strdup_printf("%s/../../reference/mame/run/nvram",
+                                     exe);
+
+        found = sgi_hpc3_try_seed(root, name);
+        g_free(root);
     }
     /* 2. Relative to cwd (repo root via run-irix.sh, or qemu/build). */
     for (i = 0; !found && i < G_N_ELEMENTS(roots); i++) {
@@ -1470,18 +1501,12 @@ static FILE *sgi_hpc3_open_nvram(const char *name, char *out, size_t outlen)
     char *work_path;
     char *seed_path = NULL;
     FILE *f;
-    ssize_t exe_len;
 
     out[0] = '\0';
 
     /* QEMU's own writable copy, kept beside the binary. */
-    exe_len = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
-    if (exe_len > 0) {
-        char *slash = strrchr(exe, '/');
-        if (slash) {
-            *slash = '\0';
-            work_root = g_strdup(exe);
-        }
+    if (sgi_hpc3_exe_dir(exe, sizeof(exe))) {
+        work_root = g_strdup(exe);
     }
     if (!work_root) {
         work_root = g_strdup("qemu/build");
