@@ -62,6 +62,14 @@ Happens sometimes, in the qemu window just open the Machine menu and hit "Reset"
 There are a few. Occasional shearing here and there, background refresh and 
 colour maps in some demos are wrong. 
 
+### ec3 sometimes reports error on boot
+
+Safe to ignore. Unrelated to your main adapter which should be ec0.
+
+### Panics / application crashes
+
+Likely at this stage.
+
 ## Notes and tips
 
 ### Mouse / keyboard capture
