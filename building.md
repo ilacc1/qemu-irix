@@ -39,14 +39,15 @@ qemu-irix/
 ### 1.2 Runtime data
 
 The PROM image and NVRAM seeds ship in `indy/` with the source. The disk
-image and any CD ISO are **not** distributed with the source (size and
-licensing) — you supply those yourself:
+image is **not** distributed with the source (size and licensing) — you
+supply it yourself. A CD ISO is never required; one can optionally be
+attached as the install/overlay CD:
 
 | File | Purpose | Where it goes |
 |------|---------|---------------|
 | `ip24prom.070-9101-011.bin` | IP24 PROM BIOS (bios set `b10`, the `indy_4020` default), 524288 bytes | In the repo: `indy/` |
 | `irix65_4020.chd` | The bootable IRIX 6.5 disk (CHD format) | You supply it; path set via `IRIX_DISK` (Linux) or `IRIX_DISK`/`DISK` in `run-irix.bat` |
-| IRIX 6.5.22 Overlay ISO | Install/overlay CD attached as a CD-ROM | Anywhere; path set via `IRIX_CDROM` (Linux) or `CDROM` in `run-irix.bat` |
+| IRIX 6.5.22 Overlay ISO (optional) | Install/overlay CD on SCSI ID 4, attached only when configured | Anywhere; path set via `IRIX_CDROM` (Linux) or `CDROM` in `run-irix.bat` |
 | `nvram/{eeprom,rtc}` | PROM NVRAM seed (IP24 uses a DS1386 8 KiB RTC) | In the repo: `indy/nvram/`; seeded automatically into `build/nvram/indy_4020/` on first run |
 
 The PROM image is the `ip24prom.070-9101-011.bin` member of the MAME

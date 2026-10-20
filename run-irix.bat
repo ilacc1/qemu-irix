@@ -29,6 +29,8 @@ set "QEMU=build\qemu-system-mips64.exe"
 set "BIOS=indy\ip24prom.070-9101-011.bin"
 if not "%IRIX_DISK%"=="" set "DISK=%IRIX_DISK%"
 if "%DISK%"=="" set "DISK=irix65_4020.chd"
+rem Optional CD image (SCSI ID 4); leave IRIX_CDROM unset for no CD, e.g.:
+rem   set IRIX_CDROM=C:\isos\overlay.iso ^& run-irix.bat
 if not "%IRIX_CDROM%"=="" set "CDROM=%IRIX_CDROM%"
 
 if not exist "%QEMU%" ( echo ERROR: %QEMU% not found - build it first. & goto :end )

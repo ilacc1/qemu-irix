@@ -73,6 +73,8 @@ DISPLAY_MODE=${IRIX_DISPLAY:-"gtk,zoom-to-fit=on"}
 MACHINE=${IRIX_MACHINE:-indy}
 # bios set b10 = index 0 = MAME indy_4020's default BIOS.
 BIOS_IMAGE=${IRIX_BIOS:-ip24prom.070-9101-011.bin}
+# Optional CD image (SCSI ID 4). Leave IRIX_CDROM unset for no CD, e.g.:
+#   IRIX_DISK=~/irix65_4020.chd IRIX_CDROM=~/overlay.iso ./run-irix.sh
 CDROM_ISO=${IRIX_CDROM:-}
 PIO_TELNET_PORT=${IRIX_TELNET_PORT:-4444}
 MON_SOCK=${IRIX_MONITOR:-$ROOT_DIR/run/mon.sock}
