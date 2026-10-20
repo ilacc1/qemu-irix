@@ -2667,13 +2667,13 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
     int x = x_start;
     int y = y_start;
     /* Iris draw_block_g: the shade DDA runs continuously across rows
-     * (no per-row base reload); block rows restart the pattern cursors
-     * at bit 31 while lsrcount continues. Span continues the stream. */
+     * (no per-row base reload). The pattern cursors are NOT restarted
+     * here: iris resets them only on DOSETUP (execute_go) and when a row
+     * completes (rex3_generic.rs:1434). Restarting at every row top made
+     * each one-word-per-GO host fill re-sample the pattern from bit 31,
+     * so the same pattern bits landed on the same slot of every 8-pixel
+     * word and painted fixed 2px vertical stripes. */
     do {
-        if (address_mode == 1) {
-            state->pat_bit = 31;
-            state->zpat_bit = 31;
-        }
         do {
             /* No draw-coords range guard (MAME/iris call the pixel body
              * unconditionally): x is pre-window, so a nonzero window
@@ -2747,15 +2747,24 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
             }
         } while (x != prim_end_x && x != x_end && stop_on_x);
         if ((x_step > 0 && x >= x_end) || (x_step < 0 && x <= x_end)) {
-            /* A row boundary is a forced word boundary: drop any pixels
-             * left in the current word so the next row starts fresh (iris
-             * rex3_generic.rs:1459-1471). */
-            if (((mode0 >> 6) & 1) && ((state->draw_mode1 >> 7) & 1) &&
-                state->host_shift != sgi_gio64_host_initial_shift(state)) {
-                state->host_shift = sgi_gio64_host_initial_shift(state);
-            }
             x = state->x_save;
             y += address_mode == 1 ? y_step : 0;
+            /* Iris draw_block_g (rex3_generic.rs:1434-1435): the pattern
+             * cursors restart at bit 31 when, and only when, a row
+             * completes. lsrcount (LSMODE bits 7:0) keeps running. */
+            if (address_mode == 1) {
+                state->pat_bit = 31;
+                state->zpat_bit = 31;
+            }
+            /* Iris draw_block_g (rex3_generic.rs:1471-1473): a partial host
+             * word at a row boundary ends the primitive instead of being
+             * carried (stale) into the next row. Continuing re-reads the
+             * drained shifter and smears columns down the rectangle. */
+            if (((mode0 >> 6) & 1) && ((state->draw_mode1 >> 7) & 1) &&
+                state->host_len <= 1 &&
+                state->host_shift != sgi_gio64_host_initial_shift(state)) {
+                break;
+            }
         } else if (!stop_on_x) {
             /* Single-pixel row: draw once and stop instead of spinning. */
             break;
@@ -3045,13 +3054,13 @@ static uint64_t sgi_gio64_xl24_read_reg(void *opaque, hwaddr addr,
 
                     switch (state->xmap_mode_index[head] & 3) {
                     case 0:
-                        ret = (uint64_t)(entry >> 16) << 32;
+                        ret = (uint64_t)(entry & 0xff) << 32;
                         break;
                     case 1:
                         ret = (uint64_t)((entry >> 8) & 0xff) << 32;
                         break;
                     case 2:
-                        ret = (uint64_t)(entry & 0xff) << 32;
+                        ret = (uint64_t)((entry >> 16) & 0xff) << 32;
                         break;
                     default:
                         break;
@@ -3842,6 +3851,7 @@ static void sgi_gio64_xl24_write(void *opaque, hwaddr addr,
                     }
                 }
             }
+            sgi_gio64_damage_full(state);
             break;
         }
         case DCB_ADDR_XMAP01:
@@ -3919,11 +3929,11 @@ static void sgi_gio64_xl24_write(void *opaque, hwaddr addr,
                 /* Per-channel LUTs (MAME ramdac_write), applied after the
                  * palette/direct stage by ramdac_remap. */
                 state->ramdac_lut_r[state->ramdac_index] =
-                    (uint8_t)(state->dcb_data_msw >> 8) << 16;
+                    (uint8_t)(state->dcb_data_msw >> 24) << 16;
                 state->ramdac_lut_g[state->ramdac_index] =
                     (uint8_t)(state->dcb_data_msw >> 16) << 8;
                 state->ramdac_lut_b[state->ramdac_index] =
-                    (uint8_t)(state->dcb_data_msw >> 24);
+                    (uint8_t)(state->dcb_data_msw >> 8);
                 state->ramdac_index++;
                 sgi_gio64_damage_full(state);
             }
@@ -4651,7 +4661,9 @@ static bool sgi_gio64_update_display(void *opaque)
                         break;
                     }
                     break;
-                case 1: /* RGB Map0: direct BGR conversion */
+                case 1: /* RGB Map0 */
+                case 2: /* RGB Map1 */
+                default: /* RGB Map2: iris expands every RGB mode identically */
                     switch (pix_size) {
                     case 0: {
                         uint8_t shift = (table & 1) ? 4 : 0;
@@ -4688,12 +4700,6 @@ static bool sgi_gio64_update_display(void *opaque)
                         break;
                     }
                     }
-                    break;
-                case 2: /* RGB Map1: MAME debug magenta */
-                    rgb = 0xff00ff;
-                    break;
-                default: /* RGB Map2: MAME debug green */
-                    rgb = 0x00ff00;
                     break;
                 }
                 if (dbg && (y == 320 || y == 500 || y == 832) &&
