@@ -55,7 +55,7 @@ indy_40xx ROM set and is already extracted into `indy/` for you.
 
 Do **not** substitute a different PROM, or a
 disk image from another machine — the emulation is matched to this exact
-configuration. indy_4015 will work fine.
+configuration. Image created with indy_4015 will work fine.
 
 Alternatively you can of course try creating a clean install on CHD or on qemu native formats (qcow, raw).
 I have not tried it but see no obvious reason why it wouldn't work. You will need to fight with qemu 

@@ -153,6 +153,16 @@ else
               -netdev "user,id=net0")
 fi
 
+# Tolerate a missing TAP interface: warn (with a pointer to the setup
+# guide) and boot without networking instead of failing.
+if [ "${IRIX_NETMODE:-tap}" = "tap" ] && [ -z "${IRIX_NONET:-}" ]; then
+    if ! (command -v ip >/dev/null 2>&1 && ip link show "$IRIX_TAP_IF" >/dev/null 2>&1); then
+        echo "WARNING: TAP interface '$IRIX_TAP_IF' not found - guest will have no network." >&2
+        echo "See https://github.com/ilacc1/qemu-irix/blob/master/networking.md to set it up." >&2
+        NET_ARGS=()
+    fi
+fi
+
 # Audio wiring for the HAL2 boot chime (see header).
 AUDIO_BACKEND=${IRIX_AUDIO:-pa}
 AUDIO_ID=sgiaudio
