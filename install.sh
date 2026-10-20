@@ -73,16 +73,15 @@ fi
 chmod +x "$BIN" run-irix.sh install.sh 2>/dev/null || true
 
 # Bridged networking needs a TAP interface owned by you (default tap-iris).
-# This only REPORTS; creating interfaces/bridges is host-specific, so it is
-# left to you. run-irix.sh defaults to TAP; use IRIX_NETMODE=user for
-# SLIRP (if built in) or IRIX_NONET=1 to skip networking entirely.
+# This only REPORTS; setup is documented in networking.md. run-irix.sh
+# boots without networking when the TAP is absent; use IRIX_NETMODE=user
+# for SLIRP (if built in) or IRIX_NONET=1 to skip networking entirely.
 if ip tuntap show 2>/dev/null | grep -q .; then
     echo "TAP interfaces present:"
     ip tuntap show
 else
-    echo "NOTE: no TAP interfaces found. For bridged networking create one, e.g.:"
-    echo "  sudo ip tuntap add dev tap-iris mode tap user \$USER"
-    echo "  (then enslave it to your bridge; or run with IRIX_NETMODE=user / IRIX_NONET=1)"
+    echo "NOTE: no TAP interfaces found - the guest will have no network."
+    echo "Setup guide: https://github.com/ilacc1/qemu-irix/blob/master/networking.md"
 fi
 
 if [ -z "${IRIX_DISK:-}" ]; then

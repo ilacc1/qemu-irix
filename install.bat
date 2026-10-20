@@ -116,11 +116,8 @@ rem --- TAP adapter - driver install needs admin; only reported here ---------
 ipconfig | findstr /i /c:"my-tap" >nul
 if errorlevel 1 (
     echo.
-    echo NOTE: no 'my-tap' TAP adapter found. run-irix.bat uses
-    echo tap,ifname=my-tap - bridged networking needs the adapter:
-    echo   1. Install the TAP driver - OpenVPN TAP-Windows6 package.
-    echo   2. Rename the new TAP adapter to my-tap in Network Connections.
-    echo Until then the guest has no network; everything else still works.
+    echo NOTE: no 'my-tap' TAP adapter found - guest will have no network.
+    echo Setup guide: https://github.com/ilacc1/qemu-irix/blob/master/networking.md
 ) else (
     echo TAP adapter 'my-tap' found.
 )

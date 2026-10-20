@@ -6,6 +6,12 @@ emulated **Silicon Graphics Indy (IP24)** hardware.
 All the new code is agent generated. Author makes no claim as to accuracy 
 or suitability for any use. 
 
+## Just get it running
+
+1. Get the release zip / tar.gz for your OS and run either install.bat or install.sh
+2. Get the indy_40xx compatible CHD from any source (mame presumably)
+3. See [networking.md](networking.md) if you want to have access to the network. Of course, these are ancient systems and highly insecure so beware.
+
 ## Why another IRIX emulator
 
 ### 1. The host sleeps when the guest sleeps
