@@ -24,3 +24,6 @@ GTAGS
 /Agents.md
 # Release packaging output (built by release.sh / release.bat).
 /dist/
+# Disk images and ISOs are user-supplied, never committed.
+*.chd
+*.iso

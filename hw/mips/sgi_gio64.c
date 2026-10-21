@@ -1235,9 +1235,13 @@ static uint32_t sgi_gio64_host_color(SGIGIO64State *state)
     return (blue & 0xc0) | ((green & 0xe0) >> 2) | ((red & 0xe0) >> 5);
 }
 
-/* 4x4 Bayer matrix (MAME s_bayer == iris BAYER_PACKED). */
+/* 4x4 Bayer matrix, indexed [x & 3][y & 3]. iris BAYER_PACKED
+ * (rex3_generic.rs) is indexed by (y<<2)|x, i.e. the transpose of this
+ * layout: entry [x][y] equals iris threshold M[y][x]. Rows y=1 of the x=0
+ * and x=1 columns previously held 12/4 (the transpose's values), which
+ * flipped the dither cell at (0,1) and (1,1). */
 static const uint8_t sgi_gio64_bayer[4][4] = {
-    { 0, 12, 3, 15 }, { 8, 4, 11, 7 },
+    { 0, 4, 3, 15 }, { 8, 12, 11, 7 },
     { 2, 14, 1, 13 }, { 10, 6, 9, 5 },
 };
 
@@ -1247,6 +1251,15 @@ static uint32_t sgi_gio64_shaded_color(SGIGIO64State *state, int x, int y)
     uint32_t green = sgi_gio64_clamp_color(state->curr_color_green);
     uint32_t blue = sgi_gio64_clamp_color(state->curr_color_blue);
     uint32_t alpha = sgi_gio64_clamp_color(state->curr_color_alpha);
+
+    /* MAME get_rgb_color stores the clamped alpha in bits 31:24
+     * (`alpha <<= 24`), NOT in the low byte. The plane color lives in
+     * bits 23:0 (or fewer), and expand_to_all_lanes only replicates the
+     * plane-width bits, so the high alpha byte never reaches VRAM. ORing
+     * alpha unshifted into the low byte (as this used to) let a nonzero
+     * alpha current (e.g. the clear alpha 0x33) bleed into the first
+     * channel, so a black fill came out 0x033 -> expand 0x33033 (yellow). */
+    alpha <<= 24;
 
     if (!((state->draw_mode1 >> 15) & 1)) {
         return state->color_i & 0xff;
@@ -1354,7 +1367,7 @@ static uint32_t sgi_gio64_shaded_color(SGIGIO64State *state, int x, int y)
                ((red & 0xf0) >> 4);
     }
     if (((state->draw_mode1 >> 3) & 3) == 3) {
-        return (blue << 16) | (green << 8) | red | (alpha << 24);
+        return (blue << 16) | (green << 8) | red | alpha;
     }
     return ((blue & 0xc0) | ((green & 0xe0) >> 2) |
             ((red & 0xe0) >> 5));
@@ -1363,6 +1376,22 @@ static uint32_t sgi_gio64_shaded_color(SGIGIO64State *state, int x, int y)
 static int32_t sgi_gio64_sext_bits(uint32_t value, unsigned bits)
 {
     return (int32_t)(value << (32 - bits)) >> (32 - bits);
+}
+
+/* iris clamp_shade (rex3_generic.rs): RGB-mode DDA currents are clamped in
+ * place after every shade step, not just at read-out. The integer part is
+ * bits[22:11] & 0x1FF; a value below 0x100 is kept verbatim (fraction and
+ * all), 0x100..0x17F pins to 0xFF (0x7FFFF, fraction dropped), and >= 0x180
+ * or a negative (bit31) current pins to 0. Mutating the accumulator matters:
+ * it changes the trajectory of the next few steps, not just this read. */
+static int32_t sgi_gio64_clamp_shade(int32_t c)
+{
+    uint32_t val = ((uint32_t)c >> 11) & 0x1ff;
+
+    if (c < 0 || val >= 0x180) {
+        return 0;
+    }
+    return val > 0xff ? 0x0007ffff : c;
 }
 
 static void sgi_gio64_iterate_shade(SGIGIO64State *state)
@@ -1386,6 +1415,14 @@ static void sgi_gio64_iterate_shade(SGIGIO64State *state)
     if (state->slope_alpha & 0x7ffff) {
         state->curr_color_alpha +=
             sgi_gio64_sext_bits((uint32_t)state->slope_alpha, 20);
+    }
+    /* iris iterate_shade clamps each current in RGB mode right here. */
+    if ((state->draw_mode1 >> 15) & 1) {
+        state->curr_color_red = sgi_gio64_clamp_shade(state->curr_color_red);
+        state->curr_color_green = sgi_gio64_clamp_shade(state->curr_color_green);
+        state->curr_color_blue = sgi_gio64_clamp_shade(state->curr_color_blue);
+        state->curr_color_alpha =
+            sgi_gio64_clamp_shade(state->curr_color_alpha);
     }
 }
 
@@ -1681,6 +1718,70 @@ static uint32_t sgi_gio64_blend_rgb24(SGIGIO64State *state, uint32_t src,
     return out;
 }
 
+/* TEMP wrong-colour store probe (SGI_GIO_STORE=1): logs the first stores of
+ * each distinct (mode0, mode1) pair with every input that shapes the stored
+ * word, so the emitter of a suspect constant (e.g. 0x033) can be located. */
+static int sgi_store_on = -1;
+static bool sgi_store_enabled(void)
+{
+    if (sgi_store_on < 0) {
+        sgi_store_on = getenv("SGI_GIO_STORE") ? 1 : 0;
+    }
+    return sgi_store_on != 0;
+}
+
+typedef struct SGIStoreSeen {
+    uint32_t m0;
+    uint32_t m1;
+    unsigned n;
+} SGIStoreSeen;
+
+static SGIStoreSeen sgi_store_seen[64];
+static unsigned sgi_store_nseen;
+
+static void sgi_store_log(SGIGIO64State *state, int x, int y, uint32_t color,
+                          uint32_t mask, uint32_t dst, uint32_t expanded,
+                          uint32_t out, uint32_t result, unsigned coverage)
+{
+    uint32_t m0 = state->draw_mode0;
+    uint32_t m1 = state->draw_mode1;
+    unsigned i;
+
+    for (i = 0; i < sgi_store_nseen; i++) {
+        if (sgi_store_seen[i].m0 == m0 && sgi_store_seen[i].m1 == m1) {
+            if (sgi_store_seen[i].n >= 4) {
+                return;
+            }
+            sgi_store_seen[i].n++;
+            break;
+        }
+    }
+    if (i == sgi_store_nseen) {
+        if (sgi_store_nseen >= 64) {
+            return;
+        }
+        sgi_store_seen[i].m0 = m0;
+        sgi_store_seen[i].m1 = m1;
+        sgi_store_seen[i].n = 1;
+        sgi_store_nseen++;
+    }
+    fprintf(stderr, "STORE m0=%08x m1=%08x pd=%u rgb=%u dith=%u op=%u "
+            "wm=%06x x=%d y=%d xy=(%d,%d) color=%06x exp=%06x cr=%08x cg=%08x "
+            "cb=%08x ca=%08x ci=%06x cv=%06x dst=%08x out=%08x res=%08x\n",
+            m0, m1, state->plane_depth,
+            (state->draw_mode1 >> 15) & 1, (state->draw_mode1 >> 16) & 1,
+            (state->draw_mode1 >> 28) & 0xf,
+            mask, x, y, x + (int)state->x_window - 0x1000,
+            y + (int)state->y_window - 0x1000,
+            color, expanded, (uint32_t)state->curr_color_red,
+            (uint32_t)state->curr_color_green,
+            (uint32_t)state->curr_color_blue,
+            (uint32_t)state->curr_color_alpha,
+            state->color_i & 0xffffff, state->color_vram & 0xffffff,
+            dst, out, result);
+    (void)coverage;
+}
+
 static void sgi_gio64_put_pixel(SGIGIO64State *state, uint32_t *vram,
                                  uint32_t *aux,
                                  int x, int y, uint32_t color, uint32_t mask,
@@ -1773,6 +1874,10 @@ static void sgi_gio64_put_pixel(SGIGIO64State *state, uint32_t *vram,
     }
     mask &= XL24_GLOBAL_MASK;
     *pixel = (dst & ~mask) | (out & mask);
+    if (sgi_store_enabled()) {
+        sgi_store_log(state, x, y, color, mask, dst, expanded, out,
+                      *pixel, coverage);
+    }
     if (sgi_rowmap_enabled()) {
         sgi_row_note(state->draw_mode0, x, y, *pixel, 1);
     }
@@ -1810,7 +1915,8 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
         fprintf(stderr, "SEQ n=%llu m0=%08x m1=%08x pd=%u zpat=%08x "
                 "lspat=%08x ls=%08x xs=%d ys=%d xe=%d ye=%d xsv=%d "
                 "mv=(%d,%d) hlen=%u hstg=%u hs=%u cfg=%08x "
-                "win=(%d,%d) ci=%06x cv=%06x clip=%04x sm=%04x/%04x\n",
+                "win=(%d,%d) ci=%06x cv=%06x clip=%04x sm=%04x/%04x "
+                "sm0=%08x/%08x sm1=%08x/%08x wm=%06x\n",
                 (unsigned long long)sgi_seq_n++, mode0, state->draw_mode1,
                 state->plane_depth, state->z_pattern,
                 state->line_stipple_pattern, state->ls_mode,
@@ -1822,7 +1928,10 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
                 (int)state->x_window - 0x1000, (int)state->y_window - 0x1000,
                 state->color_i & 0xffffff, state->color_vram & 0xffffff,
                 state->clip_mode & 0x1fff,
-                state->screenmask_x[0] & 0xffff, state->screenmask_y[0] & 0xffff);
+                state->screenmask_x[0] & 0xffff, state->screenmask_y[0] & 0xffff,
+                state->screenmask_x[0], state->screenmask_y[0],
+                state->screenmask_x[1], state->screenmask_y[1],
+                state->write_mask & 0xffffff);
     }
 
     /* Arm the host transfer: a loud PIO write is len == 1 (scalar path);
@@ -1836,6 +1945,19 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
     } else {
         state->host_len = 0;
         state->host_cursor = 0;
+    }
+    /* TEMP wrong-colour trace: staged word bits at each GO (with SEQLOG).
+     * Joins to the SEQ line above via n (already incremented there). */
+    if (sgi_seq_enabled() && state->host_len > 0) {
+        uint32_t hl = state->host_len > 16384 ? 16384 : state->host_len;
+
+        fprintf(stderr, "SEQW n=%llu len=%u w0=%016llx w1=%016llx "
+                "w2=%016llx w3=%016llx\n",
+                (unsigned long long)sgi_seq_n - 1, state->host_len,
+                (unsigned long long)state->host_words[0],
+                (unsigned long long)(hl > 1 ? state->host_words[1] : 0),
+                (unsigned long long)(hl > 2 ? state->host_words[2] : 0),
+                (unsigned long long)(hl > 3 ? state->host_words[3] : 0));
     }
     if (sgi_pl_enabled() && opcode >= 1 && opcode <= 3) {
         uint8_t flags = ((mode0 >> 6) & 1) | (((mode0 >> 12) & 1) << 1) |
@@ -2609,6 +2731,11 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
                         &ffb[(size_t)dy * XL24_STRIDE + cx0];
                     int i;
 
+                    if (sgi_store_enabled()) {
+                        sgi_store_log(state, cx0, dy, fcol, fmask, dst[0],
+                                      fcol, fcol, (dst[0] & ~fmask) |
+                                      (fcol & fmask), 255);
+                    }
                     if (fmask == 0x00ffffffu) {
                         /* Full-word store, no readback. Byte-replicated
                          * colors (8-bit CI fills) go through memset. */
@@ -2767,11 +2894,23 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
             /* Iris draw_block_g (rex3_generic.rs:1471-1473): a partial host
              * word at a row boundary ends the primitive instead of being
              * carried (stale) into the next row. Continuing re-reads the
-             * drained shifter and smears columns down the rectangle. */
+             * drained shifter and smears columns down the rectangle.
+             * Scalar transfers (one word per GO) stop here: later GOs
+             * bring later words. A batched run behind one GO has no
+             * later GO to resume it (our GO drains the whole primitive,
+             * unlike iris's suspend/resume walker), so instead discard
+             * the partial word exactly like iris's batch resume loop
+             * does (rex3.rs: hostcnt = 0 each round) and continue the
+             * next row on a fresh word. Carrying it merges stale pixels
+             * into the next row and shifts every row after the first.
+             * A drained batch stops: no words left to draw with. */
             if (((mode0 >> 6) & 1) && ((state->draw_mode1 >> 7) & 1) &&
-                state->host_len <= 1 &&
                 state->host_shift != sgi_gio64_host_initial_shift(state)) {
-                break;
+                if (state->host_len <= 1 ||
+                    state->host_cursor >= state->host_len) {
+                    break;
+                }
+                state->host_shift = sgi_gio64_host_initial_shift(state);
             }
         } else if (!stop_on_x) {
             /* Single-pixel row: draw once and stop instead of spinning. */
@@ -3954,11 +4093,11 @@ static void sgi_gio64_xl24_write(void *opaque, hwaddr addr,
                 /* Per-channel LUTs (MAME ramdac_write), applied after the
                  * palette/direct stage by ramdac_remap. */
                 state->ramdac_lut_r[state->ramdac_index] =
-                    (uint8_t)(state->dcb_data_msw >> 24) << 16;
+                    (uint8_t)(state->dcb_data_msw >> 8) << 16;
                 state->ramdac_lut_g[state->ramdac_index] =
                     (uint8_t)(state->dcb_data_msw >> 16) << 8;
                 state->ramdac_lut_b[state->ramdac_index] =
-                    (uint8_t)(state->dcb_data_msw >> 8);
+                    (uint8_t)(state->dcb_data_msw >> 24);
                 state->ramdac_index++;
                 sgi_gio64_damage_full(state);
             }
@@ -3968,6 +4107,18 @@ static void sgi_gio64_xl24_write(void *opaque, hwaddr addr,
             break;
         default:
             break;
+        }
+        /* TEMP DCB program trace (wrong-colour hunt): colormap/XMAP/RAMDAC
+         * programming is otherwise invisible. Capped; with SEQLOG. */
+        if (sgi_seq_enabled()) {
+            static unsigned sgi_dcb_n;
+
+            if (sgi_dcb_n < 200000) {
+                sgi_dcb_n++;
+                fprintf(stderr, "DCBW slave=%u reg=%u msw=%08x lsw=%08x size=%u\n",
+                        state->dcb_slave_select, state->dcb_reg_select,
+                        state->dcb_data_msw, state->dcb_data_lsw, size);
+            }
         }
         if (state->dcb_mode & (1U << 3)) {
             state->dcb_reg_select = (state->dcb_reg_select + 1) & 7;
@@ -4432,13 +4583,39 @@ static bool sgi_gio64_update_display(void *opaque)
                         o < vw3 ? state->aux_ptr[o] : 0xeeeeeeee);
             }
         }
+        /* TEMP full-coverage trace (wrong-colour hunt): strided whole-frame
+         * VRAM+aux sample (catches any viewport), the colormap banks the
+         * overlay path reads (0x1400 suspect + bank 0 reference), and the
+         * RAMDAC LUT lanes. ~400 lines per 30s fire. */
+        for (int py = 0; py < XL24_HEIGHT; py += 64) {
+            for (int px = 0; px < XL24_STRIDE; px += 64) {
+                size_t o = (size_t)py * XL24_STRIDE + px;
+                fprintf(stderr, "GRID y=%d x=%d vram=%08x aux=%08x\n", py,
+                        px, o < vw3 ? state->vram_ptr[o] : 0xeeeeeeee,
+                        o < vw3 ? state->aux_ptr[o] : 0xeeeeeeee);
+            }
+        }
+        for (int i = 0; i < 256; i += 8) {
+            fprintf(stderr, "CMAPBANK base=1400 i=%03x v=%06x w=%06x\n", i,
+                    state->cmap_palette[0][0x1400 + i] & 0xffffff,
+                    state->cmap_palette[0][i] & 0xffffff);
+        }
+        for (int i = 0; i < 256; i += 16) {
+            fprintf(stderr, "CMAPBANK base=1500 i=%03x v=%06x\n", i,
+                    state->cmap_palette[0][0x1500 + i] & 0xffffff);
+            fprintf(stderr, "CMAPBANK base=1d00 i=%03x v=%06x\n", i,
+                    state->cmap_palette[0][0x1d00 + i] & 0xffffff);
+        }
+        for (int i = 0; i < 256; i += 16) {
+            fprintf(stderr, "LUT i=%02x r=%06x g=%06x b=%06x\n", i,
+                    state->ramdac_lut_r[i], state->ramdac_lut_g[i],
+                    state->ramdac_lut_b[i]);
+        }
     no_peek:;
     }
-    /* Bound the full-map dumps; swaps re-arm constantly. */
-    static unsigned sgi_modlog_ndump;
-    if (sgi_modlog_enabled() && !sgi_modlog_dumped &&
-        sgi_modlog_ndump < 4) {
-        sgi_modlog_ndump++;
+    /* DID dump re-arms on every XMAP mode-table write; no total cap so
+     * late runs (powerflip) are captured, not just boot rows. */
+    if (sgi_modlog_enabled() && !sgi_modlog_dumped) {
         sgi_modlog_dumped = true;
         size_t vwords = memory_region_size(&state->vram) / sizeof(uint32_t);
         fprintf(stderr, "DIDCFG cfg=%02x curcmap=%02x pupcmap=%02x\n",
