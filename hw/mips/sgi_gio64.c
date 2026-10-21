@@ -2884,13 +2884,19 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
         if ((x_step > 0 && x >= x_end) || (x_step < 0 && x <= x_end)) {
             x = state->x_save;
             y += address_mode == 1 ? y_step : 0;
-            /* Iris draw_block_g (rex3_generic.rs:1434-1435): the pattern
-             * cursors restart at bit 31 when, and only when, a row
-             * completes. lsrcount (LSMODE bits 7:0) keeps running. */
-            if (address_mode == 1) {
-                state->pat_bit = 31;
-                state->zpat_bit = 31;
-            }
+            /* Pattern cursors restart at bit 31 when a row completes, for
+             * BOTH block and span. iris resets on row completion in
+             * draw_block_g (rex3_generic.rs:1434-1435) and on span
+             * completion in draw_span_g (rex3_generic.rs:1584-1585); MAME
+             * reloads `bit = 31` at the top of every block row
+             * (newport.cpp:3451) and every span (newport.cpp:3379). A span
+             * drawn as its own GO (no Setup bit) must therefore start its
+             * stipple at bit 31 again — otherwise the cursor keeps drifting
+             * across commands and the screen-door pattern lands on the
+             * wrong phase, thinning the covered surface. lsrcount (LSMODE
+             * bits 7:0) keeps running. */
+            state->pat_bit = 31;
+            state->zpat_bit = 31;
             /* Iris draw_block_g (rex3_generic.rs:1471-1473): a partial host
              * word at a row boundary ends the primitive instead of being
              * carried (stale) into the next row. Continuing re-reads the
