@@ -92,9 +92,15 @@ struct SgiHpc3State {
     uint64_t bbram_clock_base_ns;
     time_t bbram_clock_base_time;
     QEMUTimer *bbram_timer;
+    QEMUTimer *nvram_timer;
     eeprom_t *eeprom;
     uint8_t eeprom_ctrl;
 };
+
+/* NVRAM write-back cadence: persist PROM env every few seconds (writes
+ * only happen when the content actually changed), so a killed or
+ * window-closed emulator loses at most one interval of NVRAM history. */
+#define SGI_NVRAM_FLUSH_NS (5ULL * 1000000000ULL)
 
 #define SGI_HPC3(obj) OBJECT_CHECK(SgiHpc3State, (obj), TYPE_SGI_HPC3)
 
@@ -1264,6 +1270,7 @@ static SgiHpc3State *sgi_hpc3_nvram_state;
 
 static FILE *sgi_hpc3_open_nvram(const char *name, char *out, size_t outlen);
 static void sgi_hpc3_nvram_reset_flush(void *opaque);
+static void sgi_hpc3_nvram_tick(void *opaque);
 static void sgi_hpc3_note_nvram_paths(const char *eeprom, const char *rtc);
 static void sgi_hpc3_note_nvram_state(SgiHpc3State *state);
 
@@ -1287,6 +1294,12 @@ static void sgi_hpc3_realize(DeviceState *device, Error **errp)
      */
     timer_mod_ns(state->bbram_timer,
                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + SGI_BBRAM_TICK_NS);
+    /* Flush PROM env to disk every few seconds as well as on reset/exit,
+     * so NVRAM survives even a killed emulator window. */
+    state->nvram_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                      sgi_hpc3_nvram_tick, state);
+    timer_mod_ns(state->nvram_timer,
+                 qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + SGI_NVRAM_FLUSH_NS);
 
     qemu_chr_fe_set_handlers(&state->console,
                              sgi_hpc3_console_can_receive,
@@ -1600,8 +1613,14 @@ static FILE *sgi_hpc3_open_nvram(const char *name, char *out, size_t outlen)
     }
     f = sgi_hpc3_try_nvram(work_path, out, outlen);
     if (!f && outlen > 0) {
-        /* No seed anywhere (normal for the DS1286 RTC): still record the
-         * working-copy path so BBRAM edits survive the next run. */
+        /* No seed anywhere (normal on a flattened tree without the
+         * reference/mame dir): still record the working-copy path and
+         * create its parents, so the first write-back can create the
+         * file and BBRAM edits survive the next run. */
+        char *dir = g_path_get_dirname(work_path);
+
+        g_mkdir_with_parents(dir, 0755);
+        g_free(dir);
         snprintf(out, outlen, "%s", work_path);
     }
 
@@ -1630,10 +1649,17 @@ static void sgi_hpc3_write_back_nvram(void)
     /* These paths are QEMU's own writable copies under <exe>/nvram/, never
      * the pristine seeds in reference/mame, so persisting PROM env cannot
      * modify the reference tree. Writes happen only when the content
-     * differs from what was last written back. */
-    if (sgi_hpc3_nvram_eeprom_path[0] && state->eeprom &&
-        access(sgi_hpc3_nvram_eeprom_path, W_OK) == 0) {
-        uint16_t *data = eeprom93xx_data(state->eeprom);
+     * differs from what was last written back. Parent dirs are created
+     * on demand: gating on access(W_OK) meant a missing working copy
+     * (fresh flattened tree, seed copy skipped) could never be created,
+     * silently disabling persistence. */
+    if (sgi_hpc3_nvram_eeprom_path[0] && state->eeprom) {
+        char *dir = g_path_get_dirname(sgi_hpc3_nvram_eeprom_path);
+        uint16_t *data;
+
+        g_mkdir_with_parents(dir, 0755);
+        g_free(dir);
+        data = eeprom93xx_data(state->eeprom);
         uint8_t bytes[256];
         static uint8_t last[sizeof(bytes)];
         static bool have_last;
@@ -1653,11 +1679,14 @@ static void sgi_hpc3_write_back_nvram(void)
             }
         }
     }
-    if (sgi_hpc3_nvram_rtc_path[0] && sgi_hpc3_nvram_state &&
-        access(sgi_hpc3_nvram_rtc_path, W_OK) == 0) {
+    if (sgi_hpc3_nvram_rtc_path[0] && sgi_hpc3_nvram_state) {
         /* Persist the full DS1286/DS1386_8K image MAME uses. */
         static uint8_t last[0x2000];
         static bool have_last;
+        char *dir = g_path_get_dirname(sgi_hpc3_nvram_rtc_path);
+
+        g_mkdir_with_parents(dir, 0755);
+        g_free(dir);
 
         if (!have_last || state->bbram_size > sizeof(last) ||
             memcmp(state->bbram, last, state->bbram_size) != 0) {
@@ -1672,6 +1701,18 @@ static void sgi_hpc3_write_back_nvram(void)
             }
         }
     }
+}
+
+/* Periodic NVRAM flush: the content check inside the write-back keeps
+ * this cheap, and it bounds history loss when the emulator is killed
+ * or its window closed instead of exiting cleanly. */
+static void sgi_hpc3_nvram_tick(void *opaque)
+{
+    SgiHpc3State *state = SGI_HPC3(opaque);
+
+    sgi_hpc3_write_back_nvram();
+    timer_mod_ns(state->nvram_timer,
+                 qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + SGI_NVRAM_FLUSH_NS);
 }
 
 static void sgi_hpc3_note_nvram_paths(const char *eeprom, const char *rtc)
