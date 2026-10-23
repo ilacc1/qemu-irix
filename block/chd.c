@@ -460,9 +460,26 @@ fail:
 }
 
 /*
+ * SGI_CHD_SYNC=1 inflates hunks inline in the requesting coroutine instead
+ * of handing them to the block thread pool.
+ */
+static bool sgi_chd_sync_enabled(void)
+{
+    static int cached = -1;
+
+    if (cached < 0) {
+        const char *e = getenv("SGI_CHD_SYNC");
+
+        cached = (e && *e && strtoul(e, NULL, 0) != 0) ? 1 : 0;
+    }
+    return cached != 0;
+}
+
+/*
  * Decompressed-hunk cache. Size from SGI_CHD_CACHE_MB (default 256). Without
  * it, every read of a compressed hunk decompresses the whole hunk again, even
- * when the previous request just did so.
+ * when the previous request just did so. Set SGI_CHD_CACHE_MB=0 to disable
+ * the cache entirely.
  */
 static uint32_t chd_cache_bytes(void)
 {
@@ -678,8 +695,13 @@ chd_read_hunk(BlockDriverState *bs, BDRVChdState *s, uint32_t hunk,
             .src = s->comp_buf,
             .src_len = complen,
         };
-        /* Inflate off the main loop; this coroutine sleeps until it is done. */
-        thread_pool_submit_co(chd_inflate_job, &job);
+        /* Inflate off the main loop; this coroutine sleeps until it is done.
+         * SGI_CHD_SYNC=1 inflates inline instead, for A/B comparison. */
+        if (sgi_chd_sync_enabled()) {
+            chd_inflate_job(&job);
+        } else {
+            thread_pool_submit_co(chd_inflate_job, &job);
+        }
 
         if (job.zr != Z_OK || job.dst_len != s->hunk_bytes) {
             error_report("chd: zlib error %d expanding hunk %u", job.zr, hunk);
