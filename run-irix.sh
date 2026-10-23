@@ -62,7 +62,28 @@
 # ports (kernel serial console) to files there, e.g.
 #   IRIX_ESCC_LOG=run/escc ./run-irix.sh
 # then in the PROM Command Monitor: `setenv console d`, then `boot`.
+# IRIX_ESCC_SOCK: path of a unix socket for the second ESCC port, so the
+# guest's serial console can be driven from the host.
+# IRIX_DISK_COW: copy-on-write mode for the disk image.
+#   overlay (default) - a qcow2 overlay with the image as its backing
+#                    file. The image is opened READ-ONLY and every guest
+#                    write goes to the overlay (by default
+#                    <image>.cow.qcow2 next to it), so the image itself
+#                    can never be damaged while the guest's data persists
+#                    between runs. Delete the overlay to go back to the
+#                    pristine image; IRIX_DISK_OVERLAY names it.
+#   off            - direct read-write access to the image (old
+#                    behaviour; the image can be damaged by a kill).
 # Extra QEMU args may be appended: ./run-irix.sh -d guest_errors
+#
+# Tuning switches (value-based; 0 and unset both mean "offload enabled"):
+#   SGI_GFX_SYNC=1   run every REX3 draw inline on the vCPU thread
+#                    (default 0: surface draws go to the GIO64 worker thread)
+#   SGI_WD_SYNC=1    force WD33C93 DMA through the per-byte path
+#                    (default 0: batched run-DMA fast path)
+#   SGI_CHD_SYNC=1   inflate CHD hunks inline instead of in the block thread
+#                    pool (default 0)
+#   SGI_CHD_CACHE_MB decompressed-hunk cache size, default 256; 0 disables
 set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -136,6 +157,12 @@ if [ -n "${IRIX_ESCC_LOG:-}" ]; then
     mkdir -p "$IRIX_ESCC_LOG"
     ESCC_A=(-serial "file:$IRIX_ESCC_LOG/esccA.log")
     ESCC_B=(-serial "file:$IRIX_ESCC_LOG/esccB.log")
+elif [ -n "${IRIX_ESCC_SOCK:-}" ]; then
+    # ESCC_B as a unix socket so the guest's serial console can be driven
+    # from the host (login prompt, command output). IRIX_ESCC_SOCK holds
+    # the socket path; a client connects with e.g. run/escccon.py.
+    ESCC_A=(-serial null)
+    ESCC_B=(-serial "unix:$IRIX_ESCC_SOCK,server=on,wait=off")
 else
     ESCC_A=(-serial null)
     ESCC_B=(-serial null)
@@ -192,9 +219,36 @@ else
     CDROM_ARGS=()
 fi
 
+# Disk access mode. The default is copy-on-write: a qcow2 overlay with
+# the CHD as its backing file. The CHD is opened read-only (backing files
+# always are) and every guest write lands in the overlay, so the original
+# image can never be damaged while the guest's data persists between
+# runs. Delete the overlay to start over from the pristine image.
+COW=${IRIX_DISK_COW:-overlay}
+case "$COW" in
+overlay)
+    OVERLAY=${IRIX_DISK_OVERLAY:-$DISK.cow.qcow2}
+    if [ ! -f "$OVERLAY" ]; then
+        echo "Creating copy-on-write overlay $OVERLAY"
+        "$ROOT_DIR/run/mkoverlay.py" --disk "$DISK" --overlay "$OVERLAY"
+    fi
+    DISK_ARGS=("file=$OVERLAY,format=qcow2,if=scsi,bus=0,unit=1,media=disk")
+    ;;
+off)
+    DISK_ARGS=("file=$DISK,format=chd,if=scsi,bus=0,unit=1,media=disk")
+    ;;
+*)
+    echo "IRIX_DISK_COW must be 'overlay' or 'off' (got '$COW')" >&2
+    exit 1
+    ;;
+esac
+
 echo "GTK window shows the PROM menu. Type there (window focused)."
 echo "PIO console (early boot only): telnet 127.0.0.1 $PIO_TELNET_PORT"
 echo "Monitor socket: $MON_SOCK"
+if [ "$COW" = "overlay" ]; then
+    echo "Disk copy-on-write: $DISK is read-only, guest writes go to $OVERLAY"
+fi
 exec env -u GTK_PATH -u GTK_EXE_PREFIX -u GTK_IM_MODULE_FILE \
     -u LD_PRELOAD \
     "$ROOT_DIR/build/qemu-system-mips64" \
@@ -203,7 +257,7 @@ exec env -u GTK_PATH -u GTK_EXE_PREFIX -u GTK_IM_MODULE_FILE \
     "${MC_ARGS[@]}" \
     -m "$GUEST_RAM" \
     -bios "$ROOT_DIR/indy/$BIOS_IMAGE" \
-    -drive "file=$DISK,format=chd,if=scsi,bus=0,unit=1,media=disk" \
+    -drive "${DISK_ARGS[@]}" \
     "${CDROM_ARGS[@]}" \
     ${NET_ARGS[@]} \
     -display "$DISPLAY_MODE" \

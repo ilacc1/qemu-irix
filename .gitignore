@@ -27,3 +27,10 @@ GTAGS
 # Disk images and ISOs are user-supplied, never committed.
 *.chd
 *.iso
+# Copy-on-write overlays created by run-irix.sh.
+*.cow.qcow2
+# Local harness output and sockets.
+/run/mon.sock
+/run/escc/
+/run/__pycache__/
+/run/analyze/__pycache__/

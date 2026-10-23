@@ -89,14 +89,21 @@ replacing AB:CD:EF with the desired 3 octets.
 ### Optimisations (experimental)
 
 If you experience problems or have time to play around to eke out maximum
-performance, there are two environment switches to experiment with:
+performance, there are a few environment switches to experiment with. All of
+them are value-based: `1` disables the offload, `0` (or leaving the variable
+unset) leaves it enabled.
 
 - `SGI_WD_SYNC=1` — disables the WD33C93 batched run-DMA fast path and
   forces every disk byte through the single-step transfer path (slower,
   but closer to real hardware behaviour). Default: fast path **enabled**.
+- `SGI_CHD_SYNC=1` — decompresses CHD hunks inline instead of handing them
+  to the block layer's thread pool. Default: thread pool **enabled**.
 - `SGI_GFX_SYNC=1` — disables the GIO64 graphics worker thread and executes
   REX3 command lists synchronously on the main loop (slower, but avoids any
   worker/main-loop races). Default: worker thread **enabled**.
+
+- `SGI_CHD_CACHE_MB=N` — size of the decompressed-hunk cache in MiB
+  (default 256, capped at 4096). `0` disables the cache.
 
 These are code defaults - os-specific startup scripts may have os-specific
 defaults. Best to stick with current values, but if you want to play, change
