@@ -473,14 +473,23 @@ static void sgi_wd_dma_run_account(SGIWD33C93State *state, uint32_t n)
     }
 }
 
+/* Value of an environment switch: unset, empty or "0" is false, any other
+ * number is true. */
+static bool sgi_env_flag(const char *name)
+{
+    const char *e = getenv(name);
+
+    return e && *e && strtoul(e, NULL, 0) != 0;
+}
+
 /* SGI_WD_SYNC=1 disables the batched run fast path, forcing every byte
- * through the original per-byte code. */
+ * through the original per-byte code; SGI_WD_SYNC=0 (the default) keeps it. */
 static bool sgi_wd_sync_enabled(void)
 {
     static int cached = -1;
 
     if (cached < 0) {
-        cached = getenv("SGI_WD_SYNC") ? 1 : 0;
+        cached = sgi_env_flag("SGI_WD_SYNC") ? 1 : 0;
     }
     return cached != 0;
 }
