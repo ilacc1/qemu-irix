@@ -206,11 +206,13 @@ static void sgi_mc_dma_complete(void *opaque)
 {
     SgiMcState *state = SGI_MC(opaque);
     /* One transfer per start: the DMA timer and a DMA_RUN read can both reach
-     * here for the same start. Only a pending transfer (RUN bit 0x40) runs. */
+     * here for the same start. Only a pending transfer (RUN bit 0x40) runs.
+     * The "it was running" latch is not cleared here: it belongs to the
+     * guest's DMA_RUN read, which can come after the completion timer (the
+     * PROM starts a transfer and polls DMA_RUN right after). */
     if (!(state->dma_run & 0x40)) {
         return;
     }
-    state->dma_run_unread = false;
     uint32_t memory_addr = state->dma_mem_addr;
     uint32_t line_count = (state->dma_size >> 16) & 0xffff;
     uint32_t line_width = state->dma_size & 0xffff;
