@@ -9,6 +9,7 @@
 #include "qemu/module.h"
 #include "qemu/timer.h"
 #include "qemu/thread.h"
+#include "qemu/atomic.h"
 #include "ui/console.h"
 
 #define TYPE_SGI_GIO64 "sgi-gio64"
@@ -537,6 +538,26 @@ struct SGIGIO64State {
     uint32_t ramdac_lut_g[256];
     uint32_t ramdac_lut_b[256];
     uint8_t ramdac_index;
+    /* Palette and RGB-mode tables with the RAMDAC gamma already applied.
+     * The scanout then costs one table load per pixel instead of a palette
+     * lookup plus a three-channel RAMDAC remap. A palette write updates its
+     * own entry in place; a RAMDAC write changes every entry, so it sets
+     * rgba_dirty and the tables are rebuilt lazily at the next scanout. */
+    uint32_t cmap_rgba[65536];
+    uint32_t bgr4_rgba[16];
+    uint32_t bgr8_rgba[256];
+    uint32_t bgr12_rgba[4096];
+    /* 24bpp direct RGB: the RAMDAC LUTs per channel, pre-shifted. */
+    uint32_t rgb24_r[256];
+    uint32_t rgb24_g[256];
+    uint32_t rgb24_b[256];
+    bool rgba_dirty;
+    /* The guest wrote the aux/CID plane at least once. The pop-up and
+     * overlay layers live there, so the scanout can skip that whole pass
+     * while the plane is untouched (the common case: IRIX draws into the
+     * main RGBCI plane only). Written by the gfx worker, read by the
+     * display thread. */
+    bool aux_written;
     uint32_t xmap_mode[2][32];
     uint8_t xmap_mode_index[2];
     uint32_t xmap_config[2];
@@ -578,6 +599,11 @@ struct SGIGIO64State {
     uint32_t *blt_buf;
     size_t blt_len;
 };
+
+/* Forward declarations: the scanout tables are maintained from the DCB
+ * write path, which sits above the converters. */
+static uint32_t sgi_gio64_ramdac_remap(SGIGIO64State *state, uint32_t rgb);
+static void sgi_gio64_rebuild_rgba_tables(SGIGIO64State *state);
 
 /* Union raw framebuffer coords into the damage rect (over-cover is safe,
  * under-cover leaves stale pixels). Clamped to the RB2 store. */
@@ -968,6 +994,13 @@ static void sgi_gio64_vblank(void *opaque)
 
     if (sgi_rowmap_enabled() && (++sgi_rowmap_tick % 300) == 0) {
         sgi_gio64_rowmap_dump(state);
+    }
+
+    /* A RAMDAC gamma change invalidates every scanout table entry. The
+     * rebuild runs here (vCPU thread) so the display thread only ever
+     * reads the tables: no rebuild can race with a pen write. */
+    if (state->rgba_dirty) {
+        sgi_gio64_rebuild_rgba_tables(state);
     }
 
     /* Raise VRINT only while VC2 display control bit 0 is set (MAME
@@ -1839,6 +1872,11 @@ static void sgi_gio64_put_pixel(SGIGIO64State *state, uint32_t *vram,
         }
     }
     plane = state->draw_mode1 & 7;
+    if (plane >= 4 && plane <= 6) {
+        /* Overlay/pop-up/CID draws land in the aux plane: the scanout
+         * needs its pop-up/overlay pass from now on. */
+        qatomic_set(&state->aux_written, true);
+    }
     pixel = (plane >= 4 && plane <= 6) ?
             &aux[y * XL24_STRIDE + x] : &vram[y * XL24_STRIDE + x];
     dst = *pixel;
@@ -2983,12 +3021,24 @@ static void sgi_gio64_rex3_command(SGIGIO64State *state)
 }
 
 /*
+ * Value of an environment switch: unset, empty or "0" is false, any other
+ * number is true.
+ */
+static bool sgi_env_flag(const char *name)
+{
+    const char *e = getenv(name);
+
+    return e && *e && strtoul(e, NULL, 0) != 0;
+}
+
+/*
  * Surface-draw worker. Surface fills and blits (DRAW with BLOCK or SPAN
  * address mode, no COLORHOST) run on this thread, one job at a time. Every
  * device entry point (REX3 register read/write, scanout, reset) first calls
  * sgi_gio64_gfx_sync, so the vCPU never observes or changes REX3 state while
  * a job is running. Pixel and host-data operations stay synchronous.
- * SGI_GFX_SYNC=1 disables the worker for A/B comparison.
+ * SGI_GFX_SYNC=1 runs every draw inline on the vCPU thread; SGI_GFX_SYNC=0
+ * (the default) offloads them to the worker.
  */
 static bool sgi_gfx_threaded;
 
@@ -4009,6 +4059,13 @@ static void sgi_gio64_xl24_write(void *opaque, hwaddr addr,
                     /* Pens are 0x00RRGGBB (MAME cmap set_pen_color order). */
                     state->cmap_palette[head][state->cmap_index[head]] =
                         state->dcb_data_msw >> 8;
+                    /* Keep the scanout's RGBA table in step: head 0 drives
+                     * the display, so only head 0 has a mirror. */
+                    if (head == 0) {
+                        state->cmap_rgba[state->cmap_index[0]] =
+                            sgi_gio64_ramdac_remap(
+                                state, state->cmap_palette[0][state->cmap_index[0]]);
+                    }
                     sgi_gio64_damage_full(state);
                     if (state->cmap_index[head] < 0x2000 && sgi_gio_dbg()) {
                         static unsigned npens;
@@ -4105,6 +4162,9 @@ static void sgi_gio64_xl24_write(void *opaque, hwaddr addr,
                 state->ramdac_lut_b[state->ramdac_index] =
                     (uint8_t)(state->dcb_data_msw >> 24);
                 state->ramdac_index++;
+                /* The gamma LUTs feed every scanout table entry, so they
+                 * are all stale now; the next scanout rebuilds them. */
+                state->rgba_dirty = true;
                 sgi_gio64_damage_full(state);
             }
             break;
@@ -4447,6 +4507,36 @@ static uint32_t sgi_gio64_ramdac_remap(SGIGIO64State *state, uint32_t rgb)
     return out;
 }
 
+/* Rebuild the scanout tables after a RAMDAC gamma change: every palette
+ * and RGB-mode entry is remapped through the new LUTs. Cheap enough to do
+ * in one go (the RAMDAC is programmed rarely) and it keeps the per-pixel
+ * scanout down to a single table load. */
+static void sgi_gio64_rebuild_rgba_tables(SGIGIO64State *state)
+{
+    for (unsigned i = 0; i < 65536; i++) {
+        state->cmap_rgba[i] =
+            sgi_gio64_ramdac_remap(state, state->cmap_palette[0][i]);
+    }
+    for (unsigned i = 0; i < 16; i++) {
+        state->bgr4_rgba[i] =
+            sgi_gio64_ramdac_remap(state, sgi_gio64_bgr4_to_rgb(i));
+    }
+    for (unsigned i = 0; i < 256; i++) {
+        state->bgr8_rgba[i] =
+            sgi_gio64_ramdac_remap(state, sgi_gio64_bgr8_to_rgb(i));
+    }
+    for (unsigned i = 0; i < 4096; i++) {
+        state->bgr12_rgba[i] =
+            sgi_gio64_ramdac_remap(state, sgi_gio64_bgr12_to_rgb(i));
+    }
+    for (unsigned i = 0; i < 256; i++) {
+        state->rgb24_r[i] = state->ramdac_lut_r[i];
+        state->rgb24_g[i] = state->ramdac_lut_g[i];
+        state->rgb24_b[i] = state->ramdac_lut_b[i];
+    }
+    state->rgba_dirty = false;
+}
+
 static void sgi_gio64_decode_xmap(uint32_t table_entry, uint8_t *pix_mode,
                                   uint8_t *pix_size, uint8_t *aux_mode,
                                   uint16_t *aux_msb, uint16_t *ci_msb)
@@ -4471,6 +4561,298 @@ static void sgi_gio64_decode_xmap(uint32_t table_entry, uint8_t *pix_mode,
     }
 }
 
+/*
+ * Raster one XMAP segment of a scanout row into the console surface.
+ *
+ * The pixel format (CI or RGB, 4/8/12/24bpp) is fixed for the whole
+ * segment, so the format dispatch is hoisted out of the pixel loop and
+ * each pixel costs a single table load. The palette and RGB tables
+ * already carry the RAMDAC gamma, so no per-pixel remap is needed.
+ *
+ * The cursor, pop-up and overlay layers are painted on top of the main
+ * pixels. They have priority over the main pixel in the MAME/iris
+ * compositing order (cursor, pop-up, overlay, main), so overwriting the
+ * main pixel reproduces that order exactly.
+ */
+static void sgi_gio64_raster_segment(SGIGIO64State *state, uint32_t *prow,
+                                     size_t rowbase, int y,
+                                     unsigned sx0, unsigned sx1,
+                                     uint32_t table, uint8_t pix_mode,
+                                     uint8_t pix_size, uint8_t aux_mode,
+                                     uint16_t aux_msb, uint16_t ci_msb,
+                                     bool row_has_cursor, int cur_x0,
+                                     unsigned cur_xspan, bool aux_used)
+{
+    const uint32_t *vrow = state->vram_ptr + rowbase;
+    const uint32_t *auxplane = state->aux_ptr;
+    const uint32_t *cmap_rgba = state->cmap_rgba;
+    uint16_t cursor_msb = (uint16_t)(state->xmap_cursor_cmap[0] & 0xff) << 5;
+    uint16_t popup_msb = (uint16_t)(state->xmap_popup_cmap[0] & 0xff) << 5;
+    bool is_8bpp = (state->xmap_config[0] >> 2) & 1;
+    unsigned px;
+
+    /* Main pixel pass. */
+    if (pix_mode == 0) {
+        /* CI through the head-0 colormap. */
+        if (pix_size == 1) {
+            uint32_t base = ci_msb;
+
+            for (px = sx0; px < sx1; px++) {
+                prow[px] = cmap_rgba[base | (vrow[px] & 0xff)];
+            }
+        } else if (pix_size == 0) {
+            uint32_t base = ci_msb;
+            unsigned shift = (table & 1) ? 4 : 0;
+
+            for (px = sx0; px < sx1; px++) {
+                prow[px] = cmap_rgba[base | ((vrow[px] >> shift) & 0xf)];
+            }
+        } else if (pix_size == 2) {
+            /* MAME CI 12bpp: low 12 bits of the word, upper half
+             * selected by table bit 0. */
+            uint32_t base = ci_msb & 0x1000;
+            unsigned shift = (table & 1) ? 12 : 0;
+
+            for (px = sx0; px < sx1; px++) {
+                prow[px] = cmap_rgba[base | ((vrow[px] >> shift) & 0xfff)];
+            }
+        } else {
+            /* 24bpp CI view unsupported (MAME skips): black. */
+            uint32_t black = 0xff000000 | state->ramdac_lut_r[0] |
+                             state->ramdac_lut_g[0] | state->ramdac_lut_b[0];
+
+            for (px = sx0; px < sx1; px++) {
+                prow[px] = black;
+            }
+        }
+    } else if (pix_size == 1) {
+        /* MAME RGB Map0 8bpp: buffer selected by table bit 0. */
+        unsigned shift = (table & 1) ? 8 : 0;
+
+        for (px = sx0; px < sx1; px++) {
+            prow[px] = state->bgr8_rgba[(vrow[px] >> shift) & 0xff];
+        }
+    } else if (pix_size == 0) {
+        unsigned shift = (table & 1) ? 4 : 0;
+
+        for (px = sx0; px < sx1; px++) {
+            prow[px] = state->bgr4_rgba[(vrow[px] >> shift) & 0xf];
+        }
+    } else if (pix_size == 2) {
+        /* MAME RGB 12bpp: low 12 bits of the word, upper half selected
+         * by table bit 0. */
+        unsigned shift = (table & 1) ? 12 : 0;
+
+        for (px = sx0; px < sx1; px++) {
+            prow[px] = state->bgr12_rgba[(vrow[px] >> shift) & 0xfff];
+        }
+    } else {
+        /* MAME RGB 24bpp: the word is 0x00BBGGRR. */
+        for (px = sx0; px < sx1; px++) {
+            uint32_t w = vrow[px];
+
+            prow[px] = 0xff000000 |
+                       state->rgb24_r[w & 0xff] |
+                       state->rgb24_g[(w >> 8) & 0xff] |
+                       state->rgb24_b[(w >> 16) & 0xff];
+        }
+    }
+
+    /* Pop-up and overlay layers. The pop-up bits live in the aux plane
+     * (bits 3:2); the overlay bits (bits 8+) only matter when the
+     * segment asks for an overlay mode. Both are transparent when zero,
+     * so the main pixel below shows through. The pass is skipped entirely
+     * while the guest has never written the aux plane. */
+    if (aux_used) {
+        for (px = sx0; px < sx1; px++) {
+            uint32_t cidaux = auxplane[rowbase + px];
+            uint32_t rgb = 0;
+
+            /* Popup iff pup!=0 (iris compositor: no Pup_En gate; MAME
+             * fires on bits 6/7 with pup==0 (opaque black pen 0); that
+             * mispaints transparent regions black). */
+            if (((cidaux >> 2) & 3) != 0) {
+                rgb = cmap_rgba[popup_msb | ((cidaux >> 2) & 3)];
+            } else if (aux_mode != 0) {
+                /* Overlay components only, transparent when zero
+                 * (xmap9.pdf 3.3; iris compositor). No underlay: iris
+                 * never displays underlay modes (falls through to main)
+                 * and is the correct reference. */
+                if (is_8bpp) {
+                    switch (aux_mode) {
+                    case 2: { /* 2-bit overlay */
+                        uint32_t v = (cidaux >> 8) & 3;
+
+                        if (v) {
+                            rgb = cmap_rgba[aux_msb | v];
+                        }
+                        break;
+                    }
+                    case 6: { /* 1-bit overlay, bit by table bit 1 */
+                        unsigned shift = (table & 2) ? 9 : 8;
+                        uint32_t v = (cidaux >> shift) & 1;
+
+                        if (v) {
+                            rgb = cmap_rgba[aux_msb | v];
+                        }
+                        break;
+                    }
+                    case 7: { /* 1-bit overlay */
+                        uint32_t v = (cidaux >> 8) & 1;
+
+                        if (v) {
+                            rgb = cmap_rgba[aux_msb | v];
+                        }
+                        break;
+                    }
+                    default:
+                        break;
+                    }
+                } else {
+                    switch (aux_mode) {
+                    case 2: { /* 8-bit overlay */
+                        uint32_t v = ((cidaux >> 8) & 0xf) |
+                                     ((cidaux >> 16) & 0xf0);
+
+                        if (v) {
+                            rgb = cmap_rgba[aux_msb | v];
+                        }
+                        break;
+                    }
+                    case 6: { /* 4-bit overlay, shift by table bit 1 */
+                        unsigned shift = (table & 2) ? 12 : 8;
+                        uint32_t v = (cidaux >> shift) & 0xf;
+
+                        if (v) {
+                            rgb = cmap_rgba[aux_msb | v];
+                        }
+                        break;
+                    }
+                    case 7: { /* 4-bit overlay */
+                        uint32_t v = (cidaux >> 8) & 0xf;
+
+                        if (v) {
+                            rgb = cmap_rgba[aux_msb | v];
+                        }
+                        break;
+                    }
+                    default:
+                        break;
+                    }
+                }
+            }
+            /* The table entries always carry the alpha bit, so a zero
+             * rgb here means "no overlay": leave the main pixel. */
+            if (rgb) {
+                prow[px] = rgb;
+            }
+        }
+    }
+
+    /* Cursor layer, painted last: the cursor has priority over the
+     * pop-up and overlay layers (MAME screen_update order: cursor, pop-up,
+     * overlay, main pixel). The fetch window is at most 64 pixels wide, so
+     * only that slice is probed in VC2 RAM. */
+    if (row_has_cursor) {
+        unsigned c0 = sx0 > (unsigned)cur_x0 ? sx0 : (unsigned)cur_x0;
+        unsigned c1 = (unsigned)(cur_x0 + cur_xspan) + 1;
+
+        if (c1 > sx1) {
+            c1 = sx1;
+        }
+        for (px = c0; px < c1; px++) {
+            uint8_t cur = sgi_gio64_cursor_pixel(state, px, y);
+
+            if (cur) {
+                prow[px] = cmap_rgba[cursor_msb | cur];
+            }
+        }
+    }
+}
+
+/*
+ * Debug trace of the scanout colour at the sampled positions (SGI_GIO_DBG).
+ * The segment raster works on the pre-remapped table entries, so the trace
+ * recomputes the palette value the old per-pixel loop printed.
+ */
+static void sgi_gio64_trace_row(SGIGIO64State *state, int y, unsigned sx0,
+                                unsigned sx1, uint32_t table, uint8_t pix_mode,
+                                uint8_t pix_size, uint16_t ci_msb)
+{
+    static uint8_t pbyte[3][168];
+    const uint32_t *vrow = state->vram_ptr + (size_t)y * XL24_STRIDE;
+    unsigned px;
+
+    if (y == 320 || y == 500 || y == 832) {
+        unsigned yi = y == 320 ? 0 : (y == 500 ? 1 : 2);
+
+        for (px = sx0; px < sx1; px++) {
+            uint32_t word = vrow[px];
+            uint8_t byte = (uint8_t)word;
+            uint32_t rgb = 0;
+
+            if ((px & 7) != 0 || pbyte[yi][px >> 3] == byte) {
+                continue;
+            }
+            pbyte[yi][px >> 3] = byte;
+            if (pix_mode == 0) {
+                switch (pix_size) {
+                case 0:
+                    rgb = state->cmap_palette[0][ci_msb |
+                              ((byte >> ((table & 1) ? 4 : 0)) & 0xf)];
+                    break;
+                case 1:
+                    rgb = state->cmap_palette[0][ci_msb | byte];
+                    break;
+                case 2:
+                    rgb = state->cmap_palette[0][(ci_msb & 0x1000) |
+                              ((word >> ((table & 1) ? 12 : 0)) & 0xfff)];
+                    break;
+                default:
+                    break;
+                }
+            } else {
+                switch (pix_size) {
+                case 0:
+                    rgb = sgi_gio64_bgr4_to_rgb(
+                        (byte >> ((table & 1) ? 4 : 0)) & 0xf);
+                    break;
+                case 1:
+                    rgb = sgi_gio64_bgr8_to_rgb(
+                        (word >> ((table & 1) ? 8 : 0)) & 0xff);
+                    break;
+                case 2:
+                    rgb = sgi_gio64_bgr12_to_rgb(
+                        (word >> ((table & 1) ? 12 : 0)) & 0xfff);
+                    break;
+                default: {
+                    uint8_t r = word & 0xff;
+                    uint8_t g = (word >> 8) & 0xff;
+                    uint8_t b = (word >> 16) & 0xff;
+
+                    rgb = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+                    break;
+                }
+                }
+            }
+            fprintf(stderr, "DPX y=%d x=%d raw=%02x rgb=%06x\n", y, px, byte,
+                    rgb);
+        }
+    }
+    if (y == 500) {
+        for (px = MAX(sx0, 320u); px < MIN(sx1, 353u); px++) {
+            fprintf(stderr, "DPF y=500 x=%d raw=%02x\n", px,
+                    (uint8_t)vrow[px]);
+        }
+    }
+    if (y == 832) {
+        for (px = sx0; px < MIN(sx1, 17u); px++) {
+            fprintf(stderr, "DPF y=832 x=%d raw=%02x\n", px,
+                    (uint8_t)vrow[px]);
+        }
+    }
+}
+
 static bool sgi_gio64_update_display(void *opaque)
 {
     sgi_gio64_gfx_sync(opaque);
@@ -4478,23 +4860,50 @@ static bool sgi_gio64_update_display(void *opaque)
     DisplaySurface *surface = qemu_console_surface(state->console);
     uint32_t *pixels = surface_data(surface);
     const uint32_t *vram = state->vram_ptr;
-    size_t vram_words = memory_region_size(&state->vram) / sizeof(*vram);
     int width = sgi_gio64_display_width(state);
     int height = sgi_gio64_display_height(state);
     int stride;
     int x, y;
     /* Head 0 drives the display (MAME screen_update uses m_xmap[0] and
      * m_cmap[0]). Pens are 0x00RRGGBB. */
-    const uint32_t *cmap = state->cmap_palette[0];
     const uint32_t *auxplane = state->aux_ptr;
-    uint16_t cursor_msb =
-        (uint16_t)(state->xmap_cursor_cmap[0] & 0xff) << 5;
-    uint16_t popup_msb =
-        (uint16_t)(state->xmap_popup_cmap[0] & 0xff) << 5;
-    bool is_8bpp = (state->xmap_config[0] >> 2) & 1;
+    /* The pop-up and overlay layers live in the aux plane; the scanout
+     * skips that pass entirely while the guest has never written it. */
+    bool aux_used = qatomic_read(&state->aux_written);
     /* XMAP config bit 0 (Pup_En, xmap9.pdf Table 3i): pop-up planes
      * replace overlay/underlay for the whole screen when set; when
      * clear the pup bits are ordinary aux bits. */
+    /* Hoist the cursor fetch-window test out of the per-pixel loop: the
+     * cursor covers at most a 64x64 box, so rastering the full 1344x1024
+     * surface only needs the (cheap) register fetch + the actual VC2 RAM
+     * probe inside that box. sgi_gio64_cursor_pixel does the same test, but
+     * called for every pixel it dominated the raster (the bbox compares
+     * were ~46% of update_display). */
+    bool cur_active;
+    int cur_x0, cur_x1, cur_y0, cur_y1;
+    {
+        uint16_t ctrl = state->vc2_regs[VC2_REG_DISPLAY_CTRL];
+        int cx = (int)(uint16_t)(state->vc2_regs[VC2_REG_CURSOR_X] +
+                                 SGI_GIO64_CURSOR_X_ADJUST);
+        int cy = (int)state->vc2_regs[VC2_REG_CURSOR_Y];
+        int csize = (ctrl & VC2_CURSOR_SIZE_64) ? 64 : 32;
+
+        cur_active = (ctrl & VC2_CURSOR_FUNC_ENABLE) &&
+                     (ctrl & VC2_CURSOR_ENABLE) &&
+                     !(ctrl & VC2_CURSOR_MODE_BIT);
+        cur_x0 = cx - 31;
+        cur_x1 = cx;
+        cur_y0 = cy - 31;
+        cur_y1 = cy;
+        /* Clip the 64-wide window to the cursor's real size so the box
+         * stays tight for both 32- and 64-pixel cursors. */
+        if (cx - 31 + csize - 1 < cur_x1) {
+            cur_x1 = cx - 31 + csize - 1;
+        }
+        if (cy - 31 + csize - 1 < cur_y1) {
+            cur_y1 = cy - 31 + csize - 1;
+        }
+    }
 
     if (surface_width(surface) != width || surface_height(surface) != height) {
         qemu_console_resize(state->console, width, height);
@@ -4690,12 +5099,34 @@ static bool sgi_gio64_update_display(void *opaque)
         }
         did = sgi_gio64_vc2_next_did(state);
         bool row_hit = full || (y >= ry0 && y <= ry1);
+        /* Resolve the repaint x-range for the row once: the segment raster
+         * then clips itself to it, which replaces the per-pixel
+         * (x < rx0 || x > rx1) pair that was the top cost in the scanout
+         * raster. row_hit false skips the row entirely. */
+        unsigned row_lo = row_hit ? (unsigned)MAX(rx0, 0) : 0u;
+        unsigned row_hi = row_hit ? (unsigned)MIN(rx1, width - 1) : 0u;
+        /* Cursor only lives on one horizontal band, so resolve the whole
+         * row's cursor x-range once: only that slice is probed in VC2 RAM.
+         * row_has_cursor false removes the probe for almost every row. */
+        bool row_has_cursor = cur_active && y >= cur_y0 && y <= cur_y1;
+        unsigned cur_xspan = row_has_cursor ?
+                             (unsigned)(cur_x1 - cur_x0) : 0u;
 
-        for (x = 0; x < width; x++) {
-            uint32_t rgb = 0;
-            bool replaced = false;
-            uint8_t cursor;
-            uint8_t byte = 0;
+        /*
+         * Segment walk. The DID chain marks the XMAP segment boundaries, so
+         * the decode parameters (pix_mode/pix_size/aux_mode/aux_msb/ci_msb
+         * and the table shift bits) are constant between boundaries. Raster
+         * one segment at a time instead of re-testing the boundary for every
+         * pixel: that per-pixel test was the top cost in the scanout loop.
+         *
+         * The chain only advances on an exact boundary match (one switch per
+         * pixel, as the original per-pixel test did), so a boundary at or
+         * before the current x can never match again and the rest of the
+         * row is a single segment.
+         */
+        x = 0;
+        while (x < width) {
+            unsigned seg_end;
 
             if ((uint16_t)x == (did >> 5)) {
                 table = state->xmap_mode[0][did & 0x1f];
@@ -4741,196 +5172,33 @@ static bool sgi_gio64_update_display(void *opaque)
                 }
                 did = sgi_gio64_vc2_next_did(state);
             }
-            if (!row_hit || x < rx0 || x > rx1) {
-                continue;
+            /* The next boundary closes this segment. The chain only
+             * advances on an exact boundary match (one switch per pixel,
+             * as the old per-pixel test did), so a boundary at or before
+             * x can never match again: the rest of the row then keeps the
+             * current table. */
+            seg_end = (unsigned)(did >> 5);
+            if (seg_end <= (unsigned)x || seg_end > (unsigned)width) {
+                seg_end = (unsigned)width;
             }
-            cursor = sgi_gio64_cursor_pixel(state, x, y);
-            if (cursor) {
-                rgb = cmap[cursor_msb | cursor];
-                replaced = true;
-            } else {
-                /* MAME screen_update priority: cursor, popup
-                 * (cidaux bits 3:2), aux underlay/overlay, main pixel. */
-                size_t aoff = (size_t)y * XL24_STRIDE + x;
-                uint32_t cidaux = aoff < vram_words ? auxplane[aoff] : 0;
+            if (row_hit) {
+                unsigned lo = MAX((unsigned)x, row_lo);
+                unsigned hi = MIN(seg_end, row_hi + 1);
 
-                /* Popup iff pup!=0 (iris compositor: no Pup_En gate;
-                 * MAME fires on bits 6/7 with pup==0 (opaque black
-                 * pen 0); that mispaints transparent regions black. */
-                if ((((cidaux >> 2) & 3) != 0)) {
-                    rgb = cmap[popup_msb | ((cidaux >> 2) & 3)];
-                    replaced = true;
-                } else if (aux_mode != 0) {
-                    /* Overlay components only, transparent when zero
-                     * (xmap9.pdf 3.3; iris compositor). No underlay:
-                     * iris never displays underlay modes (falls through
-                     * to main) and is the correct reference. */
-                    if (is_8bpp) {
-                        switch (aux_mode) {
-                        case 2: { /* 2-bit overlay, transparent if zero */
-                            uint32_t pix_in = (cidaux >> 8) & 3;
-
-                            if (pix_in) {
-                                rgb = cmap[aux_msb | pix_in];
-                                replaced = true;
-                            }
-                            break;
-                        }
-                        case 6: { /* 1-bit overlay, bit by table bit 1 */
-                            uint32_t shift = (table & 2) ? 9 : 8;
-                            uint32_t pix_in = (cidaux >> shift) & 1;
-
-                            if (pix_in) {
-                                rgb = cmap[aux_msb | pix_in];
-                                replaced = true;
-                            }
-                            break;
-                        }
-                        case 7: { /* 1-bit overlay, transparent if zero;
-                                     * the 1-bit underlay half is a
-                                     * main-zero fallback (see below). */
-                            uint32_t pix_in = (cidaux >> 8) & 1;
-
-                            if (pix_in) {
-                                rgb = cmap[aux_msb | pix_in];
-                                replaced = true;
-                            }
-                            break;
-                        }
-                        default:
-                            break;
-                        }
-                    } else {
-                        switch (aux_mode) {
-                        case 2: { /* 8-bit overlay, transparent if zero */
-                            uint32_t pix_in =
-                                ((cidaux >> 8) & 0xf) |
-                                ((cidaux >> 16) & 0xf0);
-
-                            if (pix_in) {
-                                rgb = cmap[aux_msb | pix_in];
-                                replaced = true;
-                            }
-                            break;
-                        }
-                        case 6: { /* 4-bit overlay, shift by table bit 1 */
-                            uint32_t shift = (table & 2) ? 12 : 8;
-                            uint32_t pix_in = (cidaux >> shift) & 0xf;
-
-                            if (pix_in) {
-                                rgb = cmap[aux_msb | pix_in];
-                                replaced = true;
-                            }
-                            break;
-                        }
-                        case 7: { /* 4-bit overlay, transparent if zero;
-                                     * the 4-bit underlay half is a
-                                     * main-zero fallback (see below). */
-                            uint32_t pix_in = (cidaux >> 8) & 0xf;
-
-                            if (pix_in) {
-                                rgb = cmap[aux_msb | pix_in];
-                                replaced = true;
-                            }
-                            break;
-                        }
-                        default:
-                            break;
-                        }
+                if (lo < hi) {
+                    sgi_gio64_raster_segment(state, pixels + y * stride,
+                                             (size_t)y * XL24_STRIDE, y,
+                                             lo, hi, table, pix_mode,
+                                             pix_size, aux_mode, aux_msb,
+                                             ci_msb, row_has_cursor,
+                                             cur_x0, cur_xspan, aux_used);
+                    if (dbg) {
+                        sgi_gio64_trace_row(state, y, lo, hi, table,
+                                            pix_mode, pix_size, ci_msb);
                     }
                 }
             }
-            if (!replaced) {
-                size_t off = (size_t)y * XL24_STRIDE + x;
-                uint32_t word = off < vram_words ? vram[off] : 0;
-
-                byte = (uint8_t)word;
-                switch (pix_mode) {
-                case 0: /* CI through the head-0 colormap */
-                    switch (pix_size) {
-                    case 0: {
-                        uint8_t shift = (table & 1) ? 4 : 0;
-
-                        rgb = cmap[ci_msb | ((byte >> shift) & 0x0f)];
-                        break;
-                    }
-                    case 1:
-                        rgb = cmap[ci_msb | byte];
-                        break;
-                    case 2: {
-                        /* MAME CI 12bpp: low 12 bits of the word, upper
-                         * half selected by table bit 0. */
-                        uint8_t shift = (table & 1) ? 12 : 0;
-                        uint16_t pix_in = (word >> shift) & 0x0fff;
-
-                        rgb = cmap[(ci_msb & 0x1000) | pix_in];
-                        break;
-                    }
-                    default:
-                        /* 24bpp CI view unsupported (MAME skips). */
-                        break;
-                    }
-                    break;
-                case 1: /* RGB Map0 */
-                case 2: /* RGB Map1 */
-                default: /* RGB Map2: iris expands every RGB mode identically */
-                    switch (pix_size) {
-                    case 0: {
-                        uint8_t shift = (table & 1) ? 4 : 0;
-
-                        rgb = sgi_gio64_bgr4_to_rgb(
-                            (byte >> shift) & 0x0f);
-                        break;
-                    }
-                    case 1: {
-                        /* MAME RGB Map0 8bpp: buffer selected by table bit
-                         * 0 (buffer 1 reads bits 8-15). */
-                        uint8_t shift = (table & 1) ? 8 : 0;
-                        uint8_t pix_in = (word >> shift) & 0xff;
-
-                        rgb = sgi_gio64_bgr8_to_rgb(pix_in);
-                        break;
-                    }
-                    case 2: {
-                        /* MAME RGB 12bpp: low 12 bits of the word, upper
-                         * half selected by table bit 0. */
-                        uint8_t shift = (table & 1) ? 12 : 0;
-
-                        rgb = sgi_gio64_bgr12_to_rgb(
-                            (word >> shift) & 0x0fff);
-                        break;
-                    }
-                    default: {
-                        /* MAME RGB 24bpp: the word is 0x00BBGGRR. */
-                        uint8_t r = (word >> 0) & 0xff;
-                        uint8_t g = (word >> 8) & 0xff;
-                        uint8_t b = (word >> 16) & 0xff;
-
-                        rgb = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
-                        break;
-                    }
-                    }
-                    break;
-                }
-                if (dbg && (y == 320 || y == 500 || y == 832) &&
-                    (x & 7) == 0) {
-                    static uint8_t pbyte[3][160];
-                    unsigned yi = y == 320 ? 0 : (y == 500 ? 1 : 2);
-
-                    if (pbyte[yi][x >> 3] != byte) {
-                        pbyte[yi][x >> 3] = byte;
-                        fprintf(stderr, "DPX y=%d x=%d raw=%02x rgb=%06x\n",
-                                y, x, byte, rgb);
-                    }
-                }
-                if (dbg && y == 500 && x >= 320 && x <= 352) {
-                    fprintf(stderr, "DPF y=500 x=%d raw=%02x\n", x, byte);
-                }
-                if (dbg && y == 832 && x >= 0 && x <= 16) {
-                    fprintf(stderr, "DPF y=832 x=%d raw=%02x\n", x, byte);
-                }
-            }
-            pixels[y * stride + x] = sgi_gio64_ramdac_remap(state, rgb);
+            x = (int)seg_end;
         }
     }
     state->display_dirty = false;
@@ -4952,6 +5220,10 @@ static int sgi_gio64_post_load(void *opaque, int version_id)
 
     state->display_dirty = true;
     state->dmg_full = true;
+    /* The scanout tables are derived state: rebuild them after a load,
+     * and assume the aux plane may hold pop-up/overlay bits. */
+    state->rgba_dirty = true;
+    qatomic_set(&state->aux_written, true);
     /* In-flight host transfer is not migratable; restart clean. */
     state->host_staged = 0;
     state->host_len = 0;
@@ -5133,13 +5405,18 @@ static void sgi_gio64_init(Object *object)
     state->dcb_mask = 0xffffffff;
     state->x_window = 0x1000;
     state->y_window = 0x1000;
+    /* Build the scanout tables once so the first frame does not read
+     * uninitialised entries (the RAMDAC LUTs are still identity-less
+     * here, so every entry is opaque black until the guest programs
+     * them and the vblank handler rebuilds). */
+    sgi_gio64_rebuild_rgba_tables(state);
 }
 
 static void sgi_gio64_realize(DeviceState *device, Error **errp)
 {
     SGIGIO64State *state = SGI_GIO64(device);
 
-    sgi_gfx_threaded = getenv("SGI_GFX_SYNC") == NULL;
+    sgi_gfx_threaded = !sgi_env_flag("SGI_GFX_SYNC");
     qemu_mutex_init(&state->gfx_mtx);
     qemu_cond_init(&state->gfx_cond_work);
     qemu_cond_init(&state->gfx_cond_idle);
@@ -5198,6 +5475,9 @@ static void sgi_gio64_reset(DeviceState *device)
     state->host_cursor = 0;
     state->display_dirty = true;
     state->dmg_full = true;
+    /* The RAMDAC gamma may have changed while the guest was running:
+     * let the vblank handler rebuild the scanout tables. */
+    state->rgba_dirty = true;
     state->draw_mode1 = 0x3002f001;
     state->draw_mode0 = 0;
     state->plane_depth = (state->draw_mode1 >> 3) & 3;
