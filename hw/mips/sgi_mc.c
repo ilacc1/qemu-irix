@@ -599,7 +599,12 @@ static uint64_t sgi_mc_read_inner(void *opaque, hwaddr addr, unsigned size)
                 state->dma_timer = NULL;
             }
             sgi_mc_dma_complete(state);
-            return 0x40;
+            /* Report RUNNING on the first sample (the PROM aborts if it
+             * never observes RUN), but keep the real COMPLETE/error bits:
+             * the timer may already have finished the transfer, and a
+             * bare 0x40 would tell the kernel a done transfer is still
+             * running (VDMA TIMEOUT, status 40). */
+            return state->dma_run | 0x40;
         }
         return state->dma_run;
     }
