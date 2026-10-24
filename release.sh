@@ -28,7 +28,8 @@ DIST="$ROOT_DIR/dist"
 BUILD_DIR="${BUILD_DIR:-$ROOT_DIR/build}"
 WIN_SSH_TARGET="${WIN_SSH_TARGET:-}"
 WIN_SRC_DIR="${WIN_SRC_DIR:-/c/apps/0irix/qemu-irix}"
-WIN_MINGW="${WIN_MINGW:-/mingw64}"
+# msys root (parent of mingw64/); / resolves via the /mingw64 mount.
+WIN_MINGW="${WIN_MINGW:-/}"
 
 mkdir -p "$DIST"
 
@@ -85,9 +86,14 @@ if [ "$WITH_WINDOWS" -eq 1 ]; then
 
     # On the remote: tar the exe plus the exact mingw64 DLL closure
     # (computed with ldd there, not hardcoded) plus GTK runtime data.
+    # Everything lands under mingw64/ in the tarball to match the moves
+    # below. WIN_MINGW is the msys root (parent of mingw64/); the default
+    # / works on a standard MSYS2 install via its /mingw64 mount. The
+    # remote shell must be bourne-compatible and ssh key/agent auth is
+    # expected (no credentials live in this script).
     # shellcheck disable=SC2029
     ssh "$WIN_SSH_TARGET" \
-        "msys64/usr/bin/bash.exe -lc 'cd $WIN_SRC_DIR && EXE=qemu/build/qemu-system-mips64.exe && DLLS=\$(MSYSTEM=MINGW64 PATH=$WIN_MINGW/bin:/usr/bin:\$PATH ldd \$EXE | awk '\''{print \$3}'\'' | grep -i mingw64 | sed '\''s|.*\(/mingw64/.*\)|\1|'\'' | sort -u) && tar czf /tmp/qemu-irix-win.tgz -C qemu/build qemu-system-mips64.exe -C $WIN_MINGW \$DLLS lib/gdk-pixbuf-2.0 share/glib-2.0/schemas && ls -la /tmp/qemu-irix-win.tgz'"
+        "msys64/usr/bin/bash.exe -lc 'cd $WIN_SRC_DIR && EXE=qemu/build/qemu-system-mips64.exe && DLLS=\$(MSYSTEM=MINGW64 PATH=$WIN_MINGW/mingw64/bin:/usr/bin:\$PATH ldd \$EXE | awk '\''{print \$3}'\'' | grep -i mingw64 | sed '\''s|.*/mingw64/|mingw64/|'\'' | sort -u) && tar czf /tmp/qemu-irix-win.tgz -C qemu/build qemu-system-mips64.exe -C $WIN_MINGW \$DLLS mingw64/lib/gdk-pixbuf-2.0 mingw64/share/glib-2.0/schemas && ls -la /tmp/qemu-irix-win.tgz'"
     scp "$WIN_SSH_TARGET:/tmp/qemu-irix-win.tgz" "$DIST/win-remote.tgz"
 
     mkdir -p "$DIST/win-remote" && rm -rf "$DIST/win-remote" && mkdir -p "$DIST/win-remote"
