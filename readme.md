@@ -9,7 +9,7 @@ or suitability for any use.
 ## Just get it running
 
 1. Get the release zip / tar.gz for your OS and run either install.bat or install.sh
-2. Get the indy_40xx compatible CHD from any source (mame presumably)
+2. Get the indy_40xx compatible CHD from any source (mame presumably) and update run-irix.sh/bat DISK variable to point to your CHD image
 3. See [networking.md](networking.md) if you want to have access to the network. Of course, these are ancient systems and highly insecure so beware.
 
 ## Why another IRIX emulator
@@ -53,22 +53,17 @@ So you can just use your existing CHD and get all the performance benefits.
 
 ## Known issues
 
-### Black screen on startup
-
-Happens sometimes, in the qemu window just open the Machine menu and hit "Reset"
-
 ### Graphics / OpenGL bugs
 
 There are a few. Occasional shearing here and there, background refresh and 
 colour maps in some demos are wrong. 
 
+Several fixes are in 0.1.1 - powerflip works perfectly now.
+
 ### ec3 sometimes reports error on boot
 
 Safe to ignore. Unrelated to your main adapter which should be ec0.
 
-### Panics / application crashes
-
-Likely at this stage.
 
 ## Notes and tips
 
@@ -76,6 +71,9 @@ Likely at this stage.
 
 You can release your mouse/keyboard by hitting CTRL-ALT-G which Qemu hepfully
 has in the title bar.
+
+If your mouse jumps when you move it quickly, you can drop acceleration in Irix
+(Toolchest-Find-ControlPanels-Mouse).
 
 ### NVRAM
 
