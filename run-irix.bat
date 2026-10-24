@@ -19,11 +19,15 @@ if not exist "%MSYS2%\mingw64\bin\libgtk-3-0.dll" (
 )
 set "PATH=%MSYS2%\mingw64\bin;%PATH%"
 
-rem --- disable the GIO surface-draw worker (synchronous draws instead).
-rem --- SGI_GFX_SYNC=1 runs every REX3 draw inline on the vCPU thread.
-set "SGI_GFX_SYNC=1"
-rem --- disable the WD33C93 batched run-DMA fast path (per-byte instead).
-set "SGI_WD_SYNC=1"
+rem --- async offload paths (worker threads). =1 forces synchronous inline
+rem --- execution for A/B comparison; override any of these beforehand, e.g.
+rem ---   set SGI_GFX_SYNC=1
+rem --- GFX: 0 = surface draws go to the GIO64 worker thread (default).
+if not defined SGI_GFX_SYNC set "SGI_GFX_SYNC=0"
+rem --- WD33C93: 0 = batched run-DMA fast path (default).
+if not defined SGI_WD_SYNC set "SGI_WD_SYNC=0"
+rem --- CHD: 0 = inflate hunks in the block thread pool (default).
+if not defined SGI_CHD_SYNC set "SGI_CHD_SYNC=0"
 
 set "QEMU=qemu\build\qemu-system-mips64.exe"
 set "BIOS=indy\ip24prom.070-9101-011.bin"
