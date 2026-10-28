@@ -184,11 +184,13 @@ static void sgi_hpc3_pbus_tick(void *opaque)
     /*
      * Wall-clock pacing (iris src/dev/hal2.rs:159-196 Pacer::due): the
      * audio backend consumes in real time, but main-loop latency makes
-     * the host-clock timer fire late. Move at most ~5/4 of a 250us
-     * period per fire (iris PACE_PERIOD with PACE_CATCHUP_NUM/DEN) so
-     * the DMA position advances smoothly -- a burst leap would run past
-     * what the guest has written and replay stale slots. Debt past
-     * 100ms is skipped, not replayed (iris PACE_MAX_BACKLOG).
+     * the host-clock timer fire late. Replay the ticks that are actually
+     * due so the average rate stays correct. A fixed 250us catch-up
+     * window is too small when the main loop only wakes on millisecond
+     * timers (Windows): it yields ~15 samples per wake, slowing the
+     * stream to ~16kHz. Cap the burst at the same 100ms backlog the skip
+     * branch below treats as unrecoverable; debt past 100ms is skipped,
+     * not replayed (iris PACE_MAX_BACKLOG).
      */
     unsigned budget = 1;
     uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_HOST);
@@ -199,10 +201,9 @@ static void sgi_hpc3_pbus_tick(void *opaque)
         if (late > 100000000ULL) {
             dma->tick_deadline_ns = now;
         } else {
-            uint64_t per = 250000ULL / rate + 1;
-            uint64_t cap = per + (per + 3) / 4;
+            uint64_t max_due = 100000000ULL / rate;
             uint64_t due = late / rate;
-            budget = 1 + (unsigned)MIN(due, cap);
+            budget = 1 + (unsigned)MIN(due, max_due);
             dma->tick_deadline_ns += (uint64_t)budget * rate;
         }
     }
