@@ -139,6 +139,10 @@ typedef struct SgiHpc3PbusDma {
     uint32_t bytes_left;
     uint32_t control;
     uint32_t config;
+    /* MAME hpc3.cpp pbus_dma_t: set when DMASTART+LOAD_EN are written,
+     * cleared only by an EOX descriptor.  A later control write that
+     * clears DMASTART must not stop an already-running channel. */
+    bool active;
     QEMUTimer *timer;
     /* Last tick deadline (host ns); 0 when (re)armed elsewhere. The
      * timer list clears expire_time before running the callback, so the
@@ -206,7 +210,7 @@ static void sgi_hpc3_pbus_tick(void *opaque)
         uint32_t word;
         int16_t sample;
 
-        if (!dma->bytes_left || !(dma->control & 0x10)) {
+        if (!dma->bytes_left || !dma->active) {
             dma->tick_deadline_ns = 0;
             timer_del(dma->timer);
             return;
@@ -233,7 +237,7 @@ static void sgi_hpc3_pbus_tick(void *opaque)
                 qemu_set_irq(sgi_hpc3_pbus_done_irq, 1);
             }
             if (dma->flags & 0x80000000) {
-                dma->control &= ~0x10U;
+                dma->active = false;
                 dma->tick_deadline_ns = 0;
                 timer_del(dma->timer);
                 return;
@@ -404,9 +408,13 @@ static void sgi_hpc3_pbus_dma_write(void *opaque, hwaddr addr,
             return;
         case 0x1000:
             dma->control = val;
+            /* MAME hpc3.cpp pbusdma_w: latch active on DMASTART+LOAD_EN.
+             * A later control write that clears DMASTART must not stop an
+             * already-running channel; only an EOX descriptor does that. */
             if ((val & 0x30) == 0x30 && channel < 4 && dma->bytes_left) {
                 uint64_t rate = sgi_hal2_rate_ns(channel);
 
+                dma->active = true;
                 if (rate) {
                     dma->tick_deadline_ns =
                         qemu_clock_get_ns(QEMU_CLOCK_HOST) + rate;
@@ -415,9 +423,6 @@ static void sgi_hpc3_pbus_dma_write(void *opaque, hwaddr addr,
                     dma->tick_deadline_ns = 0;
                     timer_del(dma->timer);
                 }
-            } else if (!(val & 0x10)) {
-                dma->tick_deadline_ns = 0;
-                timer_del(dma->timer);
             }
             return;
         default:
@@ -594,6 +599,31 @@ static void sgi_hal2_reset_state(void)
 
 /* Indirect values are staged in IDR0-3, then committed by writing the
  * target address to IAR (MAME hal2.cpp:115-305). */
+static bool sgi_hal2_trace_on(void)
+{
+    static int cached = -1;
+
+    if (cached < 0) {
+        cached = getenv("SGI_TRACE_HAL2") ? 1 : 0;
+    }
+    return cached != 0;
+}
+
+/* An absent HAL2 reports an invalid revision (0xFFFF), so the IRIX 5.3
+ * hal2 driver skips attaching instead of spinning on an incomplete chip
+ * (iris src/dev/hpc3.rs hal2_absent_read).  Enabled by the 5.3 launcher. */
+static bool sgi_hal2_absent(void)
+{
+    static int cached = -1;
+
+    if (cached < 0) {
+        const char *v = getenv("SGI_HAL2_ABSENT");
+
+        cached = v && *v && strcmp(v, "0") != 0;
+    }
+    return cached != 0;
+}
+
 static void sgi_hal2_iar_write(uint16_t iar)
 {
     unsigned type = iar & 0xf000;
@@ -601,6 +631,12 @@ static void sgi_hal2_iar_write(uint16_t iar)
     bool read = (iar & 0x0080) != 0;
     unsigned param = (iar & 0x000c) >> 2;
 
+    if (sgi_hal2_trace_on()) {
+        fprintf(stderr, "HAL2 IAR=%04x ty=%x num=%x par=%u %s "
+                "idr=%04x,%04x,%04x,%04x\n", iar, type >> 12, num >> 8,
+                param, read ? "R" : "W", sgi_hal2_idr[0], sgi_hal2_idr[1],
+                sgi_hal2_idr[2], sgi_hal2_idr[3]);
+    }
     sgi_hal2_iar = iar;
     if (type == 0x1000 && (num == 0x0400 || num == 0x0500)) {
         /* Codec A/B CTRL1 holds channel/clock/mode, CTRL2 gain (MAME hal2.cpp:134-206). */
@@ -665,6 +701,9 @@ static void sgi_hal2_iar_write(uint16_t iar)
 /* PIO0 register file (MAME hal2.h:65-74); the PROM touches these as dwords. */
 uint64_t sgi_hal2_read(unsigned offset)
 {
+    if (sgi_hal2_absent()) {
+        return offset == 0x08 ? 0xffff : 0;
+    }
     switch (offset) {
     case 0x04:
         return sgi_hal2_isr;
@@ -676,6 +715,12 @@ uint64_t sgi_hal2_read(unsigned offset)
     case 0x14:
     case 0x18:
     case 0x1c:
+        if (sgi_hal2_trace_on()) {
+            unsigned idx = (offset - 0x10) / 4;
+
+            fprintf(stderr, "HAL2 IDR%u read=%04x iar=%04x\n", idx,
+                    sgi_hal2_idr[idx], sgi_hal2_iar);
+        }
         return sgi_hal2_idr[(offset - 0x10) / 4];
     default:
         return 0;
@@ -684,6 +729,9 @@ uint64_t sgi_hal2_read(unsigned offset)
 
 void sgi_hal2_write(unsigned offset, uint16_t value)
 {
+    if (sgi_hal2_absent()) {
+        return;
+    }
     switch (offset) {
     case 0x04:
         /* Bits 2-4 are writable control; clearing a reset bit resets that
@@ -707,6 +755,12 @@ void sgi_hal2_write(unsigned offset, uint16_t value)
     case 0x14:
     case 0x18:
     case 0x1c:
+        if (sgi_hal2_trace_on()) {
+            unsigned idx = (offset - 0x10) / 4;
+
+            fprintf(stderr, "HAL2 IDR%u write=%04x iar=%04x\n", idx,
+                    value, sgi_hal2_iar);
+        }
         sgi_hal2_idr[(offset - 0x10) / 4] = value;
         return;
     default:
@@ -1469,6 +1523,7 @@ static void sgi_indy_board_reset(void *opaque)
         sgi_hpc3_pbus_dma[i].bytes_left = 0;
         sgi_hpc3_pbus_dma[i].control = 0;
         sgi_hpc3_pbus_dma[i].config = 0;
+        sgi_hpc3_pbus_dma[i].active = false;
     }
     memset(sgi_hpc3_dma_cfg, 0, sizeof(sgi_hpc3_dma_cfg));
     memset(sgi_hpc3_pio_cfg, 0, sizeof(sgi_hpc3_pio_cfg));
