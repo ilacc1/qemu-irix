@@ -11,7 +11,8 @@ The build produces a single-system QEMU binary:
 | Linux    | `build/qemu-system-mips64` |
 | Windows  | `build\qemu-system-mips64.exe` |
 
-only for `mips64-softmmu`, which contains the `indy` machine.
+only for `mips64-softmmu`, which contains the `indy` machine. The planned
+IP27/Onyx2 machine is tracked separately.
 
 ---
 
@@ -29,29 +30,33 @@ qemu-irix/
 ├── building.md
 ├── run-irix.sh              # Linux launcher
 ├── run-irix.bat             # Windows launcher
-├── indy/                     # Indy firmware and NVRAM seeds
-│   ├── ip24prom.070-9101-011.bin
-│   └── nvram/{eeprom,rtc}
+├── sgi/                      # SGI firmware and NVRAM seeds
+│   └── indy/                 # Indy firmware and NVRAM seeds
+│       ├── ip24prom.070-9101-011.bin
+│       └── nvram/{eeprom,rtc}
 ├── build/                    # build output (created by configure)
 └── ...                       # the QEMU source tree
 ```
 
+The current firmware tree contains `sgi/indy/`; Onyx2/IP27 firmware will
+live under `sgi/onyx2/`.
+
 ### 1.2 Runtime data
 
-The PROM image and NVRAM seeds ship in `indy/` with the source. The disk
+The PROM image and NVRAM seeds ship in `sgi/indy/` with the source. The disk
 image is **not** distributed with the source (size and licensing) — you
 supply it yourself. A CD ISO is never required; one can optionally be
 attached as the install/overlay CD:
 
 | File | Purpose | Where it goes |
 |------|---------|---------------|
-| `ip24prom.070-9101-011.bin` | IP24 PROM BIOS (bios set `b10`, the `indy_4020` default), 524288 bytes | In the repo: `indy/` |
+| `ip24prom.070-9101-011.bin` | IP24 PROM BIOS (bios set `b10`, the `indy_4020` default), 524288 bytes | In the repo: `sgi/indy/` |
 | `A CHD image of Irix` | The bootable IRIX 6.5 disk (CHD format) | You supply it; path set via `IRIX_DISK` (Linux) or `IRIX_DISK`/`DISK` in `run-irix.bat` |
 | CDROM ISO (optional) | CD on SCSI ID 4, attached only when configured | Anywhere; path set via `IRIX_CDROM` (Linux) or `CDROM` in `run-irix.bat` |
-| `nvram/{eeprom,rtc}` | PROM NVRAM seed (IP24 uses a DS1386 8 KiB RTC) | In the repo: `indy/nvram/`; seeded automatically into `build/nvram/indy_4020/` on first run |
+| `nvram/{eeprom,rtc}` | PROM NVRAM seed (IP24 uses a DS1386 8 KiB RTC) | In the repo: `sgi/indy/nvram/`; seeded automatically into `build/nvram/indy_4020/` on first run |
 
 The PROM image is the `ip24prom.070-9101-011.bin` member of the MAME
-indy_40xx ROM set and is already extracted into `indy/` for you.
+indy_40xx ROM set and is already extracted into `sgi/indy/` for you.
 
 Do **not** substitute a different PROM, or a
 disk image from another machine — the emulation is matched to this exact
@@ -184,7 +189,7 @@ The result is `build/qemu-system-mips64`.
 
 ### 2.4 Install the runtime data
 
-The PROM and NVRAM seeds already ship in `indy/`. Copy your disk image
+The PROM and NVRAM seeds already ship in `sgi/indy/`. Copy your disk image
 into place and point the launcher at it:
 
 ```sh
@@ -194,7 +199,7 @@ IRIX_DISK=~/irix65_4020.chd ./run-irix.sh
 ```
 
 NVRAM is seeded automatically on first run from
-`indy/nvram/` into `build/nvram/indy_4020/`.
+`sgi/indy/nvram/` into `build/nvram/indy_4020/`.
 
 ### 2.5 Run
 
@@ -219,7 +224,7 @@ and a QEMU monitor socket at `run/mon.sock`. Useful environment overrides:
 | `IRIX_AUDIO` | Audio backend for the HAL2 boot chime (default `pa`). |
 
 For a guaranteed-pristine boot, delete the NVRAM working copy so it
-re-seeds from `indy/nvram/`:
+re-seeds from `sgi/indy/nvram/`:
 
 ```sh
 rm -rf build/nvram
@@ -351,7 +356,7 @@ The result is `build\qemu-system-mips64.exe`.
 
 ### 3.5 Install the runtime data
 
-The PROM and NVRAM seeds already ship in `indy/`. Copy your disk image
+The PROM and NVRAM seeds already ship in `sgi/indy/`. Copy your disk image
 into place (from the repository root, in the MINGW64 shell paths look
 like `/c/apps/0irix/qemu-irix/...`):
 
@@ -371,7 +376,7 @@ run-irix.bat
 `%MSYS2_ROOT%`, else falls back to `msys64` next to the script. It uses:
 
 - `build\qemu-system-mips64.exe`
-- `indy\ip24prom.070-9101-011.bin`
+- `sgi\indy\ip24prom.070-9101-011.bin`
 - your IRIX 6.5 disk image (set `IRIX_DISK`, or `irix65_4020.chd` next to
   the script)
 - the overlay/install CD only if `CDROM` names a file that exists
@@ -387,7 +392,7 @@ monitor and serial disabled:
 
 ```sh
 ./build/qemu-system-mips64.exe -M indy,audiodev=sgiaudio -audiodev none,id=sgiaudio \
-    -m 256M -bios ./indy/ip24prom.070-9101-011.bin \
+    -m 256M -bios ./sgi/indy/ip24prom.070-9101-011.bin \
     -display none -serial null -serial null -monitor none
 ```
 
@@ -410,7 +415,7 @@ Check the binary reports the `indy` machine:
   (section 2.3); the launcher checks for it and prints this reminder.
 - **No window / no display.** Without GTK, run with `-display none` (headless)
   and drive the guest through the PIO Telnet console and the monitor.
-- **PROM does nothing / machine names unknown.** Confirm `indy/`
+- **PROM does nothing / machine names unknown.** Confirm `sgi/indy/`
   holds `ip24prom.070-9101-011.bin` and you are using the `indy`
   machine, not `indigo2` or another SGI board.
 - **Disk will not mount / XFS recovery loops.** The CHD must be the

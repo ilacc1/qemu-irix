@@ -37,12 +37,12 @@ echo "All runtime libraries present (bundled lib/)."
 
 chmod +x "$BIN" run-irix.sh install.sh 2>/dev/null || true
 
-if [ ! -f indy/ip24prom.070-9101-011.bin ]; then
-    echo "ERROR: indy/ip24prom.070-9101-011.bin missing - re-extract the tarball." >&2
+if [ ! -f sgi/indy/ip24prom.070-9101-011.bin ]; then
+    echo "ERROR: sgi/indy/ip24prom.070-9101-011.bin missing - re-extract the tarball." >&2
     exit 1
 fi
-if [ ! -f indy/nvram/rtc ]; then
-    echo "ERROR: indy/nvram/rtc missing - re-extract the tarball." >&2
+if [ ! -f sgi/indy/nvram/rtc ]; then
+    echo "ERROR: sgi/indy/nvram/rtc missing - re-extract the tarball." >&2
     exit 1
 fi
 

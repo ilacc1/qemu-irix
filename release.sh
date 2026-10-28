@@ -53,7 +53,7 @@ ldd "$EXE" | awk '/=> \//{print $1 "=" $3}' | while IFS='=' read -r soname path;
     cp -L "$path" "$UBUNTU_STAGE/lib/$soname"
 done
 
-cp -r "$ROOT_DIR/indy" "$UBUNTU_STAGE/"
+cp -r "$ROOT_DIR/sgi" "$UBUNTU_STAGE/"
 cp "$ROOT_DIR/run-irix.sh" "$ROOT_DIR/install.sh" \
    "$ROOT_DIR/readme.md" "$ROOT_DIR/building.md" "$ROOT_DIR/networking.md" \
    "$UBUNTU_STAGE/"
@@ -102,7 +102,7 @@ if [ "$WITH_WINDOWS" -eq 1 ]; then
     mv "$DIST/win-remote"/mingw64/bin/*.dll "$WIN_STAGE/msys64/mingw64/bin/"
     mv "$DIST/win-remote"/mingw64/{lib,share} "$WIN_STAGE/msys64/mingw64/"
 
-    cp -r "$ROOT_DIR/indy" "$WIN_STAGE/"
+    cp -r "$ROOT_DIR/sgi" "$WIN_STAGE/"
     # CRLF for everything cmd.exe parses (normalize first: repo copies
     # may be LF or CRLF depending on checkout settings).
     for f in run-irix.bat install.bat; do

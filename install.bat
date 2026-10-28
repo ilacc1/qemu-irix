@@ -24,13 +24,13 @@ if not exist "qemu\build\qemu-system-mips64.exe" (
     echo Re-extract the distribution zip.
     exit /b 1
 )
-if not exist "indy\ip24prom.070-9101-011.bin" (
-    echo MISSING: indy\ip24prom.070-9101-011.bin
+if not exist "sgi\indy\ip24prom.070-9101-011.bin" (
+    echo MISSING: sgi\indy\ip24prom.070-9101-011.bin
     echo Re-extract the distribution zip.
     exit /b 1
 )
-if not exist "indy\nvram\rtc" (
-    echo MISSING: indy\nvram\rtc
+if not exist "sgi\indy\nvram\rtc" (
+    echo MISSING: sgi\indy\nvram\rtc
     echo Re-extract the distribution zip.
     exit /b 1
 )

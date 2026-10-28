@@ -7,7 +7,7 @@ rem    release.bat [version]
 rem
 rem  Builds dist\qemu-irix-<version>-windows.zip from the local Windows
 rem  build: the exe plus the exact mingw64 DLL closure computed with ldd
-rem  (not hardcoded), GTK runtime data, indy firmware, scripts and docs.
+rem  (not hardcoded), GTK runtime data, SGI firmware, scripts and docs.
 rem  Needs MSYS2 (MSYS2_ROOT, msys64 next to the script, or C:\msys64).
 rem  Repo path must not contain spaces.
 rem
@@ -66,7 +66,7 @@ mkdir "%STAGE%\msys64\mingw64\share"
 xcopy /e /i /y "%MSYS2%\mingw64\lib\gdk-pixbuf-2.0" "%STAGE%\msys64\mingw64\lib\gdk-pixbuf-2.0\" >nul
 xcopy /e /i /y "%MSYS2%\mingw64\share\glib-2.0\schemas" "%STAGE%\msys64\mingw64\share\glib-2.0\schemas\" >nul
 
-xcopy /e /i /y "indy" "%STAGE%\indy\" >nul
+xcopy /e /i /y "sgi" "%STAGE%\sgi\" >nul
 copy /y run-irix.bat "%STAGE%\" >nul
 copy /y install.bat "%STAGE%\" >nul
 copy /y readme.md "%STAGE%\" >nul
