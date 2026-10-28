@@ -54,7 +54,7 @@ attached as the install/overlay CD:
 |------|---------|---------------|
 | `ip24prom.070-9101-011.bin` | IP24 PROM BIOS (bios set `b10`, the `indy_4020` default), 524288 bytes | In the repo: `sgi/indy/` |
 | `A CHD image of Irix` | The bootable IRIX 6.5 disk (CHD format) | You supply it; path set via `IRIX_DISK` (Linux) or `IRIX_DISK`/`DISK` in `run-irix.bat` |
-| CDROM ISO (optional) | CD on SCSI ID 4, attached only when configured | Anywhere; path set via `IRIX_CDROM` (Linux) or `CDROM` in `run-irix.bat` |
+| CDROM ISO (optional) | CD on SCSI ID 4 (drive always present; media loaded when configured) | Anywhere; path set via `IRIX_CDROM` (Linux) or `CDROM` in `run-irix.bat` |
 | `nvram/{eeprom,rtc}` | PROM NVRAM seed (IP24 uses a DS1386 8 KiB RTC) | In the repo: `sgi/indy/nvram/`; seeded automatically into `build/nvram/indy_4020/` on first run |
 
 The PROM image is the `ip24prom.070-9101-011.bin` member of the MAME
@@ -222,7 +222,8 @@ NVRAM is seeded automatically on first run from
 ```
 
 This launches QEMU with the Indy machine, the PROM, the CHD disk on SCSI ID 1,
-the overlay CD on ID 4 (when `IRIX_CDROM` names a file that exists), a GTK
+the CD drive on ID 4 (empty unless `IRIX_CDROM` names a file that
+exists; use Machine → Removable drive to insert/eject images at runtime), a GTK
 window, a Telnet-able PIO console on port 4444,
 and a QEMU monitor socket at `run/mon.sock`. Useful environment overrides:
 
@@ -230,7 +231,7 @@ and a QEMU monitor socket at `run/mon.sock`. Useful environment overrides:
 |----------|--------|
 | `IRIX_DISK` | Path to your IRIX 6.5 disk image (required). |
 | `IRIX_DISPLAY` | GTK mode; default `gtk,zoom-to-fit=on`. Use plain `gtk` for 1:1 pixels. |
-| `IRIX_CDROM` | Path to the overlay ISO (attached only if the file exists). |
+| `IRIX_CDROM` | Path to the overlay ISO (optional; the drive is always present and media loads only if the file exists). |
 | `IRIX_TELNET_PORT` | PIO console port (default 4444). |
 | `IRIX_MONITOR` | Monitor socket path (default `run/mon.sock`). |
 | `IRIX_NONET=1` | Drop the NIC entirely. |
@@ -421,7 +422,8 @@ the script. It uses:
 - `sgi\indy\ip24prom.070-9101-011.bin`
 - your IRIX 6.5 disk image (set `IRIX_DISK`, or `irix65_4020.chd` next to
   the script)
-- the overlay/install CD only if `CDROM` names a file that exists
+- the CD drive on SCSI ID 4, empty unless `CDROM` names a file that exists
+  (Machine → Removable drive inserts/ejects images at runtime)
 - SDL2 audio through WASAPI (`IRIX_AUDIO` defaults to `sdl`; the launcher
   sets `SDL_AUDIODRIVER=wasapi` unless you override it; set
   `IRIX_AUDIO=none` for silence)

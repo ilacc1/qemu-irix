@@ -60,8 +60,9 @@ if not exist "qemu\build\nvram\indy_4020\rtc" (
     copy /y "sgi\indy\nvram\rtc" "qemu\build\nvram\indy_4020\" >nul
 )
 
-rem --- overlay/install CD is attached only when present --------------------
-set "CDROM_ARGS="
+rem --- CD drive is always present (empty tray when no image) so the GTK
+rem --- Removable drive menu can insert and eject media at runtime. ------
+set "CDROM_ARGS=-drive "if=none,id=cdrom0,media=cdrom,readonly=on" -device "scsi-cd,bus=scsi.0,scsi-id=4,drive=cdrom0,physical_block_size=512""
 if defined CDROM (
     if exist "%CDROM%" (
         set "CDROM_ARGS=-drive "file=%CDROM%,format=raw,if=none,id=cdrom0,media=cdrom,readonly=on" -device "scsi-cd,bus=scsi.0,scsi-id=4,drive=cdrom0,physical_block_size=512""
