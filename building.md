@@ -30,6 +30,8 @@ qemu-irix/
 ├── building.md
 ├── run-irix.sh              # Linux launcher
 ├── run-irix.bat             # Windows launcher
+├── build.sh                 # Linux configure + build helper
+├── build.bat                # Windows configure + build helper (MSYS2)
 ├── sgi/                      # SGI firmware and NVRAM seeds
 │   └── indy/                 # Indy firmware and NVRAM seeds
 │       ├── ip24prom.070-9101-011.bin
@@ -167,6 +169,10 @@ Notes on the options:
 - `--disable-docs` — skip Sphinx documentation (not needed to run).
 - `--disable-tools` — skip `qemu-img`, `qemu-ga`, etc.
 
+`build.sh` runs exactly this configure line followed by the ninja build, so
+you do not have to remember the options. Extra arguments are passed to
+`configure`, for example `./build.sh --enable-debug`.
+
 `configure` writes its output to `build/`. At the end it prints a summary
 table; confirm you see `GTK+ support : YES` and `mips64-softmmu` in the list
 of targets. If a required library is missing, `configure` stops with an error
@@ -262,6 +268,7 @@ pacman -S --needed \
     mingw-w64-x86_64-pkgconf \
     mingw-w64-x86_64-glib2 \
     mingw-w64-x86_64-pixman \
+    mingw-w64-x86_64-SDL2 \
     mingw-w64-x86_64-gtk3
 ```
 
@@ -314,7 +321,7 @@ cd /c/apps/0irix/qemu-irix
 ./configure \
     --target-list=mips64-softmmu \
     --enable-gtk \
-    --disable-sdl \
+    --enable-sdl \
     --disable-vnc \
     --disable-spice \
     --disable-opengl \
@@ -338,7 +345,16 @@ cd /c/apps/0irix/qemu-irix
 
 QEMU auto-selects the `windows.txt` machine configuration under
 `configs/meson/`, so no cross-file argument is needed. Confirm the summary
-shows `GTK+ support : YES` and lists `mips64-softmmu`.
+shows `GTK+ support : YES`, `SDL support : YES`, and lists `mips64-softmmu`.
+
+`--enable-sdl` provides the Windows audio backend: the launcher passes
+`-audiodev sdl`, and SDL2 then selects WASAPI rather than QEMU's DirectSound
+backend. The binary links `SDL2.dll`, which the launcher's MSYS2 runtime
+provides.
+
+`build.bat` runs this exact configure line followed by the ninja build, so
+you do not have to remember the options. Extra arguments are passed to
+`configure`, for example `build.bat --enable-debug`.
 
 To start over:
 
@@ -352,7 +368,8 @@ rm -rf build
 ninja -C build qemu-system-mips64.exe
 ```
 
-The result is `build\qemu-system-mips64.exe`.
+Or run `build.bat`, which performs the configure step above and then this
+ninja command. The result is `build\qemu-system-mips64.exe`.
 
 ### 3.5 Install the runtime data
 
@@ -380,8 +397,14 @@ run-irix.bat
 - your IRIX 6.5 disk image (set `IRIX_DISK`, or `irix65_4020.chd` next to
   the script)
 - the overlay/install CD only if `CDROM` names a file that exists
+- SDL2 audio through WASAPI (`IRIX_AUDIO` defaults to `sdl`; the launcher
+  sets `SDL_AUDIODRIVER=wasapi` unless you override it; set
+  `IRIX_AUDIO=none` for silence)
 - GTK display, PIO console on `telnet 127.0.0.1 4444`, monitor on
   `telnet 127.0.0.1 5555`
+
+The launcher also sets `SGI_GFX_SYNC`, `SGI_WD_SYNC`, and `SGI_CHD_SYNC` to
+`0` unless already defined, which keeps the asynchronous worker paths on.
 
 Edit the paths at the top of `run-irix.bat` if your layout differs.
 
@@ -431,9 +454,7 @@ Linux:
 ```sh
 sudo apt-get install -y git build-essential python3 python3-venv \
     ninja-build meson pkg-config libglib2.0-dev libpixman-1-dev libgtk-3-dev
-./configure --target-list=mips64-softmmu --enable-gtk \
-    --disable-werror --disable-docs --disable-tools
-ninja -C build qemu-system-mips64
+./build.sh
 IRIX_DISK=/path/to/irix65_4020.chd ./run-irix.sh
 ```
 
@@ -443,15 +464,9 @@ Windows (MSYS2 MINGW64 shell):
 pacman -S --needed base-devel mingw-w64-x86_64-gcc mingw-w64-x86_64-python \
     mingw-w64-x86_64-python-packaging mingw-w64-x86_64-ninja \
     mingw-w64-x86_64-meson mingw-w64-x86_64-pkgconf mingw-w64-x86_64-glib2 \
-    mingw-w64-x86_64-pixman mingw-w64-x86_64-gtk3
+    mingw-w64-x86_64-pixman mingw-w64-x86_64-SDL2 mingw-w64-x86_64-gtk3
 cd /c/apps/0irix/qemu-irix
-./configure --target-list=mips64-softmmu --enable-gtk --disable-sdl \
-    --disable-vnc --disable-spice --disable-opengl --disable-werror \
-    --disable-docs --disable-tools --disable-guest-agent --disable-capstone \
-    --disable-fdt --disable-libusb --disable-usb-redir --disable-brlapi \
-    --disable-curl --disable-tests --disable-slirp --disable-vte \
-    --disable-nettle --disable-gcrypt --disable-gnutls
-ninja -C build qemu-system-mips64.exe
+build.bat
 ```
 
 then (from `cmd.exe`, with `IRIX_DISK` set to your IRIX 6.5 CHD)
