@@ -22,7 +22,13 @@ void mips_dump_tlb_match(CPUState *cs, vaddr addr);
 #define SGI_WD_STATUS_SELECT_TRANSFER_SUCCESS 0x16
 #define SGI_WD_STATUS_TRANSFER_SUCCESS 0x18
 #define SGI_WD_STATUS_SELECTION_TIMEOUT 0x42
-#define SGI_WD_STATUS_UNEXPECTED_SEND_DATA 0x49
+/* MAME wd33c9x.cpp SCSI_STATUS_UNEXPECTED_PHASE: 0x48 | MCI, where the
+ * low three bits carry the phase the target requested.  Data out is 0
+ * (0x48), data in is S_INP (0x49).  IRIX wd93's unex_info() only resumes
+ * a stalled transfer when the direction matches the command, so a paused
+ * WRITE must report 0x48 and a paused READ 0x49. */
+#define SGI_WD_STATUS_UNEXPECTED_PHASE 0x48
+#define SGI_WD_PHASE_DATA_OUT 0x00
 #define SGI_WD_STATUS_REQ 0x88
 #define SGI_WD_PHASE_TRANSFER_COUNT 0x46
 #define SGI_WD_PHASE_COMMAND 0x02
@@ -1265,14 +1271,19 @@ static void sgi_wd_target_pump(SGIWD33C93State *state)
             state->paused_tid = state->wd_regs[0x15] & BUSID_DID;
             /*
              * Tell the driver the transfer stalled mid-phase (Iris raises
-             * TRANSFER_COUNT/UNEXPECTED_SEND_DATA here): its unex_info()
-             * re-arms HPC DMA for the next chunk and resumes with
-             * SELECT_ATN_XFER.  The HPC chain terminator carries no
+             * TRANSFER_COUNT and an unexpected-phase status here): its
+             * unex_info() re-arms HPC DMA for the next chunk and resumes
+             * with SELECT_ATN_XFER.  The HPC chain terminator carries no
              * interrupt bit, so without this the driver would never resume.
+             * The status must carry the target's requested phase: IRIX only
+             * continues the transfer for 0x48 on a write or 0x49 on a read,
+             * and aborts ("Too much data requested") on a mismatch.
              */
             state->wd_regs[0x10] = SGI_WD_PHASE_TRANSFER_COUNT;
-            sgi_wd_irq_fifo_push(state,
-                                 SGI_WD_STATUS_UNEXPECTED_SEND_DATA);
+            sgi_wd_irq_fifo_push(state, SGI_WD_STATUS_UNEXPECTED_PHASE |
+                                 (state->target_xfer > 0 ?
+                                  SGI_WD_PHASE_DATA_IN :
+                                  SGI_WD_PHASE_DATA_OUT));
             /*
              * Drop BSY (and CIP) with the interrupt.  handle_intr() spins
              * on CIP|BSY before reading registers; holding BSY while paused
@@ -1807,7 +1818,7 @@ static void sgi_wd_update_status(SGIWD33C93State *state)
      * Data buffer request: the WD33C93 asserts DBR while the initiator still
      * owes data-phase bytes.  While paused DBR must stay clear: the aux
      * register read masks INT behind DBR, which would hide the pause
-     * interrupt (0x49) from a polling driver and wedge it until timeout.
+     * interrupt (0x48/0x49) from a polling driver and wedge it until timeout.
      */
     if (state->command_active && state->target_xfer != 0 &&
         !state->xfer_paused) {
