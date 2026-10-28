@@ -71,7 +71,9 @@ if defined CDROM (
 )
 
 rem --- Tolerate a missing TAP adapter: warn and run without networking ----
-ipconfig | findstr /i /c:"my-tap" >nul
+rem --- A bridged TAP adapter has no IP address of its own, so ipconfig ----
+rem --- never lists it; ask the interface table instead. ----------------
+netsh interface show interface name="my-tap" >nul 2>&1
 if errorlevel 1 (
     echo WARNING: no my-tap TAP adapter found - guest will have no network.
     echo See https://github.com/ilacc1/qemu-irix/blob/master/networking.md
