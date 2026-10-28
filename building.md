@@ -81,6 +81,7 @@ For reference, this fork has been built and verified with:
 | GLib | 2.88.0 | 2.90.1 |
 | Pixman | 0.46.4 | 0.46.4 |
 | GTK3 | 3.24.52 | 3.24.52 |
+| SDL2 | 2.32.10 | 2.32.10 |
 
 Any reasonably recent versions work; QEMU's `configure` checks for what it
 needs and reports anything missing.
@@ -169,10 +170,6 @@ Notes on the options:
 - `--disable-docs` — skip Sphinx documentation (not needed to run).
 - `--disable-tools` — skip `qemu-img`, `qemu-ga`, etc.
 
-`build.sh` runs exactly this configure line followed by the ninja build, so
-you do not have to remember the options. Extra arguments are passed to
-`configure`, for example `./build.sh --enable-debug`.
-
 `configure` writes its output to `build/`. At the end it prints a summary
 table; confirm you see `GTK+ support : YES` and `mips64-softmmu` in the list
 of targets. If a required library is missing, `configure` stops with an error
@@ -185,6 +182,17 @@ rm -rf build
 ```
 
 ### 2.3 Build
+
+The helper script runs the configure line above and then the build:
+
+```sh
+./build.sh
+```
+
+Any extra arguments are passed to `configure`, for example
+`./build.sh --enable-debug`.
+
+To run the steps yourself instead, configure as above and then:
 
 ```sh
 ninja -C build qemu-system-mips64
@@ -352,10 +360,6 @@ shows `GTK+ support : YES`, `SDL support : YES`, and lists `mips64-softmmu`.
 backend. The binary links `SDL2.dll`, which the launcher's MSYS2 runtime
 provides.
 
-`build.bat` runs this exact configure line followed by the ninja build, so
-you do not have to remember the options. Extra arguments are passed to
-`configure`, for example `build.bat --enable-debug`.
-
 To start over:
 
 ```sh
@@ -364,35 +368,56 @@ rm -rf build
 
 ### 3.4 Build
 
+From **`cmd.exe`** (not the MSYS2 shell), the helper script runs the
+configure line above and then the build:
+
+```
+build.bat
+```
+
+Any extra arguments are passed to `configure`, for example
+`build.bat --enable-debug`.
+
+To run the steps yourself instead, configure in the MINGW64 shell as above
+and then:
+
 ```sh
 ninja -C build qemu-system-mips64.exe
 ```
 
-Or run `build.bat`, which performs the configure step above and then this
-ninja command. The result is `build\qemu-system-mips64.exe`.
+The result is `build\qemu-system-mips64.exe`.
 
 ### 3.5 Install the runtime data
 
-The PROM and NVRAM seeds already ship in `sgi/indy/`. Copy your disk image
-into place (from the repository root, in the MINGW64 shell paths look
-like `/c/apps/0irix/qemu-irix/...`):
-
-```sh
-cp /path/to/irix65_4020.chd /c/apps/0irix/irix65_4020.chd
-```
+The PROM and NVRAM seeds already ship in `sgi/indy/`; no copy step is
+needed. Put your IRIX 6.5 disk image wherever you like and point the
+launcher at it with `IRIX_DISK`. The default is `irix65_4020.chd` next to
+`run-irix.bat`.
 
 ### 3.6 Run
 
-From a **`cmd.exe`** prompt (not the MSYS2 shell), double-click or run:
+`run-irix.bat` is the packaged launcher. It expects the release layout
+produced by `release.bat`, with the source build under `qemu\`:
+
+```
+qemu-irix\
+├── run-irix.bat
+├── install.bat
+├── msys64\                 # GTK/SDL runtime DLLs
+├── sgi\indy\...            # PROM and NVRAM seeds
+└── qemu\build\qemu-system-mips64.exe
+```
+
+From a **`cmd.exe`** prompt in that directory:
 
 ```
 run-irix.bat
 ```
 
-`run-irix.bat` expects the MinGW64 runtime DLLs; it looks for MSYS2 in
-`%MSYS2_ROOT%`, else falls back to `msys64` next to the script. It uses:
+It looks for MSYS2 in `%MSYS2_ROOT%`, else falls back to `msys64` next to
+the script. It uses:
 
-- `build\qemu-system-mips64.exe`
+- `qemu\build\qemu-system-mips64.exe`
 - `sgi\indy\ip24prom.070-9101-011.bin`
 - your IRIX 6.5 disk image (set `IRIX_DISK`, or `irix65_4020.chd` next to
   the script)
@@ -408,10 +433,16 @@ The launcher also sets `SGI_GFX_SYNC`, `SGI_WD_SYNC`, and `SGI_CHD_SYNC` to
 
 Edit the paths at the top of `run-irix.bat` if your layout differs.
 
+A plain source checkout builds into `build\` at the top level, so
+`run-irix.bat` does not find the binary there. Use the direct command in
+section 3.7 for a smoke test, or run `release.bat` to produce the packaged
+layout.
+
 ### 3.7 Headless smoke test
 
-To confirm a build works without a display, run the PROM briefly with the
-monitor and serial disabled:
+From the source root in the MINGW64 shell (from `cmd.exe`, use
+`build\qemu-system-mips64.exe` and `sgi\indy\...`), run the PROM briefly
+with the monitor and serial disabled:
 
 ```sh
 ./build/qemu-system-mips64.exe -M indy,audiodev=sgiaudio -audiodev none,id=sgiaudio \
