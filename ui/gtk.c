@@ -32,9 +32,15 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "qapi/qapi-commands-block.h"
+#include "qapi/qapi-commands-block-core.h"
 #include "qapi/qapi-commands-control.h"
 #include "qapi/qapi-commands-machine.h"
 #include "qapi/qapi-commands-misc.h"
+#include "system/block-backend-global-state.h"
+#include "system/block-backend-io.h"
+#include "block/block_int-global-state.h"
+#include "block/block_int-io.h"
 #include "qemu/cutils.h"
 #include "qemu/error-report.h"
 #include "qemu/main-loop.h"
@@ -2321,6 +2327,196 @@ static void gd_connect_vc_gfx_signals(VirtualConsole *vc)
     }
 }
 
+static void gd_show_error(GtkDisplayState *s, Error *err)
+{
+    GtkWidget *dialog;
+
+    dialog = gtk_message_dialog_new(GTK_WINDOW(s->window),
+                                    GTK_DIALOG_MODAL |
+                                    GTK_DIALOG_DESTROY_WITH_PARENT,
+                                    GTK_MESSAGE_ERROR, GTK_BUTTONS_OK,
+                                    "%s", error_get_pretty(err));
+    gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+    error_free(err);
+}
+
+static BlockBackend *gd_removable_blk(void)
+{
+    BlockBackend *blk = blk_by_name("cdrom0");
+
+    if (blk && blk_dev_has_removable_media(blk)) {
+        return blk;
+    }
+    for (blk = blk_next(NULL); blk; blk = blk_next(blk)) {
+        if (blk_dev_has_removable_media(blk) && blk_get_attached_dev(blk)) {
+            return blk;
+        }
+    }
+    return NULL;
+}
+
+static char *gd_removable_label(bool *has_drive, bool *has_media)
+{
+    BlockBackend *blk = gd_removable_blk();
+    BlockInfoList *list = NULL, *it;
+    const char *name = NULL;
+    g_autofree char *dev_id = NULL;
+    char *filename = NULL;
+    bool tray_open = false;
+    bool inserted = false;
+    char *label;
+
+    *has_drive = blk != NULL;
+    *has_media = false;
+    if (!blk) {
+        return g_strdup(_("No removable drive"));
+    }
+
+    name = blk_name(blk);
+    if (!name) {
+        dev_id = blk_get_attached_dev_id(blk);
+    }
+    tray_open = blk_dev_is_tray_open(blk);
+    inserted = blk_is_inserted(blk);
+
+    list = qmp_query_block(false, false, NULL);
+    for (it = list; it; it = it->next) {
+        BlockInfo *info = it->value;
+        bool match = false;
+
+        if (name && info->device && !strcmp(name, info->device)) {
+            match = true;
+        } else if (dev_id && info->qdev && !strcmp(dev_id, info->qdev)) {
+            match = true;
+        }
+        if (!match) {
+            continue;
+        }
+        if (info->has_tray_open) {
+            tray_open = info->tray_open;
+        }
+        inserted = info->inserted != NULL;
+        if (info->inserted && info->inserted->file) {
+            filename = g_strdup(info->inserted->file);
+        }
+        break;
+    }
+    qapi_free_BlockInfoList(list);
+
+    *has_media = inserted && !tray_open;
+    if (tray_open) {
+        label = g_strdup(_("Tray open"));
+    } else if (!inserted || !filename) {
+        label = g_strdup(_("No disc"));
+    } else {
+        label = g_strdup_printf(_("Current image: %s"), filename);
+    }
+    g_free(filename);
+    return label;
+}
+
+static void gd_removable_update(GtkDisplayState *s)
+{
+    g_autofree char *label = NULL;
+    bool has_drive, has_media;
+
+    if (!s->removable_current_item) {
+        return;
+    }
+
+    label = gd_removable_label(&has_drive, &has_media);
+
+    gtk_menu_item_set_label(GTK_MENU_ITEM(s->removable_current_item), label);
+    gtk_widget_set_sensitive(s->removable_current_item, has_drive);
+    gtk_widget_set_sensitive(s->removable_insert_item, has_drive);
+    gtk_widget_set_sensitive(s->removable_eject_item, has_media);
+    gtk_widget_set_sensitive(s->removable_menu_item, has_drive);
+}
+
+static void gd_removable_choose(GtkMenuItem *item, void *opaque)
+{
+    GtkDisplayState *s = opaque;
+    GtkWidget *dialog;
+    GtkFileFilter *filter;
+
+    dialog = gtk_file_chooser_dialog_new(_("Select CD image"),
+                                         GTK_WINDOW(s->window),
+                                         GTK_FILE_CHOOSER_ACTION_OPEN,
+                                         _("_Cancel"), GTK_RESPONSE_CANCEL,
+                                         _("_Open"), GTK_RESPONSE_ACCEPT,
+                                         NULL);
+    filter = gtk_file_filter_new();
+    gtk_file_filter_set_name(filter, _("CD images (*.iso)"));
+    gtk_file_filter_add_pattern(filter, "*.iso");
+    gtk_file_filter_add_pattern(filter, "*.ISO");
+    gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(dialog), filter);
+
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
+        g_autofree char *filename =
+            gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dialog));
+        Error *err = NULL;
+        BlockBackend *blk;
+
+        blk = gd_removable_blk();
+        if (!blk) {
+            error_setg(&err, _("No removable drive"));
+        } else {
+            const char *name = blk_name(blk);
+
+            if (name) {
+                qmp_blockdev_change_medium(name, NULL, filename, "raw",
+                                           true, true, false,
+                                           BLOCKDEV_CHANGE_READ_ONLY_MODE_RETAIN,
+                                           &err);
+            } else {
+                g_autofree char *dev = blk_get_attached_dev_id(blk);
+
+                qmp_blockdev_change_medium(NULL, dev, filename, "raw",
+                                           true, true, false,
+                                           BLOCKDEV_CHANGE_READ_ONLY_MODE_RETAIN,
+                                           &err);
+            }
+        }
+        if (err) {
+            gd_show_error(s, err);
+        }
+    }
+    gtk_widget_destroy(dialog);
+    gd_removable_update(s);
+}
+
+static void gd_removable_eject(GtkMenuItem *item, void *opaque)
+{
+    GtkDisplayState *s = opaque;
+    Error *err = NULL;
+    BlockBackend *blk;
+
+    blk = gd_removable_blk();
+    if (!blk) {
+        error_setg(&err, _("No removable drive"));
+    } else {
+        const char *name = blk_name(blk);
+
+        if (name) {
+            qmp_eject(name, NULL, true, true, &err);
+        } else {
+            g_autofree char *dev = blk_get_attached_dev_id(blk);
+
+            qmp_eject(NULL, dev, true, true, &err);
+        }
+    }
+    if (err) {
+        gd_show_error(s, err);
+    }
+    gd_removable_update(s);
+}
+
+static void gd_removable_menu_show(GtkWidget *widget, void *opaque)
+{
+    gd_removable_update(opaque);
+}
+
 static void gd_connect_signals(GtkDisplayState *s)
 {
     g_signal_connect(s->show_tabs_item, "activate",
@@ -2339,6 +2535,14 @@ static void gd_connect_signals(GtkDisplayState *s)
                      G_CALLBACK(gd_menu_reset), s);
     g_signal_connect(s->powerdown_item, "activate",
                      G_CALLBACK(gd_menu_powerdown), s);
+    g_signal_connect(s->removable_current_item, "activate",
+                     G_CALLBACK(gd_removable_choose), s);
+    g_signal_connect(s->removable_insert_item, "activate",
+                     G_CALLBACK(gd_removable_choose), s);
+    g_signal_connect(s->removable_eject_item, "activate",
+                     G_CALLBACK(gd_removable_eject), s);
+    g_signal_connect(s->removable_menu, "show",
+                     G_CALLBACK(gd_removable_menu_show), s);
     g_signal_connect(s->quit_item, "activate",
                      G_CALLBACK(gd_menu_quit), s);
 #if defined(CONFIG_VTE)
@@ -2380,6 +2584,32 @@ static GtkWidget *gd_create_menu_machine(GtkDisplayState *s)
 
     s->powerdown_item = gtk_menu_item_new_with_mnemonic(_("Power _Down"));
     gtk_menu_shell_append(GTK_MENU_SHELL(machine_menu), s->powerdown_item);
+
+    s->removable_menu = gtk_menu_new();
+    gtk_menu_set_accel_group(GTK_MENU(s->removable_menu), s->accel_group);
+
+    s->removable_current_item = gtk_menu_item_new_with_label(_("No disc"));
+    gtk_menu_shell_append(GTK_MENU_SHELL(s->removable_menu),
+                          s->removable_current_item);
+
+    s->removable_insert_item =
+        gtk_menu_item_new_with_mnemonic(_("_Insert/Change..."));
+    gtk_menu_shell_append(GTK_MENU_SHELL(s->removable_menu),
+                          s->removable_insert_item);
+
+    separator = gtk_separator_menu_item_new();
+    gtk_menu_shell_append(GTK_MENU_SHELL(s->removable_menu), separator);
+
+    s->removable_eject_item = gtk_menu_item_new_with_mnemonic(_("_Eject"));
+    gtk_menu_shell_append(GTK_MENU_SHELL(s->removable_menu),
+                          s->removable_eject_item);
+
+    s->removable_menu_item =
+        gtk_menu_item_new_with_mnemonic(_("_Removable drive"));
+    gtk_menu_item_set_submenu(GTK_MENU_ITEM(s->removable_menu_item),
+                              s->removable_menu);
+    gtk_menu_shell_append(GTK_MENU_SHELL(machine_menu),
+                          s->removable_menu_item);
 
     separator = gtk_separator_menu_item_new();
     gtk_menu_shell_append(GTK_MENU_SHELL(machine_menu), separator);

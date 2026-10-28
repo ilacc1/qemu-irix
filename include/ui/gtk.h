@@ -107,6 +107,11 @@ struct GtkDisplayState {
     GtkWidget *pause_item;
     GtkWidget *reset_item;
     GtkWidget *powerdown_item;
+    GtkWidget *removable_menu_item;
+    GtkWidget *removable_menu;
+    GtkWidget *removable_current_item;
+    GtkWidget *removable_insert_item;
+    GtkWidget *removable_eject_item;
     GtkWidget *quit_item;
 
     GtkWidget *view_menu_item;
