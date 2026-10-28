@@ -28,11 +28,6 @@ rem --- WD33C93: 0 = batched run-DMA fast path (default).
 if not defined SGI_WD_SYNC set "SGI_WD_SYNC=0"
 rem --- CHD: 0 = inflate hunks in the block thread pool (default).
 if not defined SGI_CHD_SYNC set "SGI_CHD_SYNC=0"
-rem --- Audio backend: dsound plays through Windows audio (default).
-rem --- Override beforehand, e.g. set IRIX_AUDIO_BACKEND=none for silence
-rem --- or =wav to capture to a file (path via IRIX_AUDIO_WAV).
-if not defined IRIX_AUDIO_BACKEND set "IRIX_AUDIO_BACKEND=dsound"
-
 set "QEMU=qemu\build\qemu-system-mips64.exe"
 set "BIOS=sgi\indy\ip24prom.070-9101-011.bin"
 if not "%IRIX_DISK%"=="" set "DISK=%IRIX_DISK%"
@@ -89,7 +84,7 @@ echo   PIO console:  telnet 127.0.0.1 4444
 echo   QEMU monitor: telnet 127.0.0.1 5555
 echo.
 
-"%QEMU%" -M indy,audiodev=sgiaudio -audiodev "%IRIX_AUDIO_BACKEND%,id=sgiaudio" -global sgi-mc.simms=0x0eee -global sgi-mc.mc-rev=3 -m 512M -bios "%BIOS%" -drive "file=%DISK%,format=chd,if=scsi,bus=0,unit=1,media=disk" %CDROM_ARGS% %NET_ARGS% -display gtk,zoom-to-fit=on -serial null -serial null -chardev "socket,host=127.0.0.1,port=4444,server=on,wait=off,id=pc" -serial chardev:pc -monitor "tcp:127.0.0.1:5555,server=on,wait=off" %*
+"%QEMU%" -M indy,audiodev=sgiaudio -audiodev none,id=sgiaudio -global sgi-mc.simms=0x0eee -global sgi-mc.mc-rev=3 -m 512M -bios "%BIOS%" -drive "file=%DISK%,format=chd,if=scsi,bus=0,unit=1,media=disk" %CDROM_ARGS% %NET_ARGS% -display gtk,zoom-to-fit=on -serial null -serial null -chardev "socket,host=127.0.0.1,port=4444,server=on,wait=off,id=pc" -serial chardev:pc -monitor "tcp:127.0.0.1:5555,server=on,wait=off" %*
 
 set "RC=%ERRORLEVEL%"
 echo.
