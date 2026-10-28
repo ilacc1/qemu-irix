@@ -3,8 +3,8 @@
 # SGI Indy (IP24) startup script — interactive PROM/sash session.
 #
 # Machine identity: Indy (R4000SC, 200MHz), QEMU `-M indy`. The PROM is
-# indy/ip24prom.070-9101-011.bin (MAME indy_4020 default b10) and the NVRAM
-# seeds are indy/nvram/{eeprom,rtc} (IP24 DS1386 8KiB RTC). QEMU reads disks
+# sgi/indy/ip24prom.070-9101-011.bin (MAME indy_4020 default b10) and the NVRAM
+# seeds are sgi/indy/nvram/{eeprom,rtc} (IP24 DS1386 8KiB RTC). QEMU reads disks
 # through the native CHD block driver (block/chd.c), so no chdman/raw
 # extraction step exists anywhere.
 #
@@ -39,7 +39,7 @@
 #     chime to a file instead (path via IRIX_AUDIO_WAV), IRIX_AUDIO=none
 #     keeps an explicit silent sink, IRIX_AUDIO=off preserves the legacy
 #     no-audiodev command line.
-#   - NVRAM seeds from indy/nvram/{eeprom,rtc}, loaded little-endian like
+#   - NVRAM seeds from sgi/indy/nvram/{eeprom,rtc}, loaded little-endian like
 #     MAME. On first boot QEMU copies them into build/nvram/indy_4020/
 #     (resolved beside the QEMU binary); all write-back goes to that
 #     copy, and the guest clock is re-seeded from the host on every boot.
@@ -64,16 +64,17 @@
 # then in the PROM Command Monitor: `setenv console d`, then `boot`.
 # IRIX_ESCC_SOCK: path of a unix socket for the second ESCC port, so the
 # guest's serial console can be driven from the host.
-# IRIX_DISK_COW: copy-on-write mode for the disk image.
-#   overlay (default) - a qcow2 overlay with the image as its backing
-#                    file. The image is opened READ-ONLY and every guest
-#                    write goes to the overlay (by default
-#                    <image>.cow.qcow2 next to it), so the image itself
-#                    can never be damaged while the guest's data persists
-#                    between runs. Delete the overlay to go back to the
-#                    pristine image; IRIX_DISK_OVERLAY names it.
-#   off            - direct read-write access to the image (old
-#                    behaviour; the image can be damaged by a kill).
+# IRIX_DISK_COW: disk access mode.
+#   off (default)  - direct read-write access to the image.  Simple, and
+#                    no qcow2 metadata can go stale, but an unclean kill
+#                    can damage the image itself.
+#   overlay        - a qcow2 overlay with the image as its backing file.
+#                    The image is opened READ-ONLY and every guest write
+#                    goes to the overlay (by default <image>.cow.qcow2).
+#                    The base image stays pristine, but an unclean
+#                    shutdown can leave the overlay inconsistent.  Delete
+#                    the overlay to start over; IRIX_DISK_OVERLAY names
+#                    it.
 # Extra QEMU args may be appended: ./run-irix.sh -d guest_errors
 #
 # Tuning switches (value-based; 0 and unset both mean "offload enabled"):
@@ -156,8 +157,8 @@ rm -f "$MON_SOCK"
 NVRAM_DIR="$ROOT_DIR/build/nvram/indy_4020"
 if [ ! -f "$NVRAM_DIR/rtc" ]; then
     mkdir -p "$NVRAM_DIR"
-    cp "$ROOT_DIR/indy/nvram/eeprom" \
-       "$ROOT_DIR/indy/nvram/rtc" \
+    cp "$ROOT_DIR/sgi/indy/nvram/eeprom" \
+       "$ROOT_DIR/sgi/indy/nvram/rtc" \
        "$NVRAM_DIR/"
 fi
 
@@ -220,19 +221,19 @@ fi
 
 # The overlay/install CD is attached only when IRIX_CDROM names a file
 # that exists.
+# The CD drive is always present (empty tray when IRIX_CDROM is unset) so
+# the GTK Removable drive menu can insert and eject media at runtime.
 if [ -n "$CDROM_ISO" ]; then
     CDROM_ARGS=(-drive "file=$CDROM_ISO,format=raw,if=none,id=cdrom0,media=cdrom,readonly=on"
                 -device "scsi-cd,bus=scsi.0,scsi-id=4,drive=cdrom0,physical_block_size=512")
 else
-    CDROM_ARGS=()
+    CDROM_ARGS=(-drive "if=none,id=cdrom0,media=cdrom,readonly=on"
+                -device "scsi-cd,bus=scsi.0,scsi-id=4,drive=cdrom0,physical_block_size=512")
 fi
 
-# Disk access mode. The default is copy-on-write: a qcow2 overlay with
-# the CHD as its backing file. The CHD is opened read-only (backing files
-# always are) and every guest write lands in the overlay, so the original
-# image can never be damaged while the guest's data persists between
-# runs. Delete the overlay to start over from the pristine image.
-COW=${IRIX_DISK_COW:-overlay}
+# Disk access mode. Direct read-write is the default; set
+# IRIX_DISK_COW=overlay to use the qcow2 overlay instead.
+COW=${IRIX_DISK_COW:-off}
 case "$COW" in
 overlay)
     OVERLAY=${IRIX_DISK_OVERLAY:-$DISK.cow.qcow2}
@@ -256,6 +257,8 @@ echo "PIO console (early boot only): telnet 127.0.0.1 $PIO_TELNET_PORT"
 echo "Monitor socket: $MON_SOCK"
 if [ "$COW" = "overlay" ]; then
     echo "Disk copy-on-write: $DISK is read-only, guest writes go to $OVERLAY"
+else
+    echo "Disk: direct read-write $DISK (an unclean kill can damage it)"
 fi
 exec env -u GTK_PATH -u GTK_EXE_PREFIX -u GTK_IM_MODULE_FILE \
     -u LD_PRELOAD \
@@ -264,7 +267,7 @@ exec env -u GTK_PATH -u GTK_EXE_PREFIX -u GTK_IM_MODULE_FILE \
     "${AUDIO_ARGS[@]}" \
     "${MC_ARGS[@]}" \
     -m "$GUEST_RAM" \
-    -bios "$ROOT_DIR/indy/$BIOS_IMAGE" \
+    -bios "$ROOT_DIR/sgi/indy/$BIOS_IMAGE" \
     -drive "${DISK_ARGS[@]}" \
     "${CDROM_ARGS[@]}" \
     ${NET_ARGS[@]} \

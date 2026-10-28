@@ -2,8 +2,8 @@
 rem ============================================================================
 rem  SGI Indy (IP24) - IRIX 6.5 startup script for Windows (MSYS2 build).
 rem
-rem  Mirrors run-irix.sh: indy machine, PROM indy\ip24prom.070-9101-011.bin,
-rem  NVRAM seeded from indy\nvram beside first run, CHD disk supplied by
+rem  Mirrors run-irix.sh: indy machine, PROM sgi\indy\ip24prom.070-9101-011.bin,
+rem  NVRAM seeded from sgi\indy\nvram beside first run, CHD disk supplied by
 rem  the user via IRIX_DISK (not distributed with this repository).
 rem ============================================================================
 setlocal
@@ -28,9 +28,13 @@ rem --- WD33C93: 0 = batched run-DMA fast path (default).
 if not defined SGI_WD_SYNC set "SGI_WD_SYNC=0"
 rem --- CHD: 0 = inflate hunks in the block thread pool (default).
 if not defined SGI_CHD_SYNC set "SGI_CHD_SYNC=0"
+rem --- Audio backend: dsound plays through Windows audio (default).
+rem --- Override beforehand, e.g. set IRIX_AUDIO_BACKEND=none for silence
+rem --- or =wav to capture to a file (path via IRIX_AUDIO_WAV).
+if not defined IRIX_AUDIO_BACKEND set "IRIX_AUDIO_BACKEND=dsound"
 
 set "QEMU=qemu\build\qemu-system-mips64.exe"
-set "BIOS=indy\ip24prom.070-9101-011.bin"
+set "BIOS=sgi\indy\ip24prom.070-9101-011.bin"
 if not "%IRIX_DISK%"=="" set "DISK=%IRIX_DISK%"
 if "%DISK%"=="" set "DISK=irix65_4020.chd"
 rem Optional CD image (SCSI ID 4); leave IRIX_CDROM unset for no CD, e.g.:
@@ -52,10 +56,10 @@ if not exist "%DISK%" (
 
 rem --- first run: seed NVRAM beside the binary from the in-tree seeds ------
 if not exist "qemu\build\nvram\indy_4020\rtc" (
-    echo Seeding NVRAM from indy\nvram ...
+    echo Seeding NVRAM from sgi\indy\nvram ...
     mkdir "qemu\build\nvram\indy_4020" 2>nul
-    copy /y "indy\nvram\eeprom" "qemu\build\nvram\indy_4020\" >nul
-    copy /y "indy\nvram\rtc" "qemu\build\nvram\indy_4020\" >nul
+    copy /y "sgi\indy\nvram\eeprom" "qemu\build\nvram\indy_4020\" >nul
+    copy /y "sgi\indy\nvram\rtc" "qemu\build\nvram\indy_4020\" >nul
 )
 
 rem --- overlay/install CD is attached only when present --------------------
@@ -83,7 +87,7 @@ echo   PIO console:  telnet 127.0.0.1 4444
 echo   QEMU monitor: telnet 127.0.0.1 5555
 echo.
 
-"%QEMU%" -M indy,audiodev=sgiaudio -audiodev none,id=sgiaudio -global sgi-mc.simms=0x0eee -global sgi-mc.mc-rev=3 -m 512M -bios "%BIOS%" -drive "file=%DISK%,format=chd,if=scsi,bus=0,unit=1,media=disk" %CDROM_ARGS% %NET_ARGS% -display gtk,zoom-to-fit=on -serial null -serial null -chardev "socket,host=127.0.0.1,port=4444,server=on,wait=off,id=pc" -serial chardev:pc -monitor "tcp:127.0.0.1:5555,server=on,wait=off" %*
+"%QEMU%" -M indy,audiodev=sgiaudio -audiodev "%IRIX_AUDIO_BACKEND%,id=sgiaudio" -global sgi-mc.simms=0x0eee -global sgi-mc.mc-rev=3 -m 512M -bios "%BIOS%" -drive "file=%DISK%,format=chd,if=scsi,bus=0,unit=1,media=disk" %CDROM_ARGS% %NET_ARGS% -display gtk,zoom-to-fit=on -serial null -serial null -chardev "socket,host=127.0.0.1,port=4444,server=on,wait=off,id=pc" -serial chardev:pc -monitor "tcp:127.0.0.1:5555,server=on,wait=off" %*
 
 set "RC=%ERRORLEVEL%"
 echo.
