@@ -430,8 +430,9 @@ the script. It uses:
 - GTK display, PIO console on `telnet 127.0.0.1 4444`, monitor on
   `telnet 127.0.0.1 5555`
 
-The launcher also sets `SGI_GFX_SYNC`, `SGI_WD_SYNC`, and `SGI_CHD_SYNC` to
-`0` unless already defined, which keeps the asynchronous worker paths on.
+The launcher sets `SGI_GFX_SYNC` and `SGI_CHD_SYNC` to `0` (asynchronous
+worker paths on) and `SGI_WD_SYNC` to `1` (safe per-byte SCSI transfers)
+unless already defined.
 
 Edit the paths at the top of `run-irix.bat` if your layout differs.
 

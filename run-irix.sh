@@ -77,21 +77,22 @@
 #                    it.
 # Extra QEMU args may be appended: ./run-irix.sh -d guest_errors
 #
-# Tuning switches (value-based; 0 and unset both mean "offload enabled"):
-# The launcher pins all three to 0 (async worker threads) unless already
-# set in the environment; export =1 to force synchronous inline execution
-# for A/B comparison.
+# Tuning switches (value-based):
+# The launcher pins the graphics and CHD paths to 0 (async worker threads)
+# and the WD33C93 path to the safe single-step mode unless already set.
+# Override any of them for A/B comparison.
 #   SGI_GFX_SYNC=1   run every REX3 draw inline on the vCPU thread
 #                    (default 0: surface draws go to the GIO64 worker thread)
 #   SGI_WD_SYNC=1    force WD33C93 DMA through the per-byte path
-#                    (default 0: batched run-DMA fast path)
+#                    (default 1: per-byte; set 0 for the batched run-DMA
+#                    fast path, which is still under investigation)
 #   SGI_CHD_SYNC=1   inflate CHD hunks inline instead of in the block thread
 #                    pool (default 0)
 #   SGI_CHD_CACHE_MB decompressed-hunk cache size, default 256; 0 disables
 set -euo pipefail
 
 : "${SGI_GFX_SYNC:=0}"
-: "${SGI_WD_SYNC:=0}"
+: "${SGI_WD_SYNC:=1}"
 : "${SGI_CHD_SYNC:=0}"
 export SGI_GFX_SYNC SGI_WD_SYNC SGI_CHD_SYNC
 
