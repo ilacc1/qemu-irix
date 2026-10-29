@@ -16,6 +16,9 @@ rem  The disk image is never bundled: it stays a user-supplied default
 rem  resolved by the launchers at runtime.
 rem ============================================================================
 setlocal EnableDelayedExpansion
+rem Ensure the MSYS2 login shell selects the MINGW64 environment
+rem so ldd resolves the mingw64 DLLs rather than reporting them missing.
+set "MSYSTEM=MINGW64"
 cd /d "%~dp0"
 
 set "VER=%~1"
