@@ -488,16 +488,27 @@ static bool sgi_env_flag(const char *name)
     return e && *e && strtoul(e, NULL, 0) != 0;
 }
 
-/* SGI_WD_SYNC=1 disables the batched run fast path, forcing every byte
- * through the original per-byte code; SGI_WD_SYNC=0 (the default) keeps it. */
-static bool sgi_wd_sync_enabled(void)
+/* SGI_WD_SYNC modes: 0 = batched in both directions, 1 = per-byte in both,
+ * 2 = per-byte DATA IN only (fast DATA OUT), 3 = per-byte DATA OUT only
+ * (fast DATA IN).  Modes 2/3 exist to bisect which run function corrupts. */
+static unsigned sgi_wd_sync_mode(void)
 {
     static int cached = -1;
 
     if (cached < 0) {
-        cached = sgi_env_flag("SGI_WD_SYNC") ? 1 : 0;
+        const char *e = getenv("SGI_WD_SYNC");
+
+        cached = e && *e ? strtoul(e, NULL, 0) : 0;
     }
-    return cached != 0;
+    return cached;
+}
+
+static bool sgi_wd_run_disabled(bool write_run)
+{
+    unsigned mode = sgi_wd_sync_mode();
+
+    return mode == 1 || (mode == 2 && write_run) ||
+           (mode == 3 && !write_run);
 }
 
 static bool sgi_wd_verify_enabled(void)
@@ -569,7 +580,7 @@ static uint32_t sgi_wd_dma_write_run(SGIWD33C93State *state, CPUState *cs,
     uint32_t va = state->dma_current;
     uint32_t n;
 
-    if (sgi_wd_sync_enabled() || (state->dma_control & 0x02) ||
+    if (sgi_wd_run_disabled(true) || (state->dma_control & 0x02) ||
         sgi_wd_trace_enabled()) {
         return 0;
     }
@@ -598,7 +609,7 @@ static uint32_t sgi_wd_dma_read_run(SGIWD33C93State *state, CPUState *cs,
     uint32_t va = state->dma_current;
     uint32_t n;
 
-    if (sgi_wd_sync_enabled() || (state->dma_control & 0x02) ||
+    if (sgi_wd_run_disabled(false) || (state->dma_control & 0x02) ||
         sgi_wd_trace_enabled() || state->dma_count < 2) {
         return 0;
     }
