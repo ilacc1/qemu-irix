@@ -19,7 +19,7 @@
 # (irix65_4020.chd) resolved by the launchers at runtime.
 set -euo pipefail
 
-VER="${1:-0.1.0}"
+VER="${1:-0.1.2}"
 WITH_WINDOWS=0
 [ "${2:-}" = "--with-windows" ] && WITH_WINDOWS=1
 

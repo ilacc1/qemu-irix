@@ -6,6 +6,21 @@ emulated **Silicon Graphics Indy (IP24)** hardware.
 All the new code is agent generated. Author makes no claim as to accuracy 
 or suitability for any use. 
 
+## What's new in 0.1.2
+
+- Windows audio goes through SDL2/WASAPI instead of DirectSound; the HAL2
+  boot chime plays at the correct speed.
+- Windows networking detects a bridged TAP adapter correctly.
+- Machine → Removable drive inserts and ejects CD images at runtime. The CD
+  drive is always present with an empty tray.
+- The disk defaults to direct read-write access; set
+  `IRIX_DISK_COW=overlay` for the old copy-on-write mode.
+- `build.sh` / `build.bat` reproduce the documented build options, and the
+  Windows build documents and enables SDL2.
+- Firmware seeds now live under `sgi/indy/`.
+- Fixes for HAL2 absence on IRIX 5.3, PBUS DMA control writes, and stalled
+  WD33C93 transfers.
+
 ## Just get it running
 
 1. Get the release zip / tar.gz for your OS and run either install.bat or install.sh
