@@ -500,6 +500,68 @@ static bool sgi_wd_sync_enabled(void)
     return cached != 0;
 }
 
+static bool sgi_wd_verify_enabled(void)
+{
+    static int cached = -1;
+
+    if (cached < 0) {
+        cached = sgi_env_flag("SGI_WD_VERIFY") ? 1 : 0;
+    }
+    return cached != 0;
+}
+
+/*
+ * Reference read for the batched-path verifier.  This deliberately uses
+ * the kernel's physical mapping (soft-TLB match ignoring ASID), not the
+ * current-ASID debug translation, so a batch that lands on the wrong page
+ * is reported instead of being compared against itself.
+ */
+static uint8_t sgi_wd_dma_ref_read_byte(SGIWD33C93State *state, CPUState *cs,
+                                        uint32_t va)
+{
+    MemTxResult result;
+    hwaddr pa;
+
+    if (cs && va >= 0xc0000000U) {
+        hwaddr tpa = mips_cpu_get_phys_page_any_asid(cs, va);
+
+        pa = tpa != (hwaddr)-1 ? tpa : sgi_wd_pa(va);
+    } else {
+        pa = sgi_wd_pa(va);
+    }
+    if (state->dma_control & 0x02) {
+        pa ^= 3;
+    }
+    return address_space_ldub(&address_space_memory, pa,
+                              MEMTXATTRS_UNSPECIFIED, &result);
+}
+
+static unsigned sgi_wd_verify_bad;
+
+static void sgi_wd_verify_run(SGIWD33C93State *state, CPUState *cs,
+                              uint32_t va, uint8_t *buf, uint32_t n,
+                              const char *dir)
+{
+    uint32_t i;
+
+    if (!sgi_wd_verify_enabled()) {
+        return;
+    }
+    for (i = 0; i < n; i++) {
+        uint8_t ref = sgi_wd_dma_ref_read_byte(state, cs, va + i);
+
+        if (ref != buf[i]) {
+            if (sgi_wd_verify_bad < 50) {
+                fprintf(stderr,
+                        "WDVERIFY %s va=%08x i=%u n=%u fast=%02x ref=%02x\n",
+                        dir, va, i, n, buf[i], ref);
+                sgi_wd_verify_bad++;
+            }
+            break;
+        }
+    }
+}
+
 /* Returns the number of bytes moved (0 = not handled, use per-byte path). */
 static uint32_t sgi_wd_dma_write_run(SGIWD33C93State *state, CPUState *cs,
                                      uint8_t *buf, int len)
@@ -524,6 +586,7 @@ static uint32_t sgi_wd_dma_write_run(SGIWD33C93State *state, CPUState *cs,
                             MEMTXATTRS_UNSPECIFIED, buf, n);
     }
     sgi_wd_dma_run_account(state, n);
+    sgi_wd_verify_run(state, cs, va, buf, n, "WR");
     return n;
 }
 
@@ -552,6 +615,7 @@ static uint32_t sgi_wd_dma_read_run(SGIWD33C93State *state, CPUState *cs,
                            MEMTXATTRS_UNSPECIFIED, buf, n);
     }
     sgi_wd_dma_run_account(state, n);
+    sgi_wd_verify_run(state, cs, va, buf, n, "RD");
     return n;
 }
 
