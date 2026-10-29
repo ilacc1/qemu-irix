@@ -2341,6 +2341,57 @@ static void gd_show_error(GtkDisplayState *s, Error *err)
     error_free(err);
 }
 
+#define GD_UI_STATE_GROUP "removable"
+#define GD_UI_STATE_LAST_IMAGE "last-image"
+#define GD_UI_STATE_LAST_DIR "last-dir"
+
+static char *gd_ui_state_path(void)
+{
+    return g_build_filename(g_get_user_config_dir(), "qemu-irix",
+                            "ui-state.ini", NULL);
+}
+
+static GKeyFile *gd_ui_state_load(void)
+{
+    g_autofree char *path = gd_ui_state_path();
+    GKeyFile *state = g_key_file_new();
+
+    g_key_file_load_from_file(state, path, G_KEY_FILE_NONE, NULL);
+    return state;
+}
+
+static void gd_ui_state_save(GKeyFile *state)
+{
+    g_autofree char *path = gd_ui_state_path();
+    g_autofree char *dir = g_path_get_dirname(path);
+    g_autofree char *data = g_key_file_to_data(state, NULL, NULL);
+
+    g_mkdir_with_parents(dir, 0700);
+    g_file_set_contents(path, data, -1, NULL);
+}
+
+static char *gd_ui_state_get(const char *key)
+{
+    GKeyFile *state = gd_ui_state_load();
+    char *value = g_key_file_get_string(state, GD_UI_STATE_GROUP, key, NULL);
+
+    g_key_file_free(state);
+    return value;
+}
+
+static void gd_ui_state_set(const char *key, const char *value)
+{
+    GKeyFile *state = gd_ui_state_load();
+
+    if (value && *value) {
+        g_key_file_set_string(state, GD_UI_STATE_GROUP, key, value);
+    } else {
+        g_key_file_remove_key(state, GD_UI_STATE_GROUP, key, NULL);
+    }
+    gd_ui_state_save(state);
+    g_key_file_free(state);
+}
+
 static BlockBackend *gd_removable_blk(void)
 {
     BlockBackend *blk = blk_by_name("cdrom0");
@@ -2354,6 +2405,33 @@ static BlockBackend *gd_removable_blk(void)
         }
     }
     return NULL;
+}
+
+static bool gd_removable_insert(const char *filename, Error **errp)
+{
+    BlockBackend *blk = gd_removable_blk();
+    const char *name;
+
+    if (!blk) {
+        error_setg(errp, _("No removable drive"));
+        return false;
+    }
+
+    name = blk_name(blk);
+    if (name) {
+        qmp_blockdev_change_medium(name, NULL, filename, "raw",
+                                   true, true, false,
+                                   BLOCKDEV_CHANGE_READ_ONLY_MODE_RETAIN,
+                                   errp);
+    } else {
+        g_autofree char *dev = blk_get_attached_dev_id(blk);
+
+        qmp_blockdev_change_medium(NULL, dev, filename, "raw",
+                                   true, true, false,
+                                   BLOCKDEV_CHANGE_READ_ONLY_MODE_RETAIN,
+                                   errp);
+    }
+    return *errp == NULL;
 }
 
 static char *gd_removable_label(bool *has_drive, bool *has_media)
@@ -2439,6 +2517,16 @@ static void gd_removable_choose(GtkMenuItem *item, void *opaque)
     GtkDisplayState *s = opaque;
     GtkWidget *dialog;
     GtkFileFilter *filter;
+    g_autofree char *last_dir = gd_ui_state_get(GD_UI_STATE_LAST_DIR);
+
+    if (!last_dir) {
+        g_autofree char *last_image =
+            gd_ui_state_get(GD_UI_STATE_LAST_IMAGE);
+
+        if (last_image) {
+            last_dir = g_path_get_dirname(last_image);
+        }
+    }
 
     dialog = gtk_file_chooser_dialog_new(_("Select CD image"),
                                          GTK_WINDOW(s->window),
@@ -2452,34 +2540,26 @@ static void gd_removable_choose(GtkMenuItem *item, void *opaque)
     gtk_file_filter_add_pattern(filter, "*.ISO");
     gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(dialog), filter);
 
+    if (last_dir && g_file_test(last_dir, G_FILE_TEST_IS_DIR)) {
+        gtk_file_chooser_set_current_folder(GTK_FILE_CHOOSER(dialog),
+                                            last_dir);
+    }
+
     if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
         g_autofree char *filename =
             gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dialog));
-        Error *err = NULL;
-        BlockBackend *blk;
 
-        blk = gd_removable_blk();
-        if (!blk) {
-            error_setg(&err, _("No removable drive"));
-        } else {
-            const char *name = blk_name(blk);
+        if (filename) {
+            g_autofree char *dir = g_path_get_dirname(filename);
+            Error *err = NULL;
 
-            if (name) {
-                qmp_blockdev_change_medium(name, NULL, filename, "raw",
-                                           true, true, false,
-                                           BLOCKDEV_CHANGE_READ_ONLY_MODE_RETAIN,
-                                           &err);
-            } else {
-                g_autofree char *dev = blk_get_attached_dev_id(blk);
-
-                qmp_blockdev_change_medium(NULL, dev, filename, "raw",
-                                           true, true, false,
-                                           BLOCKDEV_CHANGE_READ_ONLY_MODE_RETAIN,
-                                           &err);
+            gd_ui_state_set(GD_UI_STATE_LAST_DIR, dir);
+            if (gd_removable_insert(filename, &err)) {
+                gd_ui_state_set(GD_UI_STATE_LAST_IMAGE, filename);
             }
-        }
-        if (err) {
-            gd_show_error(s, err);
+            if (err) {
+                gd_show_error(s, err);
+            }
         }
     }
     gtk_widget_destroy(dialog);
@@ -2508,6 +2588,8 @@ static void gd_removable_eject(GtkMenuItem *item, void *opaque)
     }
     if (err) {
         gd_show_error(s, err);
+    } else {
+        gd_ui_state_set(GD_UI_STATE_LAST_IMAGE, NULL);
     }
     gd_removable_update(s);
 }
@@ -2515,6 +2597,31 @@ static void gd_removable_eject(GtkMenuItem *item, void *opaque)
 static void gd_removable_menu_show(GtkWidget *widget, void *opaque)
 {
     gd_removable_update(opaque);
+}
+
+/* Re-insert the disc last chosen in the UI, but never override media
+ * supplied on the command line. */
+static void gd_removable_restore(GtkDisplayState *s)
+{
+    g_autofree char *filename = gd_ui_state_get(GD_UI_STATE_LAST_IMAGE);
+    BlockBackend *blk = gd_removable_blk();
+    Error *err = NULL;
+
+    if (!blk || !filename || !*filename) {
+        return;
+    }
+    if (blk_is_inserted(blk) && !blk_dev_is_tray_open(blk)) {
+        return;
+    }
+    if (!g_file_test(filename, G_FILE_TEST_IS_REGULAR)) {
+        return;
+    }
+
+    gd_removable_insert(filename, &err);
+    if (err) {
+        error_report_err(err);
+    }
+    gd_removable_update(s);
 }
 
 static void gd_connect_signals(GtkDisplayState *s)
@@ -3069,6 +3176,7 @@ static void gtk_display_init(DisplayState *ds, DisplayOptions *opts)
     qemu_console_add_notifier(&s->console_notifier);
 
     gd_connect_signals(s);
+    gd_removable_restore(s);
 
     gtk_notebook_set_show_tabs(GTK_NOTEBOOK(s->notebook), FALSE);
     gtk_notebook_set_show_border(GTK_NOTEBOOK(s->notebook), FALSE);
