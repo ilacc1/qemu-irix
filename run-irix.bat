@@ -24,9 +24,8 @@ rem --- execution for A/B comparison; override any of these beforehand, e.g.
 rem ---   set SGI_GFX_SYNC=1
 rem --- GFX: 0 = surface draws go to the GIO64 worker thread (default).
 if not defined SGI_GFX_SYNC set "SGI_GFX_SYNC=0"
-rem --- WD33C93: 1 = safe per-byte path (default). 0 selects the batched
-rem --- run-DMA fast path, which is still under investigation.
-if not defined SGI_WD_SYNC set "SGI_WD_SYNC=1"
+rem --- WD33C93: 0 = batched run-DMA fast path (default).
+if not defined SGI_WD_SYNC set "SGI_WD_SYNC=0"
 rem --- CHD: 0 = inflate hunks in the block thread pool (default).
 if not defined SGI_CHD_SYNC set "SGI_CHD_SYNC=0"
 rem --- Audio: SDL2 through WASAPI on Windows (not DirectSound).

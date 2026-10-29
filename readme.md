@@ -106,10 +106,9 @@ performance, there are a few environment switches to experiment with. All of
 them are value-based: `1` disables the offload, `0` (or leaving the variable
 unset) leaves it enabled.
 
-- `SGI_WD_SYNC=1` — forces every disk byte through the WD33C93
-  single-step path. This is the **default** while the batched run-DMA fast
-  path is under investigation; set `SGI_WD_SYNC=0` to opt into the fast
-  path for testing.
+- `SGI_WD_SYNC=1` — disables the WD33C93 batched run-DMA fast path and
+  forces every disk byte through the single-step transfer path (slower,
+  but closer to real hardware behaviour). Default: fast path **enabled**.
 - `SGI_CHD_SYNC=1` — decompresses CHD hunks inline instead of handing them
   to the block layer's thread pool. Default: thread pool **enabled**.
 - `SGI_GFX_SYNC=1` — disables the GIO64 graphics worker thread and executes

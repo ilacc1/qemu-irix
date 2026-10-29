@@ -96,7 +96,7 @@
 set -euo pipefail
 
 : "${SGI_GFX_SYNC:=0}"
-: "${SGI_WD_SYNC:=1}"
+: "${SGI_WD_SYNC:=0}"
 : "${SGI_CHD_SYNC:=0}"
 : "${SGI_HAL2_ABSENT:=1}"
 export SGI_GFX_SYNC SGI_WD_SYNC SGI_CHD_SYNC SGI_HAL2_ABSENT
