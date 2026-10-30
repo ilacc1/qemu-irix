@@ -33,6 +33,7 @@
 #include "qapi/error.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
+#include "system/runstate.h"
 #include "qom/object.h"
 
 #define SGI_IOC2_MMIO_BASE 0x14
@@ -810,6 +811,14 @@ static void sgi_ioc2_write_inner(void *opaque, hwaddr addr, uint64_t val,
 
     switch (reg) {
     case 0x14:
+        /*
+         * Bit 0 is POWER_SUP_INHIBIT (high = supply on).  The IP22 kernel
+         * powers down by writing ~POWER_SUP_INHIBIT to HPC3_PANEL and then
+         * spinning; without this the guest halts but QEMU never exits.
+         */
+        if (!(val & 0x01)) {
+            qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
+        }
         state->front_panel &= ~(val & 0x52);
         if (!(state->front_panel & 0x52)) {
             sgi_ioc2_lower_local(state, 1, 0x02);

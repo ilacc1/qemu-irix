@@ -929,6 +929,12 @@ chd_co_flush_to_os(BlockDriverState *bs)
     return 0;
 }
 
+static int coroutine_fn GRAPH_RDLOCK
+chd_co_flush_to_disk(BlockDriverState *bs)
+{
+    return bdrv_co_flush(bs->file->bs);
+}
+
 static void coroutine_fn GRAPH_RDLOCK
 chd_co_invalidate_cache(BlockDriverState *bs, Error **errp)
 {
@@ -951,6 +957,7 @@ static BlockDriver bdrv_chd = {
     .bdrv_co_preadv           = chd_co_preadv,
     .bdrv_co_pwritev          = chd_co_pwritev,
     .bdrv_co_flush_to_os      = chd_co_flush_to_os,
+    .bdrv_co_flush_to_disk    = chd_co_flush_to_disk,
     .bdrv_co_invalidate_cache = chd_co_invalidate_cache,
     .bdrv_co_getlength        = chd_getlength,
     .is_format                = true,
