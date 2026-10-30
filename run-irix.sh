@@ -241,10 +241,10 @@ overlay)
         echo "Creating copy-on-write overlay $OVERLAY"
         "$ROOT_DIR/run/mkoverlay.py" --disk "$DISK" --overlay "$OVERLAY"
     fi
-    DISK_ARGS=("file=$OVERLAY,format=qcow2,if=scsi,bus=0,unit=1,media=disk")
+    DISK_ARGS=("file=$OVERLAY,format=qcow2,if=scsi,bus=0,unit=1,media=disk,cache=writethrough")
     ;;
 off)
-    DISK_ARGS=("file=$DISK,format=chd,if=scsi,bus=0,unit=1,media=disk")
+    DISK_ARGS=("file=$DISK,format=chd,if=scsi,bus=0,unit=1,media=disk,cache=writethrough")
     ;;
 *)
     echo "IRIX_DISK_COW must be 'overlay' or 'off' (got '$COW')" >&2
