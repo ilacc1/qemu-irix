@@ -60,7 +60,6 @@ struct SgiIoc2State {
     uint8_t error_status;
     uint8_t front_panel;
     Notifier powerdown_notifier;
-    QEMUTimer *power_timer;
     uint8_t dma_select;
     uint8_t reset;
     uint8_t write;
@@ -126,13 +125,6 @@ static void sgi_ioc2_lower_local(SgiIoc2State *state, unsigned channel,
     }
 }
 
-static void sgi_ioc2_power_release(void *opaque)
-{
-    SgiIoc2State *state = opaque;
-
-    sgi_ioc2_lower_local(state, 0, 0x01);
-}
-
 static void sgi_ioc2_powerdown(Notifier *notifier, void *data)
 {
     SgiIoc2State *state = container_of(notifier, SgiIoc2State,
@@ -140,8 +132,6 @@ static void sgi_ioc2_powerdown(Notifier *notifier, void *data)
 
     /* Front-panel power switch is wired to GPIO4 / Local0 bit 0. */
     sgi_ioc2_raise_local(state, 0, 0x01);
-    timer_mod(state->power_timer,
-              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 100);
 }
 
 static uint8_t sgi_ioc2_map_status_read(SgiIoc2State *state)
@@ -1037,8 +1027,6 @@ static void sgi_ioc2_init(Object *object)
     qdev_init_gpio_out(DEVICE(object), state->out, 4);
     state->pit_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                     sgi_ioc2_pit_timeout, state);
-    state->power_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
-                                      sgi_ioc2_power_release, state);
     state->powerdown_notifier.notify = sgi_ioc2_powerdown;
     qemu_register_powerdown_notifier(&state->powerdown_notifier);
 }
