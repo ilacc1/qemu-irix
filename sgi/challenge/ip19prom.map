@@ -1,0 +1,82 @@
+		LINK EDITOR MEMORY MAP
+
+
+output		input		virtual
+section		section		address		size
+
+.text   			bfc00000	   124e0
+		.text   	bfc00000	     e00 entry.o
+		.text   	bfc00e00	     1a0 epcuart.o
+		.text   	bfc00fa0	     210 master.o
+		.text   	bfc011b0	     7e0 slave.o
+		.text   	bfc01990	     230 ccio.o
+		.text   	bfc01bc0	     210 bmarb.o
+		.text   	bfc01dd4	     6c0 libasm.o
+		.text   	bfc024a0	     d40 podasm.o
+		.text   	bfc031e0	     6c0 pod_cc.o
+		.text   	bfc038a0	     a60 pod_cache.o
+		.text   	bfc04300	     230 pod_ebus.o
+		.text   	bfc04530	      a0 setjmp.o
+		.text   	bfc045d0	     210 sysctlr.o
+		.text   	bfc047e0	     110 pod_bustags.o
+		.text   	bfc048f0	      f0 pod_ioasm.o
+		.text   	bfc049e0	     d50 config.o
+		.text   	bfc05730	     530 epc_config.o
+		.text   	bfc05c60	     3f0 init_epcuart.o
+		.text   	bfc06050	     5a0 main.o
+		.text   	bfc065f0	    1870 mc3_config.o
+		.text   	bfc07e60	     3a0 nvram.o
+		.text   	bfc08200	    37a0 pod.o
+		.text   	bfc0b9a0	     c70 pod_mem.o
+		.text   	bfc0c610	    1170 pod_parse.o
+		.text   	bfc0d780	     870 pod_io.o
+		.text   	bfc0dff0	     2f0 transfer.o
+		.text   	bfc0e2e0	     ff0 pod_master.o
+		.text   	bfc0f2d0	     600 diagval.o
+		.text   	bfc0f8d0	     620 disp_evcfg.o
+		.text   	bfc0fef0	     460 pod_iaid.o
+		.text   	bfc10350	     350 pod_iaram.o
+		.text   	bfc106a0	     340 epc_regtest.o
+		.text   	bfc109e0	      10 pvers.o
+		.text   	bfc109f0	    1af0 dcob.o
+
+.rdata  			bfc124e0	    5450
+		.rdata  	bfc124e0	     270 config.o
+		.rdata  	bfc12750	      20 epc_config.o
+		.rdata  	bfc12770	      50 init_epcuart.o
+		.rdata  	bfc127c0	     560 main.o
+		.rdata  	bfc12d20	     4e0 mc3_config.o
+		.rdata  	bfc13200	    16e0 pod.o
+		.rdata  	bfc148e0	     280 pod_mem.o
+		.rdata  	bfc14b60	     d70 pod_parse.o
+		.rdata  	bfc158d0	     100 pod_io.o
+		.rdata  	bfc159d0	     1d0 transfer.o
+		.rdata  	bfc15ba0	     4c0 pod_master.o
+		.rdata  	bfc16060	     b90 diagval.o
+		.rdata  	bfc16bf0	     440 disp_evcfg.o
+		.rdata  	bfc17030	     160 pod_iaid.o
+		.rdata  	bfc17190	     190 pod_iaram.o
+		.rdata  	bfc17320	     230 epc_regtest.o
+		.rdata  	bfc17550	      30 pvers.o
+		.rdata  	bfc17580	     3b0 dcob.o
+
+.data   			bfc17930	    8e30
+		.data   	bfc17930	     1a0 entry.o
+		.data   	bfc17ad0	      70 master.o
+		.data   	bfc17b40	      30 slave.o
+		.data   	bfc17b70	      30 ccio.o
+		.data   	bfc17ba0	     270 podasm.o
+		.data   	bfc17e10	     110 pod_cache.o
+		.data   	bfc17f20	      10 sysctlr.o
+		.data   	bfc17f30	      20 mc3_config.o
+		.data   	bfc17f50	      f0 pod.o
+		.data   	bfc18040	     420 pod_parse.o
+		.data   	bfc18460	     8f0 diagval.o
+		.data   	bfc18d50	      30 pod_iaid.o
+		.data   	bfc18d80	      10 pod_iaram.o
+		.data   	bfc18d90	     1e0 epc_regtest.o
+		.data   	bfc18f70	      10 pvers.o
+		.data   	bfc18f80	    2100 nib_procs.o
+		.data   	bfc1b080	    5160 nib_code.o
+		.data   	bfc201e0	     170 dcob.o
+		.data   	bfc20350	     410 nib_conf.o

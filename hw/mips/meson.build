@@ -9,6 +9,7 @@ mips_ss.add(when: 'CONFIG_MIPS_CPS', if_true: files('cps.c'))
 if 'CONFIG_TCG' in config_all_accel
 mips_ss.add(when: 'CONFIG_JAZZ', if_true: files('jazz.c'))
 mips_ss.add(when: 'CONFIG_SGI_INDY', if_true: files('sgi_indy.c', 'sgi_hpc3_scsi.c', 'sgi_gio64.c', 'sgi_ioc2.c', 'sgi_mc.c', 'sgi_hpc3.c'))
+mips_ss.add(when: 'CONFIG_SGI_IP19', if_true: files('sgi_ip19.c', 'sgi_s1.c'))
 mips_ss.add(when: 'CONFIG_FULOONG', if_true: files('fuloong2e.c'))
 mips_ss.add(when: 'CONFIG_MIPS_BOSTON', if_true: files('boston.c'))
 endif

@@ -112,3 +112,9 @@ config SGI_INDY
     select PARALLEL
     select DS1225Y
     select JAZZ_LED
+
+config SGI_IP19
+    bool
+    default y
+    depends on MIPS64
+    select SCSI
