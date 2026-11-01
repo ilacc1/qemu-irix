@@ -29,8 +29,10 @@
 #include "hw/mips/sgi_mc3.h"
 #include "hw/mips/sgi_z8530.h"
 #include "hw/core/qdev.h"
+#include "accel/tcg/cpu-loop.h"
 #include "system/address-spaces.h"
 #include "system/block-backend.h"
+#include "system/cpus.h"
 #include "system/reset.h"
 #include "system/runstate.h"
 #include "system/system.h"
@@ -41,6 +43,18 @@
 #include "qemu/host-utils.h"
 #include "qemu/timer.h"
 #include <time.h>
+
+static bool ip19_debug_enabled(void)
+{
+    static int enabled = -1;
+
+    if (enabled < 0) {
+        enabled = g_getenv("IP19_DEBUG") != NULL;
+    }
+    return enabled;
+}
+
+#define IP19_DPRINT(...)     do { if (ip19_debug_enabled()) fprintf(stderr, "ip19: " __VA_ARGS__); } while (0)
 
 #define IP19_MAX_CPUS       4
 #define IP19_MAX_SLOTS      16
@@ -268,6 +282,20 @@ struct SGI_IP19State {
     uint64_t cfg_regs[IP19_MAX_SLOTS][IP19_CFG_REGS];
 
     uint64_t ip[IP19_MAX_CPUS][2];
+    bool rtc_yield;
+    bool rtc_yield_armed;
+    int64_t rtc_yield_until_ns;
+    uint64_t grp_pending[64][2];
+    uint64_t grp_delivered[64][IP19_MAX_CPUS][2];
+    /*
+     * Reset hold for the secondary slices.  The IP19 PROM arbitration
+     * is based on the host RTC and the per-CPU SPNUM timeout, so with
+     * more than one runnable vCPU the winner depended on host timing.
+     * Keep every non-bootmaster slice halted until CPU 0 has claimed
+     * the master group.  A late slice then takes the PROM's slave path.
+     */
+    bool cpu_held[IP19_MAX_CPUS];
+    bool bootmaster_claimed;
     uint64_t ile[IP19_MAX_CPUS];
     uint64_t igrmask[IP19_MAX_CPUS];
     uint64_t cel[IP19_MAX_CPUS];
@@ -389,8 +417,17 @@ static uint64_t ip19_rtc_value(SGI_IP19State *s)
      * epoch before scaling; otherwise the 50 MHz multiply overflows.
      */
     uint64_t ns = qemu_clock_get_ns(QEMU_CLOCK_HOST) - s->rtc_epoch_ns;
+    uint64_t hz = IP19_RTC_HZ;
+    const char *div = g_getenv("IP19_RTC_DIV");
 
-    return muldiv64(ns, IP19_RTC_HZ, 1000000000ULL);
+    if (div) {
+        unsigned d = atoi(div);
+
+        if (d > 1) {
+            hz /= d;
+        }
+    }
+    return muldiv64(ns, hz, 1000000000ULL);
 }
 
 static void ip19_update_irq(SGI_IP19State *s, unsigned cpu)
@@ -477,6 +514,43 @@ static void ip19_clear_pending(SGI_IP19State *s, unsigned cpu, unsigned level)
     ip19_update_irq(s, cpu);
 }
 
+static void ip19_release_secondary_cpus(SGI_IP19State *s)
+{
+    CPUState *cs;
+
+    CPU_FOREACH(cs) {
+        unsigned cpu = cs->cpu_index;
+
+        if (cpu == 0 || cpu >= IP19_MAX_CPUS || !s->cpu_held[cpu]) {
+            continue;
+        }
+        s->cpu_held[cpu] = false;
+        cs->halted = 0;
+        qemu_cpu_kick(cs);
+        IP19_DPRINT("release cpu %u\n", cpu);
+    }
+}
+
+static void ip19_group_deliver_one(SGI_IP19State *s, unsigned cpu,
+                                  unsigned group)
+{
+    unsigned word;
+    uint64_t fresh;
+
+    if (group >= 64 || cpu >= IP19_MAX_CPUS) {
+        return;
+    }
+    for (word = 0; word < 2; word++) {
+        fresh = s->grp_pending[group][word] &
+                ~s->grp_delivered[group][cpu][word];
+        if (fresh) {
+            s->ip[cpu][word] |= fresh;
+            s->grp_delivered[group][cpu][word] |= fresh;
+        }
+    }
+    ip19_update_irq(s, cpu);
+}
+
 static void ip19_deliver_vector(SGI_IP19State *s, uint64_t vector)
 {
     unsigned dest = vector & 0x7f;
@@ -489,10 +563,25 @@ static void ip19_deliver_vector(SGI_IP19State *s, uint64_t vector)
         }
     } else if (dest & 0x40) {
         unsigned group = dest & 0x3f;
+        unsigned word = level >> 6;
+        uint64_t bit = 1ULL << (level & 63);
 
-        for (i = 0; i < IP19_MAX_CPUS; i++) {
-            if (group < 64 && (s->igrmask[i] & (1ULL << group))) {
-                ip19_set_pending(s, i, level);
+        if (group < 64) {
+            /*
+             * A group-directed SENDINT is an edge aimed at the group
+             * membership as it exists now.  Slaves join their group
+             * later during PROM boot, so keep the edge latched and
+             * hand it to each CPU when it first joins the group.
+             */
+            s->grp_pending[group][word] |= bit;
+            for (i = 0; i < IP19_MAX_CPUS; i++) {
+                s->grp_delivered[group][i][word] &= ~bit;
+            }
+            for (i = 0; i < IP19_MAX_CPUS; i++) {
+                if (s->igrmask[i] & (1ULL << group)) {
+                    ip19_set_pending(s, i, level);
+                    s->grp_delivered[group][i][word] |= bit;
+                }
             }
         }
     } else {
@@ -566,6 +655,7 @@ static MemTxResult ip19_cc_read(void *opaque, hwaddr off, uint64_t *data,
         /* slot/proc as encoded by IP19 PROM/kernel */
         ret = ((uint64_t)IP19_SLOT_CPU << EV_SLOTNUM_SHFT) |
               ((uint64_t)cpu & EV_PROCNUM_MASK);
+        IP19_DPRINT("SPNUM read cpu %u -> 0x%02" PRIx64 "\n", cpu, ret);
         break;
     case CC_SYSCONFIG:
         /*
@@ -672,7 +762,45 @@ static MemTxResult ip19_cc_write(void *opaque, hwaddr off, uint64_t val,
 
     switch (off) {
     case CC_KZRESET:
+        if (ip19_debug_enabled()) {
+            CPUState *cs;
+            uint8_t buf[8];
+
+            CPU_FOREACH(cs) {
+                MIPSCPU *mc = MIPS_CPU(cs);
+
+                IP19_DPRINT("KZRESET cpu %u pc %016" PRIx64
+                            " sr %08x cause %08x epc %016" PRIx64 "\n",
+                            cs->cpu_index, (uint64_t)mc->env.active_tc.PC,
+                            mc->env.CP0_Status, mc->env.CP0_Cause,
+                            (uint64_t)mc->env.CP0_EPC);
+            }
+            if (address_space_read(&address_space_memory, 0x3f1dcc,
+                                   MEMTXATTRS_UNSPECIFIED, buf, 4) ==
+                MEMTX_OK) {
+                IP19_DPRINT("KZRESET cb_wait %d\n", (int32_t)ldl_be_p(buf));
+            }
+            if (address_space_read(&address_space_memory, 0x3fa540,
+                                   MEMTXATTRS_UNSPECIFIED, buf, 4) ==
+                MEMTX_OK) {
+                IP19_DPRINT("KZRESET bootlck %08x\n", ldl_be_p(buf));
+            }
+            if (address_space_read(&address_space_memory, 0x3fde50,
+                                   MEMTXATTRS_UNSPECIFIED, buf, 4) ==
+                MEMTX_OK) {
+                IP19_DPRINT("KZRESET pdaindr1.CpuId %d\n",
+                            (int32_t)ldl_be_p(buf));
+            }
+        }
         qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+        /*
+         * IRIX writes KZRESET and immediately panics if the CPU
+         * continues.  Exit the current translation block now so the
+         * main loop can perform the reset before the panic executes.
+         */
+        if (current_cpu) {
+            cpu_loop_exit(current_cpu);
+        }
         break;
     case CC_WGDST:
         s->wgdst = val;
@@ -690,6 +818,16 @@ static MemTxResult ip19_cc_write(void *opaque, hwaddr off, uint64_t val,
          * (slot << 2) | cpu.
          */
         ip19_deliver_vector(s, val);
+        /*
+         * The bootmaster follows IGRMASK=IGR_MASTER with a level-6
+         * broadcast.  Release the held slices only after that edge has
+         * been delivered, so the broadcast cannot arrive after a late
+         * slice has reached the slave loop (where level 6 means POD).
+         */
+        if (s->bootmaster_claimed && (val & 0x7f) == 0x7f &&
+            ((val >> 8) & 0x7f) == 0x6) {
+            ip19_release_secondary_cpus(s);
+        }
         break;
     case CC_IP0:
         s->ip[cpu][0] = val;
@@ -725,7 +863,34 @@ static MemTxResult ip19_cc_write(void *opaque, hwaddr off, uint64_t val,
         }
         break;
     case CC_IGRMASK:
+        if (val == 0) {
+            memset(s->grp_pending, 0, sizeof(s->grp_pending));
+            memset(s->grp_delivered, 0, sizeof(s->grp_delivered));
+        }
         s->igrmask[cpu] = val;
+        /*
+         * Joining the master group is the bootmaster's claim.  Only
+         * CPU 0 can reach this point before the other slices are
+         * released, so the election is deterministic.
+         */
+        IP19_DPRINT("IGRMASK write cpu %u val 0x%02" PRIx64
+                    " claimed %d\n", cpu, val, s->bootmaster_claimed);
+        /*
+         * The CC self-test also writes 0xffff/0xaaaa/0x5555/0 to
+         * IGRMASK, so only the exact IGR_MASTER value 1 is a claim.
+         * Do not release the held slices here: the bootmaster's next
+         * CC write is the BOOT_LEVEL broadcast, and a slice that is
+         * released before that broadcast can reach the PROM slave loop
+         * first, where BOOT_LEVEL and POD_LEVEL are both 6.
+         */
+        if (!s->bootmaster_claimed && val == 0x1) {
+            s->bootmaster_claimed = true;
+        }
+        for (unsigned group = 0; group < 64; group++) {
+            if (val & (1ULL << group)) {
+                ip19_group_deliver_one(s, cpu, group);
+            }
+        }
         break;
     case CC_ILE:
         s->ile[cpu] = val;
@@ -981,6 +1146,40 @@ static MemTxResult ip19_rtc_read(void *opaque, hwaddr off, uint64_t *data,
     default:
         *data = 0;
         break;
+    }
+    /*
+     * Single-threaded TCG round-robin only switches vCPUs when the
+     * running one exits its current TB.  The IRIX AP bootstrap polls
+     * the CC RTC while spinning, and the master polls it in its boot
+     * timeout loop.  Forcing an exit on an RTC read gives the AP a
+     * chance to run in the window between the master servicing its
+     * cb_wait request and checking pdaindr[CpuId].
+     */
+    if (s->rtc_yield && current_cpu) {
+        uint64_t pc = (uint64_t)MIPS_CPU(current_cpu)->env.active_tc.PC;
+        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+        bool kernel = pc >= 0xa800000000004000ULL &&
+                      pc < 0xa800000000400000ULL;
+
+        /*
+         * Once a secondary CPU is running the kernel (its frequency
+         * calibration polls the RTC), the bootmaster's boot-timeout
+         * loop must yield between polls.  It does not otherwise leave
+         * its TB in single-threaded TCG.  Arm a single boot window:
+         * later kernel RTC traffic from another CPU must not keep
+         * forcing the bootmaster out of every us_delay() call.  The
+         * installed 6.5.22 kernel links us_delay at
+         * 0xa800000000011284.
+         */
+        if (kernel && current_cpu->cpu_index != 0 && !s->rtc_yield_armed) {
+            s->rtc_yield_armed = true;
+            s->rtc_yield_until_ns = now + 30 * 1000000000LL;
+        }
+        if (current_cpu->cpu_index == 0 && kernel &&
+            pc >= 0xa800000000011280ULL && pc < 0xa800000000011340ULL &&
+            now < s->rtc_yield_until_ns) {
+            cpu_exit(current_cpu);
+        }
     }
     return MEMTX_OK;
 }
@@ -1933,27 +2132,25 @@ static const MemoryRegionOps ip19_sync_ops = {
 static void ip19_cfg_defaults(SGI_IP19State *s, MachineState *machine)
 {
     unsigned proc;
-    uint64_t ram_size = machine->ram_size;
-    unsigned mem_size_code = 2; /* reasonable default for 128MB+ */
+    unsigned slices = MIN(machine->smp.cpus, IP19_MAX_CPUS);
 
-    if (ram_size >= 256 * MiB) {
-        mem_size_code = 3;
-    }
-    if (ram_size >= 512 * MiB) {
-        mem_size_code = 4;
-    }
-    if (ram_size >= 1024ULL * MiB) {
-        mem_size_code = 5;
-    }
-
-    s->cfg_regs[IP19_SLOT_CPU][CFG_BOARD_ENABLE] = 0x0f;
+    /*
+     * A_ENABLE is the slice vector for this IP19 board.  One 2-CPU
+     * board has slices 0-1 enabled (0x03); a 4-CPU board uses 0x0f.
+     * Do not advertise unpopulated slices as enabled.
+     */
+    s->cfg_regs[IP19_SLOT_CPU][CFG_BOARD_ENABLE] = (1U << slices) - 1;
     s->cfg_regs[IP19_SLOT_CPU][CFG_BOARD_TYPE] = 0x01; /* IP19 */
     s->cfg_regs[IP19_SLOT_CPU][CFG_BOARD_LEVEL] = 0x03;
-    for (proc = 0; proc < machine->smp.cpus && proc < IP19_MAX_CPUS; proc++) {
+    for (proc = 0; proc < slices; proc++) {
         unsigned base = CFG_PROC_BASE + proc * CFG_PROC_STRIDE;
 
         s->cfg_regs[IP19_SLOT_CPU][base + CFG_PROC_CCREV] = 0x1e; /* CC rev 2 */
-        s->cfg_regs[IP19_SLOT_CPU][base + CFG_PROC_CACHE_SZ] = mem_size_code;
+        /*
+         * EV_CACHE_SZ code 1 == 4 MiB secondary cache, matching the
+         * EAROM EV_CACHE_SZ_LOC value used by the PROM and kernel.
+         */
+        s->cfg_regs[IP19_SLOT_CPU][base + CFG_PROC_CACHE_SZ] = 0x01;
     }
 
     /* IO4 on slot 2 */
@@ -2068,6 +2265,16 @@ static void sgi_ip19_init(MachineState *machine)
         cpu->ip19_io4_window = true;
         cpu->env.CP0_PRid = IP19_CPU_PRID;
         CPU(cpu)->cpu_index = i;
+        /*
+         * Hold the secondary slices out of reset until the bootmaster
+         * claims the master group.  start_powered_off makes the generic
+         * CPU reset keep them halted on machine reset as well.
+         */
+        CPU(cpu)->start_powered_off = (i != 0);
+        CPU(cpu)->halted = (i != 0);
+        s->cpu_held[i] = (i != 0);
+        IP19_DPRINT("init cpu %d index %u held %d\n", i,
+                    CPU(cpu)->cpu_index, s->cpu_held[i]);
         cpu->env.CP0_Config0 &= ~(1U << 17);
         cpu_mips_irq_init_cpu(cpu);
         cpu_mips_clock_init(cpu);
@@ -2089,6 +2296,22 @@ static void sgi_ip19_init(MachineState *machine)
     s->cc_uart_rx = 0;
     s->cc_uart_rx_ready = false;
     s->rtc_epoch_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+    /*
+     * MIPS64 is still single-threaded TCG, so the master and AP share
+     * one host thread.  Without an explicit yield in the bootmaster's
+     * us_delay() loop the AP can be too slow to set pdaindr[CpuId]
+     * before the kernel's boot timeout expires.  Enable the yield by
+     * default for SMP; IP19_RTC_YIELD=0 provides an escape hatch for
+     * bisection.
+     */
+    {
+        const char *yield_env = g_getenv("IP19_RTC_YIELD");
+
+        s->rtc_yield = machine->smp.cpus > 1 &&
+                       (!yield_env || atoi(yield_env) != 0);
+    }
+    s->rtc_yield_armed = false;
+    s->rtc_yield_until_ns = 0;
     s->epc_rtc_base_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
     s->epc_rtc_base_sec = (int64_t)time(NULL);
     memset(s->epc_rtc_regs, 0, sizeof(s->epc_rtc_regs));
@@ -2232,7 +2455,58 @@ static void sgi_ip19_reset(MachineState *machine, ResetType type)
     CPUState *cs;
     int i;
 
+    if (ip19_debug_enabled()) {
+        uint8_t buf[8];
+
+        CPU_FOREACH(cs) {
+            MIPSCPU *mc = MIPS_CPU(cs);
+
+            IP19_DPRINT("reset-in cpu %u pc %016" PRIx64
+                        " sr %08x cause %08x epc %016" PRIx64 "\n",
+                        cs->cpu_index, (uint64_t)mc->env.active_tc.PC,
+                        mc->env.CP0_Status, mc->env.CP0_Cause,
+                        (uint64_t)mc->env.CP0_EPC);
+        }
+        if (address_space_read(&address_space_memory, 0x3f1dcc,
+                               MEMTXATTRS_UNSPECIFIED, buf, 4) == MEMTX_OK) {
+            IP19_DPRINT("reset-in cb_wait %d\n", (int32_t)ldl_be_p(buf));
+        }
+        if (address_space_read(&address_space_memory, 0x3fa540,
+                               MEMTXATTRS_UNSPECIFIED, buf, 4) == MEMTX_OK) {
+            IP19_DPRINT("reset-in bootlck %08x\n", ldl_be_p(buf));
+        }
+        if (address_space_read(&address_space_memory, 0x3fde50,
+                               MEMTXATTRS_UNSPECIFIED, buf, 4) == MEMTX_OK) {
+            IP19_DPRINT("reset-in pdaindr1.CpuId %d\n",
+                        (int32_t)ldl_be_p(buf));
+        }
+    }
+
     qemu_devices_reset(type);
+
+    /*
+     * The CC/IP state is machine state, not device state.  Clear it on
+     * reset so a reboot starts from a clean interrupt configuration and
+     * so the bootmaster has to claim the master group again.
+     */
+    memset(s->ip, 0, sizeof(s->ip));
+    memset(s->grp_pending, 0, sizeof(s->grp_pending));
+    memset(s->grp_delivered, 0, sizeof(s->grp_delivered));
+    memset(s->ile, 0, sizeof(s->ile));
+    memset(s->igrmask, 0, sizeof(s->igrmask));
+    memset(s->cel, 0, sizeof(s->cel));
+    s->bootmaster_claimed = false;
+    s->rtc_yield_armed = false;
+    s->rtc_yield_until_ns = 0;
+    /*
+     * Rebase the PROM's 2-second arbitration barrier at reset.  QEMU
+     * sets the initial epoch in sgi_ip19_init, but machine construction
+     * can take a while before the vCPUs start.  Starting the epoch here
+     * guarantees CPU 0 reaches the barrier before it expires; the held
+     * secondary slices are released after the barrier and take the
+     * late-start slave path.
+     */
+    s->rtc_epoch_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
 
     for (i = 0; i < IP19_MAX_CPUS; i++) {
         if (s->cmp_timer[i]) {
@@ -2240,6 +2514,7 @@ static void sgi_ip19_reset(MachineState *machine, ResetType type)
         }
         s->cmpint[i] = false;
         s->cmpreg[i] = 0;
+        s->cpu_held[i] = i != 0 && i < machine->smp.cpus;
     }
 
     /*
@@ -2247,7 +2522,15 @@ static void sgi_ip19_reset(MachineState *machine, ResetType type)
      * the IP19 revision visible after every machine reset as well.
      */
     CPU_FOREACH(cs) {
+        unsigned cpu = cs->cpu_index;
+
         MIPS_CPU(cs)->env.CP0_PRid = IP19_CPU_PRID;
+        if (cpu != 0 && cpu < IP19_MAX_CPUS && s->cpu_held[cpu]) {
+            cs->halted = 1;
+        }
+        IP19_DPRINT("reset cpu %u held %d halted %d\n", cpu,
+                    cpu < IP19_MAX_CPUS ? s->cpu_held[cpu] : 0,
+                    cs->halted);
     }
 }
 

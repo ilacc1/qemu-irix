@@ -503,11 +503,18 @@ static bool mc3_split_ram(uint64_t ram_size,
                           uint8_t installed[SGI_MC3_NUM_LEAVES]
                                            [SGI_MC3_BANKS_PER_LEAF])
 {
+    /*
+     * Real MC3 banks are four 16/64 MiB ECC SIMMs: 16, 64, 128 or
+     * 256 MiB per bank, eight banks per board.  Do not use the 1 GiB
+     * size code for auto-configuration; it would make the generic RAM
+     * path report a layout no single MC3 board can hold.  A full 2 GiB
+     * board is therefore eight 256 MiB banks.
+     */
     static const struct {
         unsigned code;
         uint64_t mib;
     } sizes[] = {
-        { 0, 16 }, { 1, 64 }, { 2, 128 }, { 3, 256 }, { 5, 1024 },
+        { 0, 16 }, { 1, 64 }, { 2, 128 }, { 3, 256 },
     };
     uint64_t mib = ram_size / MiB;
     unsigned i, n;

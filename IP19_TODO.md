@@ -3,6 +3,39 @@
 > Full implementation plan: [`IP19_PLAN.md`](IP19_PLAN.md).
 > IRIX target is 6.5.22m; 6.5.30m is not supported on IP19 Onyx/Challenge.
 > Bring-up starts with one CPU; the final target is four CPUs/SMP.
+>
+> SMP topology, MC3/RAM limits, bootstrap sequence and the first 2-CPU
+> bring-up are documented in [`IP19_SMP.md`](IP19_SMP.md).
+
+## SMP bring-up checkpoint (2026-11-01, 2 CPUs/2 GiB booting)
+
+- An IP19 is a 4-slice CPU board. Two CPUs is the common board population
+  and the meaning of the handbook's “IP19 = 2xR4400”; four CPUs use slices
+  0-3 on the same board. Deskside Onyx has one CPU slot (up to 4 CPUs);
+  Challenge L has three (up to 12); rack Onyx/Challenge XL use up to 6/9
+  boards (24/36 CPUs).
+- MC3 is 2 leaves x 4 banks x 4 SIMMs, 2 GB maximum per board, 8 boards
+  maximum (`EV_MAX_MC3S`). Four CPUs in a deskside are limited to 2 GB; a
+  rack can theoretically reach 16 GB with 8 MC3 boards. The current QEMU
+  machine has one MC3 and accepts at most 8 GB; recommend 2 GB.
+- Implemented: group-SENDINT latching in `sgi_ip19.c` so MPCONF init is not
+  lost when a slave joins its group late; deterministic secondary reset hold
+  until CPU 0 claims the master group; one-shot SMP RTC/`us_delay()` boot
+  yield for single-threaded TCG. Local PROM patches make `check_slaves()`
+  wait for `EVDIAG_NOT_SET` and skip the slave cache-init block on the
+  no-diags path.
+- Verified `-smp 1 -m 512M`, `-smp 2 -m 512M`, and `-smp 2 -m 2G` all reach
+  `IRIS console login:`. `hinv` on `-smp 2 -m 2G` reports two IP19 processors
+  (R4000 rev 3.0) and 2048 MB.
+- The old “Processor #1 did not start!” failure was a false timeout: CPU1 was
+  in the kernel and later set `slave_loop_ready[1]`/`pdaindr[1].CpuId = 1`,
+  but CPU0's boot timeout expired first. When it failed, CPU1 was in a normal
+  timer-interrupt/klog path spinning on `putbuflck`; CPU0 held that lock
+  inside the nested-panic path. The RTC/`us_delay()` yield fixes the
+  scheduling race.
+- Next blocker: replace the fixed `cpu_index -> slot 1/slice index` mapping
+  with an explicit topology and multi-board `SYSCONFIG`/config defaults for
+  `-smp 4`; then add a multi-MC3 model.
 
 ## Installed root boots to stable multiuser/login (2026-11-01, latest)
 
