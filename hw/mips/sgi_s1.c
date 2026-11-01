@@ -35,6 +35,9 @@
 #define S1_DMA_CHAN_RESET 0x028
 
 #define S1_SC_INT_CNTRL(_ch) (1u << (20 + (_ch)))
+#define S1_SC_INT_CNTRL_ANY (0x7u << 20)
+#define S1_SC_DMA(_ch) (1u << (17 + (_ch)))
+#define S1_SC_D_ERR(_ch) (1u << (6 + (_ch)))
 
 #define WD95_N_CTL 0
 #define WD95_N_ISR 4
@@ -43,6 +46,8 @@
 #define WD95_N_ISRM 10
 #define WD95_N_STOPUM 12
 #define WD95_N_UEIM 14
+#define WD95_S_CDBSIZ1 12
+#define WD95_S_CDBSIZ2 14
 #define WD95_N_SQADR 20
 #define WD95_N_DESTID 26
 #define WD95_N_FLAG 30
@@ -68,6 +73,16 @@
 #define W95_ISR_STOPU 0x04
 #define W95_ISR_UEI 0x08
 #define W95_ISR_BUSYI 0x10
+#define W95_ISR_VBUSYI 0x20
+#define W95_ISR_SREJ 0x40
+
+#define W95_ISRM_STOPWCSM 0x01
+#define W95_ISRM_INTWCSM 0x02
+#define W95_ISRM_STOPUM 0x04
+#define W95_ISRM_UEIM 0x08
+#define W95_ISRM_BUSYIM 0x10
+#define W95_ISRM_VBUSYIM 0x20
+#define W95_ISRM_SREJM 0x40
 
 #define W95_STPU_ABORTI 0x01
 #define W95_STPU_SCSIT 0x02
@@ -81,6 +96,7 @@
 typedef struct S1Channel {
     SGI_S1State *s;
     uint8_t regs[WD95_NUM_REGS];
+    uint8_t setup_regs[WD95_NUM_REGS];
     bool setup;
     uint32_t dma_xlat_lo;
     uint32_t dma_xlat_hi;
@@ -102,6 +118,9 @@ typedef struct S1Channel {
     size_t fifo_len;
     size_t fifo_pos;
     size_t fifo_alloc;
+    uint8_t *out_buf;      /* target data-out buffer, valid until continue */
+    size_t out_len;
+    size_t out_pos;
 } S1Channel;
 
 struct SGI_S1State {
@@ -117,20 +136,52 @@ struct SGI_S1State {
     uint32_t dma_interrupt[S1_NUM_CHANNELS];
     uint32_t ibus_error;
     QEMUBH *bh;
+    qemu_irq irq;
+    hwaddr dma_alias;
     bool trace;
 };
 
 static void s1_start_command(S1Channel *c);
+static void s1_out_flush(S1Channel *c);
+static void s1_set_dma_error(S1Channel *c);
+
+static bool s1_int0_pending(S1Channel *c)
+{
+    uint8_t isr = c->regs[WD95_N_ISR];
+    uint8_t isrm = c->regs[WD95_N_ISRM];
+    uint8_t stopu = c->regs[WD95_N_STOPU];
+    uint8_t uei = c->regs[WD95_N_UEI];
+
+    if (isr & isrm &
+        (W95_ISR_STOPWCS | W95_ISR_INTWCS | W95_ISR_BUSYI |
+         W95_ISR_VBUSYI | W95_ISR_SREJ)) {
+        return true;
+    }
+    if ((isrm & W95_ISRM_STOPUM) &&
+        (stopu & c->regs[WD95_N_STOPUM])) {
+        return true;
+    }
+    if ((isrm & W95_ISRM_UEIM) && (uei & c->regs[WD95_N_UEIM])) {
+        return true;
+    }
+    return false;
+}
+
+static void s1_update_irq(SGI_S1State *s)
+{
+    qemu_set_irq(s->irq, !!(s->status_cmd & S1_SC_INT_CNTRL_ANY));
+}
 
 static void s1_update_status_bit(S1Channel *c)
 {
     uint32_t bit = S1_SC_INT_CNTRL(c - c->s->chan);
 
-    if (c->regs[WD95_N_ISR] & 0x7f) {
+    if (s1_int0_pending(c)) {
         c->s->status_cmd |= bit;
     } else {
         c->s->status_cmd &= ~bit;
     }
+    s1_update_irq(c->s);
 }
 
 static void s1_set_isr(S1Channel *c, uint8_t bits)
@@ -141,8 +192,8 @@ static void s1_set_isr(S1Channel *c, uint8_t bits)
 
 static void s1_set_stopu(S1Channel *c, uint8_t bits)
 {
-    c->regs[WD95_N_STOPU] |= bits & 0x7f;
-    if (bits & 0x7f) {
+    c->regs[WD95_N_STOPU] |= bits & 0xff;
+    if (bits) {
         s1_set_isr(c, W95_ISR_STOPU);
     }
 }
@@ -154,39 +205,76 @@ static uint32_t s1_get_tc(S1Channel *c)
            c->regs[WD95_N_TC_0_7];
 }
 
-static void s1_set_tc(S1Channel *c, uint32_t tc)
+static void s1_store_tc(S1Channel *c, uint32_t tc)
 {
+    tc &= 0xffffff;
     c->regs[WD95_N_TC_0_7] = tc & 0xff;
     c->regs[WD95_N_TC_8_15] = (tc >> 8) & 0xff;
     c->regs[WD95_N_TC_16_23] = (tc >> 16) & 0xff;
-    c->tc = tc & 0xffffff;
-    c->tc_left = c->tc;
 }
 
-static unsigned s1_cdb_length(uint8_t op)
+static void s1_set_tc(S1Channel *c, uint32_t tc)
 {
-    switch (op >> 5) {
+    c->tc = tc & 0xffffff;
+    c->tc_left = c->tc;
+    s1_store_tc(c, c->tc);
+}
+
+static void s1_tc_consume(S1Channel *c, uint32_t n)
+{
+    bool was_busy;
+
+    if (!n) {
+        return;
+    }
+    if (n > c->tc_left) {
+        n = c->tc_left;
+    }
+    was_busy = c->tc_left != 0;
+    c->tc_left -= n;
+    s1_store_tc(c, c->tc_left);
+    if (was_busy && c->tc_left == 0 && !c->waiting_tc) {
+        c->waiting_tc = true;
+        if (c->regs[WD95_N_ISRM] & W95_ISRM_BUSYIM) {
+            s1_set_isr(c, W95_ISR_BUSYI);
+        }
+    }
+}
+
+static unsigned s1_cdb_length(S1Channel *c, uint8_t op)
+{
+    unsigned group = op >> 5;
+    unsigned len;
+
+    switch (group) {
     case 0:
         return 6;
     case 1:
     case 2:
-    case 3:
         return 10;
+    case 3:
+        len = c->setup_regs[WD95_S_CDBSIZ1] & 0x0f;
+        return len + 1;
     case 4:
-        return 16;
+        len = (c->setup_regs[WD95_S_CDBSIZ1] >> 4) & 0x0f;
+        return len + 1;
     case 5:
         return 12;
+    case 6:
+        len = c->setup_regs[WD95_S_CDBSIZ2] & 0x0f;
+        return len + 1;
     default:
-        return 6;
+        len = (c->setup_regs[WD95_S_CDBSIZ2] >> 4) & 0x0f;
+        return len + 1;
     }
 }
 
-static uint32_t s1_read_guest32(hwaddr addr, bool *ok)
+static uint32_t s1_read_guest32(SGI_S1State *s, hwaddr addr, bool *ok)
 {
     uint8_t buf[4];
     MemTxResult res;
 
-    res = address_space_read(&address_space_memory, addr,
+    res = address_space_read(&address_space_memory, s->dma_alias + addr,
                              MEMTXATTRS_UNSPECIFIED, buf, sizeof(buf));
     if (ok) {
         *ok = res == MEMTX_OK;
@@ -219,7 +307,7 @@ static bool s1_dma_buf(S1Channel *c, uint8_t *buf, size_t len, bool to_guest)
         bool ok;
         MemTxResult res;
 
-        entry = s1_read_guest32(table + (uint64_t)index * 4, &ok);
+        entry = s1_read_guest32(c->s, table + (uint64_t)index * 4, &ok);
         if (!ok) {
             if (c->s->trace) {
                 fprintf(stderr, "S1DMA ch%u bad table entry table=%llx idx=%u\n",
@@ -238,15 +326,53 @@ static bool s1_dma_buf(S1Channel *c, uint8_t *buf, size_t len, bool to_guest)
                     (unsigned long long)table, index, entry,
                     (unsigned long long)phys, page_off, n);
         }
-        if (to_guest) {
-            res = address_space_write(&address_space_memory, phys,
-                                      MEMTXATTRS_UNSPECIFIED, buf + done, n);
-        } else {
-            res = address_space_read(&address_space_memory, phys,
-                                     MEMTXATTRS_UNSPECIFIED, buf + done, n);
-        }
-        if (res != MEMTX_OK) {
-            return false;
+        {
+            hwaddr raw_phys = phys;
+
+            phys += c->s->dma_alias;
+            if (to_guest) {
+                res = address_space_write(&address_space_memory, phys,
+                                          MEMTXATTRS_UNSPECIFIED,
+                                          buf + done, n);
+            } else {
+                res = address_space_read(&address_space_memory, phys,
+                                         MEMTXATTRS_UNSPECIFIED,
+                                         buf + done, n);
+            }
+            if (res != MEMTX_OK) {
+                return false;
+            }
+            if (getenv("SGI_S1_VERIFY")) {
+                uint8_t vbuf[4096];
+                MemTxResult vres;
+
+                if (to_guest) {
+                    vres = address_space_read(&address_space_memory,
+                                              raw_phys,
+                                              MEMTXATTRS_UNSPECIFIED,
+                                              vbuf, n);
+                    if (vres != MEMTX_OK || memcmp(vbuf, buf + done, n)) {
+                        fprintf(stderr, "S1VERIFY ch%u in raw=%llx "
+                                "alias=%llx n=%zu mismatch\n",
+                                (unsigned)(c - c->s->chan),
+                                (unsigned long long)raw_phys,
+                                (unsigned long long)phys, n);
+                    }
+                } else {
+                    vres = address_space_read(&address_space_memory,
+                                              raw_phys,
+                                              MEMTXATTRS_UNSPECIFIED,
+                                              vbuf, n);
+                    if (vres != MEMTX_OK ||
+                        memcmp(vbuf, buf + done, n)) {
+                        fprintf(stderr, "S1VERIFY ch%u out raw=%llx "
+                                "alias=%llx n=%zu mismatch\n",
+                                (unsigned)(c - c->s->chan),
+                                (unsigned long long)raw_phys,
+                                (unsigned long long)phys, n);
+                    }
+                }
+            }
         }
         done += n;
     }
@@ -259,6 +385,40 @@ static void s1_fifo_reset(S1Channel *c)
 {
     c->fifo_len = 0;
     c->fifo_pos = 0;
+}
+
+/*
+ * The PROM can start a data-out command before it programs the DMA
+ * offset.  Buffer the target data and send it once DMA is armed.
+ */
+static void s1_out_flush(S1Channel *c)
+{
+    while (c->dma_armed && !c->waiting_tc && c->out_pos < c->out_len &&
+           c->tc_left) {
+        size_t n = MIN(c->out_len - c->out_pos, c->tc_left);
+
+        if (!s1_dma_buf(c, c->out_buf + c->out_pos, n, false)) {
+            s1_set_dma_error(c);
+            c->complete_status = 0;
+            c->complete_resid = c->tc_left;
+            c->target_done = true;
+            c->command_active = false;
+            c->dma_armed = false;
+            qemu_bh_schedule(c->s->bh);
+            return;
+        }
+        c->out_pos += n;
+        s1_tc_consume(c, n);
+    }
+    if (c->out_pos == c->out_len) {
+        c->out_pos = 0;
+        c->out_len = 0;
+        c->out_buf = NULL;
+    }
+    if (!c->out_len && c->need_continue && c->req) {
+        c->need_continue = false;
+        scsi_req_continue(c->req);
+    }
 }
 
 static void s1_fifo_append(S1Channel *c, const uint8_t *buf, size_t len)
@@ -285,6 +445,28 @@ static void s1_fifo_append(S1Channel *c, const uint8_t *buf, size_t len)
     c->fifo_len += len;
 }
 
+static void s1_set_dma_active(S1Channel *c, bool active)
+{
+    unsigned ch = c - c->s->chan;
+    uint32_t bit = S1_SC_DMA(ch);
+
+    if (active) {
+        c->s->status_cmd |= bit;
+    } else {
+        c->s->status_cmd &= ~bit;
+    }
+    s1_update_irq(c->s);
+}
+
+static void s1_set_dma_error(S1Channel *c)
+{
+    unsigned ch = c - c->s->chan;
+
+    c->s->status_cmd |= S1_SC_D_ERR(ch);
+    c->s->status_cmd &= ~S1_SC_DMA(ch);
+    s1_update_irq(c->s);
+}
+
 static void s1_finish_command(S1Channel *c)
 {
     SCSIRequest *req = c->req;
@@ -296,11 +478,14 @@ static void s1_finish_command(S1Channel *c)
     }
     c->regs[W95_DPR_R(11)] = c->complete_status & 0xff;
     c->regs[WD95_N_SQADR] = WCS_I_COMPLETE;
-    s1_set_tc(c, c->complete_resid & 0xffffff);
+    s1_set_tc(c, c->tc_left & 0xffffff);
     c->waiting_tc = false;
     c->need_continue = false;
     c->target_done = false;
     c->command_active = false;
+    c->out_pos = 0;
+    c->out_len = 0;
+    c->out_buf = NULL;
     s1_set_isr(c, W95_ISR_STOPWCS | W95_ISR_INTWCS);
     s1_fifo_reset(c);
     c->req = NULL;
@@ -334,19 +519,24 @@ static void s1_drain_in(S1Channel *c)
                         c->fifo_pos, c->fifo_len);
             }
             c->waiting_tc = true;
-            s1_set_isr(c, W95_ISR_BUSYI);
+            if (c->regs[WD95_N_ISRM] & W95_ISRM_BUSYIM) {
+                s1_set_isr(c, W95_ISR_BUSYI);
+            }
             return;
         }
         n = MIN(avail, c->tc_left);
         if (!s1_dma_buf(c, c->fifo + c->fifo_pos, n, true)) {
-            c->complete_status = CHECK_CONDITION;
+            s1_set_dma_error(c);
+            c->complete_status = 0;
             c->complete_resid = c->tc_left;
             c->target_done = true;
             c->command_active = false;
+            c->dma_armed = false;
+            s1_fifo_reset(c);
             return;
         }
         c->fifo_pos += n;
-        c->tc_left -= n;
+        s1_tc_consume(c, n);
     }
 
     if (c->s->trace) {
@@ -397,12 +587,10 @@ static void s1_data_bh(void *opaque)
                 s1_finish_command(c);
             }
         } else if (c->req->cmd.mode == SCSI_XFER_TO_DEV) {
-            if (c->need_continue) {
-                c->need_continue = false;
-                scsi_req_continue(c->req);
-            }
-            if (c->target_done && !c->need_continue) {
+            if (c->target_done) {
                 s1_finish_command(c);
+            } else if (c->out_len) {
+                s1_out_flush(c);
             }
         } else if (c->target_done) {
             s1_finish_command(c);
@@ -428,24 +616,11 @@ static void s1_transfer_data(SCSIRequest *req, uint32_t len)
     if (req->cmd.mode == SCSI_XFER_FROM_DEV) {
         s1_fifo_append(c, buf, len);
     } else if (req->cmd.mode == SCSI_XFER_TO_DEV) {
-        uint32_t n = len;
-
-        if (c->tc_left && n > c->tc_left) {
-            n = c->tc_left;
-        }
-        if (!s1_dma_buf(c, buf, n, false)) {
-            c->complete_status = CHECK_CONDITION;
-            c->complete_resid = c->tc_left;
-            c->target_done = true;
-            c->command_active = false;
-            qemu_bh_schedule(c->s->bh);
-            return;
-        }
-        if (n < len) {
-            memset(buf + n, 0, len - n);
-        }
-        c->tc_left -= n;
+        c->out_buf = buf;
+        c->out_len = len;
+        c->out_pos = 0;
         c->need_continue = true;
+        s1_out_flush(c);
     }
 
     qemu_bh_schedule(c->s->bh);
@@ -491,12 +666,21 @@ static void s1_command_cancel(SCSIRequest *req)
 static const struct SCSIBusInfo sgi_s1_scsi_info = {
     .tcq = false,
     .max_channel = 0,
-    .max_target = 8,
+    .max_target = 15,
     .max_lun = 7,
     .transfer_data = s1_transfer_data,
     .complete = s1_command_complete,
     .cancel = s1_command_cancel,
 };
+
+static void s1_normalize_cdb(uint8_t *cdb, unsigned cdb_len)
+{
+    if (cdb_len >= 3 &&
+        (cdb[0] == MODE_SENSE || cdb[0] == MODE_SENSE_10) &&
+        (cdb[2] & 0x3f) == 0) {
+        cdb[2] |= MODE_PAGE_ALLS;
+    }
+}
 
 static void s1_start_command(S1Channel *c)
 {
@@ -511,8 +695,20 @@ static void s1_start_command(S1Channel *c)
     int32_t datalen;
 
     target = c->regs[WD95_N_DESTID] & 0x0f;
-    lun = c->regs[W95_DPR_R(0)] & 0x07;
-    cdb_len = s1_cdb_length(c->regs[W95_DPR_R(20)]);
+    /*
+     * The kernel WCS puts the identify message in DPR[0], while the
+     * standalone WCS uses DPR[5].  Both encode the LUN in the low three
+     * bits; the identify message has bit 7 set.  Prefer DPR[0] so a stale
+     * standalone message-out byte in DPR[5] cannot change a kernel LUN.
+     */
+    if (c->regs[W95_DPR_R(0)] & 0x80) {
+        lun = c->regs[W95_DPR_R(0)] & 0x07;
+    } else if (c->regs[W95_DPR_R(5)] & 0x80) {
+        lun = c->regs[W95_DPR_R(5)] & 0x07;
+    } else {
+        lun = c->regs[W95_DPR_R(0)] & 0x07;
+    }
+    cdb_len = s1_cdb_length(c, c->regs[W95_DPR_R(20)]);
 
     c->regs[WD95_N_ISR] = 0;
     c->regs[WD95_N_STOPU] = 0;
@@ -524,6 +720,9 @@ static void s1_start_command(S1Channel *c)
     c->need_continue = false;
     c->target_done = false;
     c->xfer_total = 0;
+    c->out_pos = 0;
+    c->out_len = 0;
+    c->out_buf = NULL;
     c->complete_status = 0;
     c->complete_resid = 0;
 
@@ -540,6 +739,10 @@ static void s1_start_command(S1Channel *c)
         s1_set_stopu(c, W95_STPU_SCSIT);
         s1_update_status_bit(c);
         return;
+    }
+
+    if (dev->type == TYPE_DISK || dev->type == TYPE_ROM) {
+        s1_normalize_cdb(cdb, cdb_len);
     }
 
     req = scsi_req_new(dev, 0, lun, cdb, cdb_len, c);
@@ -562,8 +765,7 @@ static void s1_start_command(S1Channel *c)
     }
 
     if (c->tc == 0 && req->cmd.xfer > 0) {
-        c->tc = req->cmd.xfer;
-        c->tc_left = c->tc;
+        s1_set_tc(c, req->cmd.xfer);
     }
 
     datalen = scsi_req_enqueue(req);
@@ -574,13 +776,24 @@ static void s1_start_command(S1Channel *c)
 
 static uint32_t s1_reg_read(S1Channel *c, unsigned r)
 {
-    if (r == WD95_S_CVER) {
-        return 0x22;
+    if (r >= WD95_NUM_REGS) {
+        return 0;
     }
+
+    if (r == WD95_N_CTL) {
+        return c->regs[r];
+    }
+    if (c->setup) {
+        if (r == WD95_S_CVER) {
+            return 0x22;
+        }
+        return c->setup_regs[r];
+    }
+
     if (r == WD95_N_ISR) {
         uint32_t v = c->regs[r] & 0x7f;
 
-        return v | (v ? 0x80 : 0);
+        return v | (s1_int0_pending(c) ? 0x80 : 0);
     }
     if (r == WD95_N_SR) {
         return c->command_active ? W95_SR_ACTIVE : 0;
@@ -591,10 +804,7 @@ static uint32_t s1_reg_read(S1Channel *c, unsigned r)
     if (r == WD95_N_FIFOS) {
         return 0;
     }
-    if (r < WD95_NUM_REGS) {
-        return c->regs[r];
-    }
-    return 0;
+    return c->regs[r];
 }
 
 static void s1_reg_write(S1Channel *c, unsigned r, uint8_t val)
@@ -603,8 +813,7 @@ static void s1_reg_write(S1Channel *c, unsigned r, uint8_t val)
         return;
     }
 
-    switch (r) {
-    case WD95_N_CTL:
+    if (r == WD95_N_CTL) {
         c->regs[r] = val;
         c->setup = !!(val & W95_CTL_SETUP);
         if ((val & (W95_CTL_LDTC | W95_CTL_LDTCL)) && c->waiting_tc &&
@@ -614,25 +823,39 @@ static void s1_reg_write(S1Channel *c, unsigned r, uint8_t val)
             c->waiting_tc = false;
             qemu_bh_schedule(c->s->bh);
         }
-        break;
+        return;
+    }
+
+    /* Setup-mode registers have their own bank; only CTL is shared. */
+    if (c->setup) {
+        c->setup_regs[r] = val;
+        return;
+    }
+
+    switch (r) {
     case WD95_N_ISR:
         c->regs[r] &= ~(val & 0x7f);
         s1_update_status_bit(c);
         break;
     case WD95_N_STOPU:
-        if (c->setup) {
-            c->regs[r] = val;
-            break;
+        c->regs[r] &= ~(val & 0xff);
+        if (!(c->regs[WD95_N_STOPU] & 0xff)) {
+            c->regs[WD95_N_ISR] &= ~W95_ISR_STOPU;
         }
-        /* fall through */
+        s1_update_status_bit(c);
+        break;
     case WD95_N_UEI:
         c->regs[r] &= ~(val & 0xff);
-        if (!(c->regs[WD95_N_STOPU] & 0x7f) &&
-            !(c->regs[WD95_N_UEI] & 0xff) &&
-            (c->regs[WD95_N_ISR] & (W95_ISR_STOPU | W95_ISR_UEI))) {
-            c->regs[WD95_N_ISR] &= ~(W95_ISR_STOPU | W95_ISR_UEI);
-            s1_update_status_bit(c);
+        if (!(c->regs[WD95_N_UEI] & 0xff)) {
+            c->regs[WD95_N_ISR] &= ~W95_ISR_UEI;
         }
+        s1_update_status_bit(c);
+        break;
+    case WD95_N_ISRM:
+    case WD95_N_STOPUM:
+    case WD95_N_UEIM:
+        c->regs[r] = val;
+        s1_update_status_bit(c);
         break;
     case WD95_N_TC_0_7:
         c->regs[r] = val;
@@ -710,10 +933,12 @@ static bool s1_core_write(hwaddr off, unsigned size, uint64_t val,
 {
     if (off == S1_STATUS_CMD && size == 8) {
         s->status_cmd &= ~(uint32_t)val;
+        s1_update_irq(s);
         return true;
     }
     if (off == S1_STATUS_CMD + 4 && size == 4) {
         s->status_cmd &= ~(uint32_t)val;
+        s1_update_irq(s);
         return true;
     }
     if (off == S1_INTERRUPT && (size == 8 || off == S1_INTERRUPT + 4)) {
@@ -835,6 +1060,9 @@ static void s1_mmio_write(void *opaque, hwaddr off, uint64_t val,
             c->dma_offset = val & 0xfff;
             c->dma_dir_in = true;
             c->dma_armed = true;
+            c->xfer_total = 0;
+            s1_set_dma_active(c, true);
+            s1_out_flush(c);
             if (c->req &&
                 (c->fifo_len > c->fifo_pos || c->target_done)) {
                 s1_data_bh(s);
@@ -844,6 +1072,9 @@ static void s1_mmio_write(void *opaque, hwaddr off, uint64_t val,
             c->dma_offset = val & 0xfff;
             c->dma_dir_in = false;
             c->dma_armed = true;
+            c->xfer_total = 0;
+            s1_set_dma_active(c, true);
+            s1_out_flush(c);
             if (c->req &&
                 (c->fifo_len > c->fifo_pos || c->target_done)) {
                 s1_data_bh(s);
@@ -857,10 +1088,12 @@ static void s1_mmio_write(void *opaque, hwaddr off, uint64_t val,
             break;
         case S1_DMA_FLUSH + 4:
             c->dma_armed = false;
+            s1_set_dma_active(c, false);
             break;
         case S1_DMA_CHAN_RESET + 4:
             c->dma_armed = false;
             c->xfer_total = 0;
+            s1_set_dma_active(c, false);
             break;
         default:
             break;
@@ -885,25 +1118,39 @@ static const MemoryRegionOps s1_mmio_ops = {
     },
 };
 
+static void s1_channel_reset(S1Channel *c, SGI_S1State *s)
+{
+    if (c->req) {
+        scsi_req_unref(c->req);
+    }
+    g_free(c->fifo);
+    memset(c, 0, sizeof(*c));
+    c->s = s;
+    c->regs[WD95_N_ISRM] = 0x7f;
+    c->regs[WD95_N_STOPUM] = 0x3f;
+    c->regs[WD95_N_UEIM] = 0xff;
+    /* Group 3/4 and 6/7 CDB lengths are stored as (len - 1) nibbles. */
+    c->setup_regs[WD95_S_CDBSIZ1] = 0x9f;
+    c->setup_regs[WD95_S_CDBSIZ2] = 0x55;
+}
+
 static void s1_reset(DeviceState *dev)
 {
     SGI_S1State *s = SGI_S1(dev);
     unsigned i;
 
     s->status_cmd = 0;
+    for (i = 0; i < S1_NUM_CHANNELS; i++) {
+        s->chan[i].out_pos = 0;
+        s->chan[i].out_len = 0;
+        s->chan[i].out_buf = NULL;
+    }
     s->interrupt = 0;
     s->ibus_error = 0;
     for (i = 0; i < S1_NUM_CHANNELS; i++) {
-        S1Channel *c = &s->chan[i];
-
-        if (c->req) {
-            scsi_req_unref(c->req);
-            c->req = NULL;
-        }
-        g_free(c->fifo);
-        memset(c, 0, sizeof(*c));
-        c->s = s;
+        s1_channel_reset(&s->chan[i], s);
     }
+    s1_update_irq(s);
 }
 
 static void s1_realize(DeviceState *dev, Error **errp)
@@ -912,9 +1159,13 @@ static void s1_realize(DeviceState *dev, Error **errp)
     unsigned i;
 
     for (i = 0; i < S1_NUM_CHANNELS; i++) {
-        s->chan[i].s = s;
+        s1_channel_reset(&s->chan[i], s);
     }
-    s->trace = getenv("SGI_S1_TRACE") != NULL;
+    {
+        const char *trace = getenv("SGI_S1_TRACE");
+
+        s->trace = trace && strcmp(trace, "0") != 0;
+    }
     s->bh = qemu_bh_new(s1_data_bh, s);
     for (i = 0; i < S1_NUM_CHANNELS; i++) {
         scsi_bus_init(&s->bus[i], sizeof(s->bus[i]), dev,
@@ -1016,6 +1267,7 @@ static void s1_init(Object *obj)
     memory_region_init_io(&s->mmio, obj, &s1_mmio_ops, s, "sgi-s1.mmio",
                           S1_WINDOW_SIZE);
     sysbus_init_mmio(sbd, &s->mmio);
+    sysbus_init_irq(sbd, &s->irq);
 }
 
 static const VMStateDescription vmstate_sgi_s1 = {
@@ -1063,12 +1315,14 @@ static void s1_register_types(void)
 
 type_init(s1_register_types)
 
-void sgi_s1_attach(MemoryRegion *sysmem, hwaddr base, BlockBackend *drive,
-                   BlockBackend *cdrom, BlockBackend *cdrom2)
+SGI_S1State *sgi_s1_attach(MemoryRegion *sysmem, hwaddr base,
+                            BlockBackend *drive, BlockBackend *cdrom,
+                            BlockBackend *cdrom2)
 {
     DeviceState *dev = qdev_new(TYPE_SGI_S1);
     SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
     MemoryRegion *mr;
+    SGI_S1State *s = SGI_S1(dev);
 
     if (drive) {
         qdev_prop_set_drive(dev, "drive", drive);
@@ -1082,4 +1336,15 @@ void sgi_s1_attach(MemoryRegion *sysmem, hwaddr base, BlockBackend *drive,
     sysbus_realize_and_unref(sbd, &error_fatal);
     mr = sysbus_mmio_get_region(sbd, 0);
     memory_region_add_subregion_overlap(sysmem, base, mr, 2);
+    return s;
+}
+
+qemu_irq sgi_s1_get_irq(SGI_S1State *s)
+{
+    return s->irq;
+}
+
+void sgi_s1_set_dma_alias(SGI_S1State *s, hwaddr base)
+{
+    s->dma_alias = base;
 }

@@ -112,6 +112,83 @@ static int get_segctl_physical_address(CPUMIPSState *env, hwaddr *physical,
                                     pa & ~(hwaddr)segmask);
 }
 
+/*
+ * IP19 (Everest) device-window decode.
+ *
+ * On IP19 the IO4 small window is physically addressed at 0x10080000
+ * (window 1, eight 64 KiB adapters), and the CC/config/RTC/EAROM/LED/sync
+ * and GIO resources occupy low physical addresses inside RAM as well.  The
+ * kernel treats all low physical memory as usable and reaches these
+ * resources through K1 (uncached) aliases, while DMA and cached K0/K2
+ * references to the same physical addresses are ordinary RAM.  QEMU has no
+ * cache model, so route uncached CPU references in these ranges to private
+ * physical aliases used only by the machine's device models.  Cached
+ * references keep the real physical address and resolve to RAM.
+ */
+#define IP19_IO4_PHYS_BASE  0x0000000010080000ULL
+#define IP19_IO4_SIZE       0x0000000000080000ULL
+#define IP19_IO4_ALIAS_BASE 0x0000000400080000ULL
+#define IP19_LOCAL_PHYS_BASE  0x0000000018000000ULL
+#define IP19_LOCAL_PHYS_END   0x000000001a002000ULL
+#define IP19_LOCAL_ALIAS_BASE 0x0000000400100000ULL
+#define IP19_GIO_PHYS_BASE  0x000000001f000000ULL
+#define IP19_GIO_PHYS_END   0x000000001fa00000ULL
+#define IP19_GIO_ALIAS_BASE \
+    (IP19_LOCAL_ALIAS_BASE + (IP19_GIO_PHYS_BASE - IP19_LOCAL_PHYS_BASE))
+
+static hwaddr ip19_device_window_phys(CPUMIPSState *env, target_ulong address,
+                                      hwaddr physical)
+{
+    bool uncached;
+
+    if (!env_archcpu(env)->ip19_io4_window) {
+        return physical;
+    }
+
+#if defined(TARGET_MIPS64)
+    if (address >= (target_ulong)0xFFFFFFFF80000000ULL) {
+        /* Sign-extended 32-bit compatibility KSEG0/KSEG1. */
+        uncached = address >= KSEG1_BASE && address < KSEG2_BASE;
+    } else if (address < 0xC000000000000000ULL) {
+        /* XKPHYS: bits 61:59 are the cache algorithm (2 == uncached). */
+        uncached = ((address >> 59) & 7) == 2;
+    } else {
+        /* TLB-mapped kernel space; the kernel does not map devices here. */
+        uncached = false;
+    }
+#else
+    uncached = address >= KSEG1_BASE && address < KSEG2_BASE;
+#endif
+
+    /*
+     * A TLB-mapped user access can also be uncached: the kernel's
+     * v_mapphys() marks KSEG1 device mappings with cache algorithm 2 in
+     * the PTE.  The virtual address itself is in USEG, so the checks
+     * above cannot see that.
+     */
+    if (env_archcpu(env)->ip19_tlb_uncached) {
+        uncached = true;
+    }
+
+    if (!uncached) {
+        return physical;
+    }
+
+    if (physical >= IP19_IO4_PHYS_BASE &&
+        physical < IP19_IO4_PHYS_BASE + IP19_IO4_SIZE) {
+        return physical - IP19_IO4_PHYS_BASE + IP19_IO4_ALIAS_BASE;
+    }
+    if (physical >= IP19_LOCAL_PHYS_BASE &&
+        physical < IP19_LOCAL_PHYS_END) {
+        return physical - IP19_LOCAL_PHYS_BASE + IP19_LOCAL_ALIAS_BASE;
+    }
+    if (physical >= IP19_GIO_PHYS_BASE &&
+        physical < IP19_GIO_PHYS_END) {
+        return physical - IP19_GIO_PHYS_BASE + IP19_GIO_ALIAS_BASE;
+    }
+    return physical;
+}
+
 int get_physical_address(CPUMIPSState *env, hwaddr *physical,
                          int *prot, target_ulong real_address,
                          MMUAccessType access_type, int mmu_idx)
@@ -128,6 +205,10 @@ int get_physical_address(CPUMIPSState *env, hwaddr *physical,
     int ret = TLBRET_MATCH;
     target_ulong address = real_address;
 
+    if (env_archcpu(env)->ip19_io4_window) {
+        env_archcpu(env)->ip19_tlb_uncached = false;
+    }
+
     if (address <= USEG_LIMIT) {
         /* useg */
         uint16_t segctl;
@@ -142,8 +223,20 @@ int get_physical_address(CPUMIPSState *env, hwaddr *physical,
                                           mmu_idx, segctl, 0x3FFFFFFF);
 #if defined(TARGET_MIPS64)
     } else if (address < 0x4000000000000000ULL) {
-        /* xuseg */
-        if (UX && address <= (0x3FFFFFFFFFFFFFFFULL & env->SEGMask)) {
+        /*
+         * xuseg.  IRIX on IP19 puts 64-bit user stacks just below the
+         * 1 TiB DEFUSRSTACK_64 boundary, but clears Status.UX while
+         * running in the kernel (SR_KERN_SET is only SR_KX for the
+         * R4000).  copyin()/copyout() still address that xuseg stack,
+         * so a KX kernel must be able to map xuseg even when UX is
+         * clear.  This is gated to the IP19 machine; other models keep
+         * the architectural UX check.  Without this, every 64-bit
+         * dynamic executable fails to map /lib64/rld because the
+         * kernel cannot read its own stack buffer.
+         */
+        if ((UX || (kernel_mode && KX &&
+                    env_archcpu(env)->ip19_io4_window)) &&
+            address <= (0x3FFFFFFFFFFFFFFFULL & env->SEGMask)) {
             ret = env->tlb->map_address(env, physical, prot,
                                         real_address, access_type);
         } else {
@@ -223,6 +316,9 @@ int get_physical_address(CPUMIPSState *env, hwaddr *physical,
         ret = get_segctl_physical_address(env, physical, prot, real_address,
                                           access_type, mmu_idx,
                                           env->CP0_SegCtl0, 0x1FFFFFFF);
+    }
+    if (ret == TLBRET_MATCH) {
+        *physical = ip19_device_window_phys(env, real_address, *physical);
     }
     return ret;
 }

@@ -18,7 +18,9 @@
  */
 #include "qemu/osdep.h"
 #include "qemu/bitops.h"
+#include "qemu/bswap.h"
 #include "qemu/plugin.h"
+#include "system/address-spaces.h"
 
 #include "cpu.h"
 #include "internal.h"
@@ -415,7 +417,18 @@ static int r4k_map_address(CPUMIPSState *env, hwaddr *physical, int *prot,
         tlb_mmid = mi ? tlb->MMID : (uint32_t) tlb->ASID;
         if ((tlb->G == 1 || tlb_mmid == MMID) && VPN == tag && !tlb->EHINV) {
             /* TLB match */
-            int n = !!(address & mask & ~(mask >> 1));
+            int n = !!(address & mask & ~(mask >> 1));            if (env_archcpu(env)->ip19_io4_window) {
+                /*
+                 * A user mapping of a device page (for example flashio's
+                 * /dev/mmem mapping of the CC RTC) is reached through a
+                 * TLB entry whose cache algorithm is uncached.  Remember
+                 * that so the IP19 device-window decode can distinguish
+                 * it from an ordinary cached reference to the same low
+                 * physical RAM page.
+                 */
+                env_archcpu(env)->ip19_tlb_uncached =
+                    (n ? tlb->C1 : tlb->C0) == 2;
+            }
             /* Check access rights */
             if (!(n ? tlb->V1 : tlb->V0)) {
                 return TLBRET_INVALID;
@@ -637,11 +650,26 @@ static void raise_mmu_exception(CPUMIPSState *env, target_ulong address,
                        (env->CP0_EntryHi & (1 << CP0EnHi_EHINV)) |
                        (address & (TARGET_PAGE_MASK << 1));
 #if defined(TARGET_MIPS64)
-    env->CP0_EntryHi &= env->SEGMask;
-    env->CP0_XContext =
-        (env->CP0_XContext & ((~0ULL) << (env->SEGBITS - 7))) | /* PTEBase */
-        (extract64(address, 62, 2) << (env->SEGBITS - 9)) |     /* R       */
-        (extract64(address, 13, env->SEGBITS - 13) << 4);       /* BadVPN2 */
+    {
+        target_ulong pte_base;
+
+        env->CP0_EntryHi &= env->SEGMask;
+        if (env_archcpu(env)->ip19_pte_base_shared) {
+            /*
+             * R4000/R4400 share Context[63:33] with XContext[63:33].
+             * IRIX only initializes Context, so derive XContext's PTEBase
+             * from it while still writing the R/BadVPN2 fields in their
+             * architecturally correct XContext positions.
+             */
+            pte_base = env->CP0_Context;
+        } else {
+            pte_base = env->CP0_XContext;
+        }
+        env->CP0_XContext =
+            (pte_base & ((~0ULL) << (env->SEGBITS - 7))) | /* PTEBase */
+            (extract64(address, 62, 2) << (env->SEGBITS - 9)) | /* R       */
+            (extract64(address, 13, env->SEGBITS - 13) << 4);   /* BadVPN2 */
+    }
 #endif
     cs->exception_index = exception;
     env->error_code = error_code;
@@ -978,6 +1006,168 @@ refill:
 }
 #endif
 
+/*
+ * IP19 bring-up workaround: IRIX 6.5.22 on IP19 reaches the hardware K2
+ * refill path before any KPTE/kptbl TLB entry is wired.  The kernel sets
+ * Wired=6 but only installs the PDA at index 0; mlreset() then flushes
+ * indices 1..47.  Without an entry for the PTE page the refill handler
+ * double faults at the PTE fetch.  When the IP19 machine enables this
+ * workaround, synthesize wired entries on demand for the 4 MiB KPTE
+ * window(s), using the kernel's kptbl pointer to derive each backing
+ * page.  Two kernel builds are known so far: the 6.5.22 miniroot keeps
+ * the kptbl pointer global at physical 0x3fa368, while the kernel built
+ * by the installed IP19 root keeps it at physical 0x2d88f0.  Pick the
+ * first candidate that holds a plausible kernel pointer.  The extra
+ * KPTEBASE windows are only needed by the installed kernel.  This is
+ * deliberately gated off for every other machine/CPU.
+ *
+ * Only the kernel K2SEG KPTE window maps the global kptbl array.  The
+ * user KPTEBASE window maps the *current process's* page tables, which
+ * are separate allocations, so synthesizing it from kptbl silently
+ * aliases user PTEs onto unrelated kernel PTEs.  That produced
+ * intermittent wrong user mappings (a stack page turning into the
+ * shared zero page, text pages aliasing kernel data) and the init/rld
+ * SIGSEGV.  Leave the user window to the kernel's own TLB management;
+ * only the kernel window is synthesized here.
+ */
+#define IP19_KPTBL_PTR_PADDR 0x3fa368
+#define IP19_KPTBL_PTR_PADDR_INSTALLED 0x2d88f0
+#define IP19_KPTE_PAGEMASK 0x6000
+#define IP19_KPTE_HALF_SIZE 0x4000
+#define IP19_KPTE_PAIR_MASK 0x7fff
+#define IP19_KPTE_WINDOW_SIZE 0x400000
+
+static const target_ulong ip19_kpte_bases_mini[] = {
+    0xc000000060000000ULL,
+    0xc00000fc60000000ULL,
+};
+
+static const target_ulong ip19_kpte_bases_installed[] = {
+    0xc000000060000000ULL,
+    0xc00000fc60000000ULL,
+    0xc0000fc000000000ULL,
+};
+
+static bool ip19_kpte_base_for(target_ulong address, target_ulong *base,
+                               bool installed)
+{
+    const target_ulong *bases = installed ? ip19_kpte_bases_installed
+                                          : ip19_kpte_bases_mini;
+    size_t n = installed ? ARRAY_SIZE(ip19_kpte_bases_installed)
+                         : ARRAY_SIZE(ip19_kpte_bases_mini);
+    size_t i;
+
+    for (i = 0; i < n; i++) {
+        target_ulong candidate = bases[i];
+
+        if (address >= candidate &&
+            address - candidate < IP19_KPTE_WINDOW_SIZE) {
+            *base = candidate;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ip19_kptbl_ptr(CPUMIPSState *env, uint64_t *out, bool *installed)
+{
+    static const hwaddr addrs[] = {
+        IP19_KPTBL_PTR_PADDR,
+        IP19_KPTBL_PTR_PADDR_INSTALLED,
+    };
+    size_t i;
+
+    for (i = 0; i < ARRAY_SIZE(addrs); i++) {
+        uint8_t buf[sizeof(uint64_t)];
+        uint64_t v, phys, top;
+
+        if (address_space_read(&address_space_memory, addrs[i],
+                               MEMTXATTRS_UNSPECIFIED, buf, sizeof(buf)) !=
+            MEMTX_OK) {
+            continue;
+        }
+        v = ldq_be_p(buf);
+        phys = v & env->PAMask;
+        top = v & 0xff00000000000000ULL;
+        if (top == 0xa800000000000000ULL ||
+            top == 0xc000000000000000ULL ||
+            top == 0x9000000000000000ULL) {
+            if (phys && phys < 0x20000000 && (phys & 0xfff) == 0) {
+                *out = v;
+                *installed = addrs[i] == IP19_KPTBL_PTR_PADDR_INSTALLED;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static bool ip19_install_kpte_entry(CPUMIPSState *env, target_ulong address)
+{
+    MIPSCPU *cpu = env_archcpu(env);
+    r4k_tlb_t *tlb;
+    uint64_t kptbl, kptbl_phys, phys0, phys1;
+    bool installed;
+    target_ulong base, old_base, offset, pair, vpn;
+
+    if (!cpu->ip19_kpte_workaround || env->tlb->nb_tlb < 2 ||
+        env->CP0_Wired < 2) {
+        return false;
+    }
+
+    if (!ip19_kptbl_ptr(env, &kptbl, &installed)) {
+        return false;
+    }
+
+    if (!ip19_kpte_base_for(address, &base, installed)) {
+        return false;
+    }
+
+    tlb = &env->tlb->mmu.r4k.tlb[1];
+    if (!tlb->EHINV && (tlb->V0 || tlb->V1) &&
+        !ip19_kpte_base_for(tlb->VPN, &old_base, installed)) {
+        /* Index 1 is in use for something other than our KPTE mapping. */
+        return false;
+    }
+
+    /* kptbl is an XKPHYS pointer; mask to the guest physical address. */
+    kptbl_phys = kptbl & env->PAMask;
+
+    /*
+     * The kernel uses PageMask=0x6000 (16 KiB pages, two per TLB entry).
+     * Align the TLB tag to the 32 KiB page pair and back each 16 KiB half
+     * with the corresponding physical page in the kptbl window.
+     */
+    pair = address & ~(target_ulong)IP19_KPTE_PAIR_MASK;
+    offset = pair - base;
+    phys0 = (kptbl_phys + offset) & ~(hwaddr)0x3fff;
+    phys1 = (kptbl_phys + offset + IP19_KPTE_HALF_SIZE) & ~(hwaddr)0x3fff;
+
+    vpn = pair & env->SEGMask;
+
+    tlb->VPN = vpn;
+    tlb->PageMask = IP19_KPTE_PAGEMASK;
+    tlb->ASID = 0;
+    tlb->MMID = env->CP0_MemoryMapID;
+    tlb->G = 1;
+    tlb->V0 = 1;
+    tlb->D0 = 1;
+    tlb->C0 = 0;
+    tlb->V1 = 1;
+    tlb->D1 = 1;
+    tlb->C1 = 0;
+    tlb->XI0 = 0;
+    tlb->RI0 = 0;
+    tlb->XI1 = 0;
+    tlb->RI1 = 0;
+    tlb->EHINV = 0;
+    tlb->PFN[0] = phys0;
+    tlb->PFN[1] = phys1;
+
+    cpu_mips_tlb_flush(env);
+    return true;
+}
+
 bool mips_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
                        MMUAccessType access_type, int mmu_idx,
                        bool probe, uintptr_t retaddr)
@@ -986,11 +1176,15 @@ bool mips_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
     hwaddr physical;
     int prot;
     int ret = TLBRET_BADADDR;
-
     /* data access */
     /* XXX: put correct access by using cpu_restore_state() correctly */
     ret = get_physical_address(env, &physical, &prot, address,
                                access_type, mmu_idx);
+    if (!probe && ret == TLBRET_NOMATCH &&
+        ip19_install_kpte_entry(env, address)) {
+        ret = get_physical_address(env, &physical, &prot, address,
+                                   access_type, mmu_idx);
+    }
     switch (ret) {
     case TLBRET_MATCH:
         qemu_log_mask(CPU_LOG_MMU,
@@ -1463,8 +1657,7 @@ void r4k_invalidate_tlb(CPUMIPSState *env, int idx, int use_extra)
 
     MMID = mi ? MMID : (uint32_t) ASID;
 
-    tlb = &env->tlb->mmu.r4k.tlb[idx];
-    /*
+    tlb = &env->tlb->mmu.r4k.tlb[idx];    /*
      * The qemu TLB is flushed when the ASID/MMID changes, so no need to
      * flush these entries again.
      */

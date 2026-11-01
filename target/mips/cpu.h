@@ -1259,6 +1259,10 @@ struct ArchCPU {
 
     /* Properties */
     bool is_big_endian;
+    bool ip19_kpte_workaround;
+    bool ip19_pte_base_shared;
+    bool ip19_io4_window;
+    bool ip19_tlb_uncached;
 };
 
 /**

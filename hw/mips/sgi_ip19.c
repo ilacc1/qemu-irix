@@ -17,6 +17,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/bswap.h"
 #include "chardev/char-fe.h"
 #include "hw/core/boards.h"
 #include "hw/core/clock.h"
@@ -25,6 +26,9 @@
 #include "hw/core/qdev-clock.h"
 #include "hw/mips/mips.h"
 #include "hw/mips/sgi_s1.h"
+#include "hw/mips/sgi_mc3.h"
+#include "hw/mips/sgi_z8530.h"
+#include "hw/core/qdev.h"
 #include "system/address-spaces.h"
 #include "system/block-backend.h"
 #include "system/reset.h"
@@ -36,6 +40,7 @@
 #include "qemu/error-report.h"
 #include "qemu/host-utils.h"
 #include "qemu/timer.h"
+#include <time.h>
 
 #define IP19_MAX_CPUS       4
 #define IP19_MAX_SLOTS      16
@@ -70,13 +75,57 @@
 #define IP19_LED_SIZE       0x01000
 #define IP19_SYNC_BASE      0x1a000100
 #define IP19_SYNC_SIZE      0x01000
+/*
+ * IO4_CONF_SW (written by IP19prom's initialize_io4()) selects window 1.
+ * A window is 8 physical-adapter slots of 64 KiB each, so the only
+ * small-window physical range decoded by the IO4 is
+ * 0x10080000..0x100fffff.  On a machine larger than 256 MiB that range is
+ * also ordinary RAM: the hardware distinguishes the two by cache
+ * attribute, with K1/uncached accesses hitting IO4 and cached K0/K2
+ * accesses hitting memory.  QEMU has no cache model, so the MIPS
+ * translation code redirects uncached references in this range to
+ * IP19_IO4_ALIAS_BASE, and the IO4/EPC/S1 model lives at that alias.  The
+ * alias deliberately keeps region field 1 so the IO4 register encoding is
+ * unchanged.
+ */
 #define IP19_IO4_BASE       0x10000000
-#define IP19_IO4_SIZE       0x08000000
-#define IP19_S1_BASE        (IP19_IO4_BASE + (1 << 19) + (4 << 16))
+#define IP19_IO4_WINDOW     1
+#define IP19_IO4_PADAPS     8
+#define IP19_IO4_PHYS_BASE  (IP19_IO4_BASE + (IP19_IO4_WINDOW << 19))
+#define IP19_IO4_SIZE       (IP19_IO4_PADAPS << 16)
+#define IP19_IO4_ALIAS_BASE 0x400080000ULL
+#define IP19_IO4_REGION_BASE IP19_IO4_ALIAS_BASE
+#define IP19_EPC_REGION     IP19_IO4_WINDOW
+#define IP19_EPC_PADAP      1
+#define IP19_S1_PADAP       4
+#define IP19_S1_BASE        (IP19_IO4_REGION_BASE + (IP19_S1_PADAP << 16))
+#define IP19_S1_SIZE        0x8000
 #define IP19_GIO_BASE       0x1f000000
 #define IP19_GIO_SIZE       0x00a00000
+/*
+ * The kernel treats all low physical memory as usable (Everest has no bad
+ * pages, see memsupport.c setupbadmem()) and reaches the CC/config/RTC/
+ * EAROM/LED/sync/GIO resources through K1 uncached aliases.  DMA and cached
+ * kernel references to the same physical addresses are ordinary RAM.  Move
+ * the local-resource model to a private physical alias and let the MIPS
+ * translation code redirect uncached references there, just as it already
+ * does for the IO4 small window.
+ */
+#define IP19_LOCAL_PHYS_BASE 0x18000000ULL
+#define IP19_LOCAL_ALIAS_BASE 0x400100000ULL
+#define IP19_LOCAL_ALIAS(_phys) \
+    (IP19_LOCAL_ALIAS_BASE + ((_phys) - IP19_LOCAL_PHYS_BASE))
 
 #define IP19_RTC_HZ         50000000ULL
+
+/*
+ * IP19 uses R4000SC parts at revision 3.0 or later.  The IP19 kernel is
+ * built without JUMP_WAR (see kern/kcommondefs), so coproc_find() panics
+ * when CP0 PRId reports a pre-3.0 R4000 (major <= 2, minor <= 2).  QEMU's
+ * R4000SC model reports revision 0.0; publish the minimum supported IP19
+ * revision instead.
+ */
+#define IP19_CPU_PRID       0x00000430
 
 /* CC local resources, IP19.h */
 #define CC_SPNUM            0x008
@@ -112,6 +161,7 @@
 #define CFG_BOARD_LEVEL     0x02
 #define CFG_PROC_BASE       0x10
 #define CFG_PROC_STRIDE     0x40
+#define CFG_PROC_CMPREG0    0x10
 #define CFG_PROC_CCREV      0x19
 #define CFG_PROC_CACHE_SZ   0x3e
 
@@ -134,6 +184,7 @@
 #define MC3_BANK_IF         2
 #define MC3_BANK_IP         3
 
+#define CFG_IO4_LW          0x00
 #define CFG_IO4_SW          0x01
 #define CFG_IO4_REVTYPE     0x01
 #define CFG_IO4_ADAP        0x02
@@ -150,16 +201,20 @@
 #define CFG_IO4_RTIMEOUT    0x10
 #define CFG_IO4_INTRMASK    0x11
 #define IO4_TYPE_VALUE      0x03
-#define IO4_REV_LEVEL       0x01
+#define IO4_REV_LEVEL       0x02
+#define IO4_ADAP_NULL       0x00
 #define IO4_ADAP_SCSI       0x0d
+#define IO4_ADAP_SCIP       0x1d
 #define IO4_ADAP_EPC        0x0e
 
 #define IP19_SLOT_CPU       1
 #define IP19_SLOT_MC3       2
 #define IP19_SLOT_IO4       3
 
-#define IP19_EPC_REGION     1
-#define IP19_EPC_PADAP      1
+#define IO4_EBUSERROR_BADIOA   0x0008
+#define IO4_EBUSERROR_STICKY   0x0001
+#define IO4_INTRMASK_ERROR     0x0002
+#define IO4_INTRMASK_DISABLE   0x0001
 
 /* Interrupt level groups used by evintr.c get_intr_level(). */
 #define IP19_CAUSE_IP2      0x04
@@ -169,10 +224,19 @@
 #define IP19_CAUSE_IP6      0x40
 #define IP19_CAUSE_IP7      0x80
 
+/* CC local-interrupt enable bits in EV_ILE. */
+#define EV_ILE_EBUSINT      0x01
+#define EV_ILE_CMPINT       0x02
+
 #define SCC_RR0_TX_EMPTY    0x04
 
 #define TYPE_SGI_IP19_MACHINE MACHINE_TYPE_NAME("ip19")
 OBJECT_DECLARE_SIMPLE_TYPE(SGI_IP19State, SGI_IP19_MACHINE)
+
+typedef struct IP19CmpTimer {
+    struct SGI_IP19State *s;
+    unsigned cpu;
+} IP19CmpTimer;
 
 struct SGI_IP19State {
     MachineState parent_obj;
@@ -182,6 +246,9 @@ struct SGI_IP19State {
     MemoryRegion flash;
     MemoryRegion flash_alias;
     MemoryRegion flash_alias_hi;
+    uint8_t *flash_data;
+    bool flash_program_setup;
+    bool flash_erase_setup;
     MemoryRegion cc;
     MemoryRegion cfg;
     MemoryRegion bustag;
@@ -193,12 +260,21 @@ struct SGI_IP19State {
     MemoryRegion io4;
     MemoryRegion gio;
 
+    SgiMC3State *mc3;
+    SGI_S1State *s1;
+    SgiZ8530State *epc_duart[3];
+    uint8_t epc_duart_irq[3];
+
     uint64_t cfg_regs[IP19_MAX_SLOTS][IP19_CFG_REGS];
 
     uint64_t ip[IP19_MAX_CPUS][2];
     uint64_t ile[IP19_MAX_CPUS];
     uint64_t igrmask[IP19_MAX_CPUS];
     uint64_t cel[IP19_MAX_CPUS];
+    uint32_t cmpreg[IP19_MAX_CPUS];
+    bool cmpint[IP19_MAX_CPUS];
+    QEMUTimer *cmp_timer[IP19_MAX_CPUS];
+    IP19CmpTimer cmp_ctx[IP19_MAX_CPUS];
     uint64_t wgdst;
     uint64_t wgcntrl;
     uint64_t cc_ertoip;
@@ -206,6 +282,9 @@ struct SGI_IP19State {
     uint64_t pgbren;
     uint64_t epc_imask;
     uint64_t epc_ipend;
+    uint64_t epc_prst;
+    uint64_t io4_lw;
+    uint64_t io4_sw;
     int64_t rtc_epoch_ns;
     uint8_t earom_data[IP19_EAROM_SIZE];
     uint32_t iaram[IP19_IARAM_SIZE / 4];
@@ -214,23 +293,60 @@ struct SGI_IP19State {
     uint8_t epc_xram_page;
     uint8_t epc_rtc_addr;
     uint8_t epc_rtc_regs[16];
+    int64_t epc_rtc_base_ns;
+    int64_t epc_rtc_base_sec;
+    char sysctlr_serial[16];
     uint32_t io4_ebus_error;
+    uint64_t io4_error_vector;
 
     qemu_irq cpu_irq[IP19_MAX_CPUS][8];
 
-    CharFrontend chr;
-    uint8_t scc_sel[IP19_MAX_CPUS * 2];
-    uint8_t epc_uart_fifo[256];
-    unsigned epc_uart_head;
-    unsigned epc_uart_tail;
+    Chardev *cc_uart_chr;
     uint8_t cc_uart_rx;
     bool cc_uart_rx_ready;
     uint8_t cc_uart_fifo[64];
     unsigned cc_uart_head;
     unsigned cc_uart_tail;
-    uint8_t cc_cmd[8];
+    uint8_t cc_cmd[32];
     unsigned cc_cmd_len;
 };
+
+static void ip19_epc_update_irq(SGI_IP19State *s);
+static void ip19_set_pending(SGI_IP19State *s, unsigned cpu,
+                             unsigned level);
+static void ip19_clear_pending(SGI_IP19State *s, unsigned cpu,
+                               unsigned level);
+
+static void ip19_s1_irq(void *opaque, int n, int level)
+{
+    SGI_IP19State *s = opaque;
+
+    if (level) {
+        ip19_set_pending(s, 0, 0x4f);
+    } else {
+        ip19_clear_pending(s, 0, 0x4f);
+    }
+}
+
+static void ip19_epc_duart_irq(void *opaque, int n, int level)
+{
+    SGI_IP19State *s = opaque;
+    uint64_t pending = 0;
+
+    if (n < 0 || n >= 3) {
+        return;
+    }
+    s->epc_duart_irq[n] = !!level;
+
+    if (s->epc_duart_irq[0]) {
+        pending |= 0x01;                    /* EPC_INTR_DUART0 */
+    }
+    if (s->epc_duart_irq[1] || s->epc_duart_irq[2]) {
+        pending |= 0x02;                    /* EPC_INTR_DUART12 */
+    }
+    s->epc_ipend = (s->epc_ipend & ~0x03ULL) | pending;
+    ip19_epc_update_irq(s);
+}
 
 static unsigned ip19_attached_cpu(MemTxAttrs attrs)
 {
@@ -265,6 +381,18 @@ static uint64_t ip19_level_cause(int level)
     return IP19_CAUSE_IP2;                  /* DEV */
 }
 
+static uint64_t ip19_rtc_value(SGI_IP19State *s)
+{
+    /*
+     * The PROM checks that the clock advances across two adjacent reads.
+     * QEMU_CLOCK_HOST is system uptime, so subtract the machine-start
+     * epoch before scaling; otherwise the 50 MHz multiply overflows.
+     */
+    uint64_t ns = qemu_clock_get_ns(QEMU_CLOCK_HOST) - s->rtc_epoch_ns;
+
+    return muldiv64(ns, IP19_RTC_HZ, 1000000000ULL);
+}
+
 static void ip19_update_irq(SGI_IP19State *s, unsigned cpu)
 {
     int level = ip19_hpil(s, cpu);
@@ -276,12 +404,65 @@ static void ip19_update_irq(SGI_IP19State *s, unsigned cpu)
      * device interrupts.  CEL masks levels at or below the current
      * exception level.
      */
-    if (level && level > s->cel[cpu] && (s->ile[cpu] & 1)) {
+    if (level && level > s->cel[cpu] && (s->ile[cpu] & EV_ILE_EBUSINT)) {
         cause = ip19_level_cause(level);
     }
+    /*
+     * The CC timer comparator is a separate local interrupt class
+     * (EV_CMPINT).  It is not part of EV_IP0/EV_IP1, and the kernel
+     * dispatches it through Cause IP3 (SRB_TIMOCLK) to timein().
+     */
+    if (s->cmpint[cpu] && (s->ile[cpu] & EV_ILE_CMPINT)) {
+        cause |= IP19_CAUSE_IP3;
+    }
     for (ip = 0; ip < 8; ip++) {
+        /*
+         * IP7 is the CPU-internal Count/Compare timer.  Never drive it
+         * from the system controller: the machine would otherwise clear
+         * a pending timer edge whenever it recomputes the CC interrupt
+         * state, and the guest clock would stop.
+         */
+        if (ip == 7) {
+            continue;
+        }
         qemu_set_irq(s->cpu_irq[cpu][ip], !!(cause & (1ULL << ip)));
     }
+}
+
+static void ip19_cmp_expire(void *opaque)
+{
+    IP19CmpTimer *ctx = opaque;
+    SGI_IP19State *s = ctx->s;
+
+    s->cmpint[ctx->cpu] = true;
+    ip19_update_irq(s, ctx->cpu);
+}
+
+/*
+ * The CC has a free-running 50 MHz RTC and a per-processor 32-bit
+ * comparator.  When the low 32 bits of the RTC reach CMPREG the CC
+ * raises the CMPINT local interrupt; it stays pending until software
+ * acknowledges it through EV_CIPL124.
+ */
+static void ip19_cmp_rearm(SGI_IP19State *s, unsigned cpu)
+{
+    uint32_t now;
+    uint32_t delta;
+    int64_t now_ns;
+    int64_t fire_ns;
+
+    if (!s->cmp_timer[cpu]) {
+        return;
+    }
+    now = (uint32_t)ip19_rtc_value(s);
+    delta = s->cmpreg[cpu] - now;
+    now_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+
+    if (!delta) {
+        delta = 1;
+    }
+    fire_ns = now_ns + muldiv64(delta, 1000000000ULL, IP19_RTC_HZ);
+    timer_mod(s->cmp_timer[cpu], fire_ns);
 }
 
 static void ip19_set_pending(SGI_IP19State *s, unsigned cpu, unsigned level)
@@ -324,6 +505,34 @@ static void ip19_deliver_vector(SGI_IP19State *s, uint64_t vector)
     }
 }
 
+static void ip19_clear_vector(SGI_IP19State *s, uint64_t vector)
+{
+    unsigned dest = vector & 0x7f;
+    unsigned level = (vector >> 8) & 0x7f;
+    unsigned i;
+
+    if (dest == 0x7f) {
+        for (i = 0; i < IP19_MAX_CPUS; i++) {
+            ip19_clear_pending(s, i, level);
+        }
+    } else if (dest & 0x40) {
+        unsigned group = dest & 0x3f;
+
+        for (i = 0; i < IP19_MAX_CPUS; i++) {
+            if (group < 64 && (s->igrmask[i] & (1ULL << group))) {
+                ip19_clear_pending(s, i, level);
+            }
+        }
+    } else {
+        unsigned slot = (dest >> 2) & 0xf;
+        unsigned target = dest & 0x3;
+
+        if (slot == IP19_SLOT_CPU && target < IP19_MAX_CPUS) {
+            ip19_clear_pending(s, target, level);
+        }
+    }
+}
+
 static void ip19_cc_uart_push(SGI_IP19State *s, uint8_t ch)
 {
     unsigned next = (s->cc_uart_head + 1) % sizeof(s->cc_uart_fifo);
@@ -331,6 +540,17 @@ static void ip19_cc_uart_push(SGI_IP19State *s, uint8_t ch)
     if (next != s->cc_uart_tail) {
         s->cc_uart_fifo[s->cc_uart_head] = ch;
         s->cc_uart_head = next;
+    }
+}
+
+static void ip19_cc_uart_putc(SGI_IP19State *s, uint8_t ch)
+{
+    /*
+     * The CC UART is a debug console only.  Write directly to the shared
+     * host backend; the Z8530 owns the receive side of that chardev.
+     */
+    if (s->cc_uart_chr) {
+        qemu_chr_write(s->cc_uart_chr, &ch, 1, true);
     }
 }
 
@@ -492,8 +712,14 @@ static MemTxResult ip19_cc_write(void *opaque, hwaddr off, uint64_t val,
         s->cel[cpu] = val;
         ip19_update_irq(s, cpu);
         break;
-    case CC_CIPL0:
     case CC_CIPL124:
+        /* EV_CIPL124 takes a mask of local interrupt classes. */
+        if (val & EV_ILE_CMPINT) {
+            s->cmpint[cpu] = false;
+            ip19_update_irq(s, cpu);
+        }
+        /* fall through */
+    case CC_CIPL0:
         if (val < 128) {
             ip19_clear_pending(s, cpu, val);
         }
@@ -510,7 +736,7 @@ static MemTxResult ip19_cc_write(void *opaque, hwaddr off, uint64_t val,
     case CC_UART_DATA: {
         uint8_t ch = val & 0xff;
 
-        qemu_chr_fe_write_all(&s->chr, &ch, 1);
+        ip19_cc_uart_putc(s, ch);
 
         /*
          * Minimal sysctlr protocol responder: answer the debug-switch
@@ -528,12 +754,58 @@ static MemTxResult ip19_cc_write(void *opaque, hwaddr off, uint64_t val,
             if (ch == 0x0a) {             /* SC_TERM */
                 if (s->cc_cmd_len >= 5 && s->cc_cmd[1] == 0x47 &&
                     s->cc_cmd[2] == 0x44 && s->cc_cmd[3] == 0x44) {
+                    /*
+                     * Debug-switch query.  Report VDS_NO_DIAGS so
+                     * bring-up skips the very slow destructive
+                     * IO4/map-RAM diagnostics.
+                     */
                     static const uint8_t resp[] = {
                         0x52, 0x44, 0x44, '0', '0', '1', '0', 0
                     };
                     for (unsigned i = 0; i < sizeof(resp); i++) {
                         ip19_cc_uart_push(s, resp[i]);
                     }
+                } else if (s->cc_cmd_len >= 5 && s->cc_cmd[1] == 0x47 &&
+                           s->cc_cmd[2] == 0x53 &&
+                           s->cc_cmd[3] == 0x53) {
+                    /*
+                     * SC_GET SC_SERIAL: reply R, sequence, type, then
+                     * the NUL-terminated serial number.  The PROM and
+                     * kernel both use this to validate the system
+                     * controller serial.
+                     */
+                    unsigned len = strlen(s->sysctlr_serial) + 1;
+
+                    if (len > 10) {
+                        len = 10;
+                    }
+                    ip19_cc_uart_push(s, 0x52);      /* SC_RESP */
+                    ip19_cc_uart_push(s, 0x53);      /* SC_SERIAL */
+                    ip19_cc_uart_push(s, 0x53);      /* SC_SERIAL */
+                    for (unsigned i = 0; i < len; i++) {
+                        uint8_t c = i < strlen(s->sysctlr_serial)
+                                    ? s->sysctlr_serial[i] : 0;
+                        ip19_cc_uart_push(s, c);
+                        if (c == 0) {
+                            break;
+                        }
+                    }
+                } else if (s->cc_cmd_len >= 4 && s->cc_cmd[1] == 0x53 &&
+                           s->cc_cmd[2] == 0x53) {
+                    /*
+                     * SC_SET SC_SERIAL: store a new NUL-padded serial
+                     * (up to the 10-byte protocol limit).
+                     */
+                    unsigned len = s->cc_cmd_len - 4;
+                    unsigned i;
+
+                    if (len > sizeof(s->sysctlr_serial) - 1) {
+                        len = sizeof(s->sysctlr_serial) - 1;
+                    }
+                    for (i = 0; i < len; i++) {
+                        s->sysctlr_serial[i] = s->cc_cmd[3 + i];
+                    }
+                    s->sysctlr_serial[i] = '\0';
                 }
                 s->cc_cmd_len = 0;
             }
@@ -560,20 +832,6 @@ static const MemoryRegionOps ip19_cc_ops = {
     },
 };
 
-static bool ip19_mc3_bank_size_reg(unsigned reg)
-{
-    unsigned leaf, bank;
-
-    for (leaf = 0; leaf < 2; leaf++) {
-        for (bank = 0; bank < 4; bank++) {
-            if (reg == (unsigned)CFG_MC3_BANK(leaf, bank, MC3_BANK_SIZE)) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
 static MemTxResult ip19_cfg_read(void *opaque, hwaddr off, uint64_t *data,
                                  unsigned size, MemTxAttrs attrs)
 {
@@ -585,16 +843,18 @@ static MemTxResult ip19_cfg_read(void *opaque, hwaddr off, uint64_t *data,
         *data = 0;
         return MEMTX_OK;
     }
-    if (slot == IP19_SLOT_MC3 && reg == CFG_MC3_EBUSERROR) {
-        /* EBUS error register: clear on read, no errors modelled. */
-        *data = 0;
-        return MEMTX_OK;
-    }
     if (slot == IP19_SLOT_IO4) {
         switch (reg) {
-        case CFG_IO4_REVTYPE:
-            /* Reads always report type/rev, not the SW window value. */
-            *data = (IO4_REV_LEVEL << 4) | IO4_TYPE_VALUE;
+        case CFG_IO4_LW:
+            *data = s->io4_lw;
+            return MEMTX_OK;
+        case CFG_IO4_SW:
+            /*
+             * The SW window register left-shifts the window number by
+             * eight bits; REVTYPE is the read-only low-byte alias.
+             */
+            *data = s->io4_sw |
+                    ((uint64_t)((IO4_REV_LEVEL << 4) | IO4_TYPE_VALUE));
             return MEMTX_OK;
         case CFG_IO4_IBUSERROR:
         case CFG_IO4_IBUSERRORCLR:
@@ -606,6 +866,10 @@ static MemTxResult ip19_cfg_read(void *opaque, hwaddr off, uint64_t *data,
         case CFG_IO4_EBUSERRORCLR:
             *data = s->io4_ebus_error;
             s->io4_ebus_error = 0;
+            if (s->io4_error_vector) {
+                ip19_clear_vector(s, s->io4_error_vector);
+                s->io4_error_vector = 0;
+            }
             return MEMTX_OK;
         default:
             break;
@@ -623,25 +887,47 @@ static MemTxResult ip19_cfg_write(void *opaque, hwaddr off, uint64_t val,
     unsigned reg = (off & 0x7ff) >> 3;
 
     if (slot < IP19_MAX_SLOTS && reg < IP19_CFG_REGS) {
-        if (slot == IP19_SLOT_MC3 && reg == CFG_MC3_BISTRESULT) {
-            /* BIST completes immediately in the model. */
-            s->cfg_regs[slot][reg] = 0;
-            return MEMTX_OK;
+        if (slot == IP19_SLOT_CPU && reg >= CFG_PROC_CMPREG0) {
+            unsigned proc = (reg - CFG_PROC_CMPREG0) / CFG_PROC_STRIDE;
+            unsigned preg = (reg - CFG_PROC_CMPREG0) % CFG_PROC_STRIDE;
+
+            if (proc < IP19_MAX_CPUS && preg <= 3) {
+                unsigned base = CFG_PROC_CMPREG0 +
+                                proc * CFG_PROC_STRIDE;
+
+                s->cfg_regs[slot][reg] = val;
+                s->cmpreg[proc] =
+                    (s->cfg_regs[slot][base] & 0xff) |
+                    ((s->cfg_regs[slot][base + 1] & 0xff) << 8) |
+                    ((s->cfg_regs[slot][base + 2] & 0xff) << 16) |
+                    ((s->cfg_regs[slot][base + 3] & 0xff) << 24);
+                /*
+                 * The kernel writes the LSB alone to disable the timeout
+                 * interrupt and writes all four bytes to re-enable it.
+                 * Re-arm on every byte so both cases follow the hardware
+                 * comparator value.
+                 */
+                ip19_cmp_rearm(s, proc);
+                return MEMTX_OK;
+            }
         }
-        if (slot == IP19_SLOT_MC3 &&
-            (reg == CFG_MC3_TYPE || reg == CFG_MC3_REVLEVEL ||
-             ip19_mc3_bank_size_reg(reg))) {
-            /* Read-only MC3 identification: ignore writes. */
-            return MEMTX_OK;
-        }
-        if (slot == IP19_SLOT_IO4 &&
-            (reg == CFG_IO4_REVTYPE || reg == CFG_IO4_IODEV0 ||
-             reg == CFG_IO4_IODEV1 || reg == CFG_IO4_RESET)) {
-            /*
-             * REVTYPE/IODEVn are read-only identification; RESET must
-             * not wipe the model.
-             */
-            return MEMTX_OK;
+        if (slot == IP19_SLOT_IO4) {
+            switch (reg) {
+            case CFG_IO4_LW:
+                s->io4_lw = val;
+                return MEMTX_OK;
+            case CFG_IO4_SW:
+                /* Window number is stored in bits 20:8, type/rev in 7:0. */
+                s->io4_sw = (val & 0x1fffff) << 8;
+                return MEMTX_OK;
+            case CFG_IO4_IODEV0:
+            case CFG_IO4_IODEV1:
+            case CFG_IO4_RESET:
+                /* IODEVn are read-only identification; RESET is ignored. */
+                return MEMTX_OK;
+            default:
+                break;
+            }
         }
         s->cfg_regs[slot][reg] = val;
     }
@@ -666,14 +952,36 @@ static MemTxResult ip19_rtc_read(void *opaque, hwaddr off, uint64_t *data,
                                  unsigned size, MemTxAttrs attrs)
 {
     SGI_IP19State *s = opaque;
-    /*
-     * The PROM checks that the clock advances across two adjacent reads.
-     * QEMU_CLOCK_HOST is system uptime, so subtract the machine-start
-     * epoch before scaling; otherwise the 50 MHz multiply overflows.
-     */
-    uint64_t ns = qemu_clock_get_ns(QEMU_CLOCK_HOST) - s->rtc_epoch_ns;
+    uint64_t v = ip19_rtc_value(s);
+    unsigned shift;
 
-    *data = muldiv64(ns, IP19_RTC_HZ, 1000000000ULL);
+    /*
+     * The CC RTC is a 64-bit big-endian counter.  The IRIX flashio
+     * delay code maps it and advances to the second 32-bit word
+     * (`rtc++`), i.e. the low half of the counter.  Honour the access
+     * offset so that a 4-byte load at +4 returns the fast low word
+     * instead of the high word.
+     */
+    switch (size) {
+    case 1:
+        shift = 8 * (7 - (off & 7));
+        *data = (v >> shift) & 0xff;
+        break;
+    case 2:
+        shift = 8 * (6 - (off & 6));
+        *data = (v >> shift) & 0xffff;
+        break;
+    case 4:
+        shift = 8 * (4 - (off & 4));
+        *data = (v >> shift) & 0xffffffffu;
+        break;
+    case 8:
+        *data = v;
+        break;
+    default:
+        *data = 0;
+        break;
+    }
     return MEMTX_OK;
 }
 
@@ -692,7 +1000,114 @@ static const MemoryRegionOps ip19_rtc_ops = {
         .max_access_size = 8,
     },
     .impl = {
-        .min_access_size = 8,
+        .min_access_size = 1,
+        .max_access_size = 8,
+    },
+};
+
+/*
+ * The IO4 flash is two ganged Intel 8-bit parts, accessed as 16-bit
+ * halfwords.  The IRIX flashio utility (irix/cmd/flashio) issues the
+ * Intel command sequences: RESET, SETUP_PROGRAM+data, SETUP_ERASE+ERASE
+ * and the PROGRAM/ERASE verify commands.  Model just enough of that
+ * behaviour for erase/program/verify to complete; reads always return
+ * the array contents.
+ */
+static uint64_t ip19_flash_read(void *opaque, hwaddr off, unsigned size)
+{
+    SGI_IP19State *s = opaque;
+
+    off &= IP19_FLASH_SIZE - 1;
+    if (off + size > IP19_FLASH_SIZE) {
+        return 0;
+    }
+
+    switch (size) {
+    case 1:
+        return s->flash_data[off];
+    case 2:
+        return lduw_be_p(s->flash_data + off);
+    case 4:
+        return ldl_be_p(s->flash_data + off);
+    case 8:
+        return ldq_be_p(s->flash_data + off);
+    default:
+        return 0;
+    }
+}
+
+static void ip19_flash_write(void *opaque, hwaddr off, uint64_t val,
+                             unsigned size)
+{
+    SGI_IP19State *s = opaque;
+
+    off &= IP19_FLASH_SIZE - 1;
+    if (off + size > IP19_FLASH_SIZE) {
+        return;
+    }
+
+    if (size == 2) {
+        uint16_t v = val & 0xffff;
+
+        if (s->flash_program_setup) {
+            stw_be_p(s->flash_data + off, v);
+            s->flash_program_setup = false;
+            return;
+        }
+
+        switch (v) {
+        case 0xffff:                    /* RESET */
+            s->flash_erase_setup = false;
+            return;
+        case 0x4040:                    /* SETUP_PROGRAM */
+            s->flash_program_setup = true;
+            s->flash_erase_setup = false;
+            return;
+        case 0x2020:                    /* SETUP_ERASE / ERASE */
+            if (s->flash_erase_setup) {
+                memset(s->flash_data, 0xff, IP19_FLASH_SIZE);
+                s->flash_erase_setup = false;
+            } else {
+                s->flash_erase_setup = true;
+            }
+            return;
+        case 0xa0a0:                    /* ERASE_VERIFY */
+        case 0xc0c0:                    /* PROGRAM_VERIFY */
+            s->flash_erase_setup = false;
+            return;
+        default:
+            stw_be_p(s->flash_data + off, v);
+            return;
+        }
+    }
+
+    switch (size) {
+    case 1:
+        s->flash_data[off] = val;
+        break;
+    case 4:
+        stl_be_p(s->flash_data + off, val);
+        break;
+    case 8:
+        stq_be_p(s->flash_data + off, val);
+        break;
+    default:
+        break;
+    }
+    s->flash_program_setup = false;
+    s->flash_erase_setup = false;
+}
+
+static const MemoryRegionOps ip19_flash_ops = {
+    .read = ip19_flash_read,
+    .write = ip19_flash_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 8,
+    },
+    .impl = {
+        .min_access_size = 1,
         .max_access_size = 8,
     },
 };
@@ -749,90 +1164,331 @@ static const MemoryRegionOps ip19_earom_ops = {
 #define EPC_DUART_STRIDE    0x1000
 #define EPC_DUART_CHAN_A    0x08
 #define EPC_CTRL_BASE       0xa100
+#define EPC_TINDEX          0xa268
+#define EPC_TTOP            0xa270
 
 #define EPC_ISTAT           0xa100
 #define EPC_IMSET           0xa108
 #define EPC_IMRST           0xa110
-#define EPC_CTRL_END        0xa400
+#define EPC_PRST            0xa400
+#define EPC_PRSTSET         0xa408
 #define EPC_PRSTCLR         0xa410
 #define EPC_IERR            0xa418
 #define EPC_IERRC           0xa420
 
-#define EPC_RR0_TX_EMPTY    0x04
-#define EPC_RR0_RX_CHR      0x01
+#define EPC_INTR_DUART0     0x01
+#define EPC_INTR_DUART12    0x02
 
-static int ip19_epc_can_receive(void *opaque)
+/* EPC PBUS Ethernet ID PROM (pdev 2). */
+#define EPC_ENETPROM_BASE   0x2000
+
+/* Everest NVRAM layout (irix/kern/sys/EVEREST/nvram.h). */
+#define EPC_NV_OLD_CHECKSUM     0
+#define EPC_NV_REVISION         1
+#define EPC_NV_CONSOLE          2
+#define EPC_NV_SYSPART          4
+#define EPC_NV_OSLOADER         52
+#define EPC_NV_OSFILE           70
+#define EPC_NV_OSOPTS           98
+#define EPC_NV_DBGTTY           121
+#define EPC_NV_DISKLESS         141
+#define EPC_NV_TZ               142
+#define EPC_NV_OSPART           150
+#define EPC_NV_AUTOLOAD         198
+#define EPC_NV_ROOT             199
+#define EPC_NV_NETADDR          221
+#define EPC_NV_SCSIHOSTID       272
+#define EPC_NV_SGILOGO          273
+#define EPC_NV_NONSTOP          275
+#define EPC_NV_INVENT_VALID     276
+#define EPC_NV_INVENTORY        277
+#define EPC_NV_LBAUD            116
+#define EPC_NV_RBAUD            790
+#define EPC_NV_RESTART          795
+#define EPC_NV_SNUMVALID        853
+#define EPC_NV_SNUMSIZE         854
+#define EPC_NV_SERIALNUM        855
+#define EPC_NV_REBOUND          871
+#define EPC_NV_NEW_CHECKSUM     872
+#define EPC_NV_TOD_CYCLE        3694
+#define EPC_NV_LOWFREE          3695
+#define EPC_NV_HIGHFREE         4058
+#define EPC_NVRAM_SIZE          4096
+#define EPC_NV_SERIAL_MAGIC     0x5a
+
+/* Dallas DS1397 RTC register numbers (epc.h). */
+#define NVR_SEC                 0x00
+#define NVR_MIN                 0x02
+#define NVR_HOUR                0x04
+#define NVR_WEEKDAY             0x06
+#define NVR_DAY                 0x07
+#define NVR_MONTH               0x08
+#define NVR_YEAR                0x09
+#define NVR_RTCA                0x0a
+#define NVR_RTCB                0x0b
+#define NVR_RTCC                0x0c
+#define NVR_RTCD                0x0d
+#define NVR_SET                 0x80
+#define NVR_DM                  0x04
+#define NVR_MILTIME             0x02
+#define NVR_OSC_ON              0x20
+#define NVR_VRT                 0x80
+
+static uint8_t ip19_bin_to_bcd(unsigned v)
 {
-    SGI_IP19State *s = opaque;
-    unsigned used = (s->epc_uart_head - s->epc_uart_tail) &
-                    (sizeof(s->epc_uart_fifo) - 1);
-
-    return sizeof(s->epc_uart_fifo) - 1 - used;
+    return ((v / 10) << 4) | (v % 10);
 }
 
-static void ip19_epc_receive(void *opaque, const uint8_t *buf, int size)
+static unsigned ip19_bcd_to_bin(uint8_t v)
 {
-    SGI_IP19State *s = opaque;
-
-    while (size-- > 0) {
-        unsigned next = (s->epc_uart_head + 1) & (sizeof(s->epc_uart_fifo) - 1);
-        if (next == s->epc_uart_tail) {
-            break;
-        }
-        s->epc_uart_fifo[s->epc_uart_head] = *buf++;
-        s->epc_uart_head = next;
-    }
+    return (v >> 4) * 10 + (v & 0xf);
 }
 
-static void ip19_epc_event(void *opaque, QEMUChrEvent event)
+static void ip19_epc_rtc_now(SGI_IP19State *s, struct tm *tm)
 {
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+    int64_t sec = s->epc_rtc_base_sec +
+                  (now - s->epc_rtc_base_ns) / 1000000000LL;
+    time_t t = (time_t)sec;
+
+    gmtime_r(&t, tm);
 }
 
-static void ip19_epc_duart_write(SGI_IP19State *s, unsigned duart,
-                                 unsigned chan, bool is_data, uint8_t val)
+static uint8_t ip19_epc_rtc_read_reg(SGI_IP19State *s, unsigned reg)
 {
-    unsigned idx = (duart & 3) * 2 + chan;
+    uint8_t regb = s->epc_rtc_regs[NVR_RTCB];
+    struct tm tm;
+    unsigned v;
 
-    if (is_data) {
-        qemu_chr_fe_write_all(&s->chr, &val, 1);
-        return;
-    }
-    /*
-     * A write to the control register is WR0; bits 2:0 select the
-     * register returned by the next control read.
-     */
-    s->scc_sel[idx] = val & 0x07;
-}
-
-static uint64_t ip19_epc_duart_read(SGI_IP19State *s, unsigned duart,
-                                    unsigned chan, bool is_data)
-{
-    unsigned idx = (duart & 3) * 2 + chan;
-    unsigned rr;
-
-    if (is_data) {
-        if (s->epc_uart_head != s->epc_uart_tail) {
-            uint8_t ch = s->epc_uart_fifo[s->epc_uart_tail];
-            s->epc_uart_tail = (s->epc_uart_tail + 1) &
-                               (sizeof(s->epc_uart_fifo) - 1);
-            qemu_chr_fe_accept_input(&s->chr);
-            return ch;
-        }
+    reg &= 0xf;
+    switch (reg) {
+    case NVR_RTCA:
+        /* Keep the oscillator on; UIP is never asserted by this model. */
+        return (s->epc_rtc_regs[reg] & 0x70) | NVR_OSC_ON;
+    case NVR_RTCB:
+        return regb;
+    case NVR_RTCC:
         return 0;
-    }
-    rr = s->scc_sel[idx];
-    s->scc_sel[idx] = 0;       /* control reads return to RR0 */
-    switch (rr) {
-    case 0:
-        /* RR0: TX empty plus RX-ready when input is queued. */
-        return EPC_RR0_TX_EMPTY |
-               (s->epc_uart_head != s->epc_uart_tail ? EPC_RR0_RX_CHR : 0);
-    case 1:
-        /* RR1: all characters completely sent, no errors. */
-        return 0x01;
+    case NVR_RTCD:
+        return NVR_VRT;
     default:
-        return 0;
+        break;
     }
+
+    /*
+     * While the SET bit is asserted the kernel writes the time fields a
+     * byte at a time.  Return the staged bytes so read-modify-write
+     * sequences see what they just wrote.
+     */
+    if ((regb & NVR_SET) && reg <= NVR_YEAR) {
+        return s->epc_rtc_regs[reg];
+    }
+
+    ip19_epc_rtc_now(s, &tm);
+    switch (reg) {
+    case NVR_SEC:
+        v = tm.tm_sec;
+        break;
+    case NVR_MIN:
+        v = tm.tm_min;
+        break;
+    case NVR_HOUR:
+        v = tm.tm_hour;
+        break;
+    case NVR_WEEKDAY:
+        v = tm.tm_wday + 1;      /* DS1397: 1 = Sunday */
+        break;
+    case NVR_DAY:
+        v = tm.tm_mday;
+        break;
+    case NVR_MONTH:
+        v = tm.tm_mon + 1;
+        break;
+    case NVR_YEAR:
+        v = (tm.tm_year + 1900 - 1970) % 100;
+        break;
+    default:
+        /* Alarm registers: plain storage. */
+        return s->epc_rtc_regs[reg];
+    }
+
+    if (!(regb & NVR_DM) && reg != NVR_WEEKDAY) {
+        v = ip19_bin_to_bcd(v);
+    }
+    if (reg == NVR_HOUR && !(regb & NVR_MILTIME)) {
+        unsigned hour = tm.tm_hour;
+        bool pm = hour >= 12;
+
+        hour %= 12;
+        if (!hour) {
+            hour = 12;
+        }
+        v = (regb & NVR_DM) ? hour : ip19_bin_to_bcd(hour);
+        if (pm) {
+            v |= 0x80;
+        }
+    }
+    return v & 0xff;
+}
+
+static void ip19_epc_rtc_write_reg(SGI_IP19State *s, unsigned reg,
+                                   uint8_t val)
+{
+    reg &= 0xf;
+
+    if (reg == NVR_RTCB && (s->epc_rtc_regs[NVR_RTCB] & NVR_SET) &&
+        !(val & NVR_SET)) {
+        struct tm tm = { 0 };
+        bool dm = s->epc_rtc_regs[NVR_RTCB] & NVR_DM;
+        bool mil = s->epc_rtc_regs[NVR_RTCB] & NVR_MILTIME;
+        unsigned sec = s->epc_rtc_regs[NVR_SEC];
+        unsigned min = s->epc_rtc_regs[NVR_MIN];
+        unsigned hour = s->epc_rtc_regs[NVR_HOUR];
+        unsigned day = s->epc_rtc_regs[NVR_DAY];
+        unsigned mon = s->epc_rtc_regs[NVR_MONTH];
+        unsigned year = s->epc_rtc_regs[NVR_YEAR];
+        time_t t;
+
+        if (!dm) {
+            sec = ip19_bcd_to_bin(sec);
+            min = ip19_bcd_to_bin(min);
+            hour = ip19_bcd_to_bin(hour & 0x7f);
+            day = ip19_bcd_to_bin(day);
+            mon = ip19_bcd_to_bin(mon);
+            year = ip19_bcd_to_bin(year);
+        } else {
+            hour &= 0x7f;
+        }
+        if (!mil) {
+            bool pm = s->epc_rtc_regs[NVR_HOUR] & 0x80;
+
+            hour %= 12;
+            if (pm) {
+                hour += 12;
+            }
+        }
+
+        tm.tm_sec = sec;
+        tm.tm_min = min;
+        tm.tm_hour = hour;
+        tm.tm_mday = day;
+        tm.tm_mon = mon ? mon - 1 : 0;
+        tm.tm_year = year + 70;
+        tm.tm_isdst = 0;
+        t = timegm(&tm);
+        if (t != (time_t)-1) {
+            s->epc_rtc_base_sec = t;
+            s->epc_rtc_base_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+        }
+    }
+
+    s->epc_rtc_regs[reg] = val;
+    if (reg == NVR_RTCA) {
+        s->epc_rtc_regs[reg] |= NVR_OSC_ON;
+    }
+}
+
+#define EPC_NV_MAX_LEN 64
+static const struct {
+    unsigned offset;
+    unsigned length;
+    const char *value;
+} ip19_nv_defaults[] = {
+    { EPC_NV_CONSOLE,     2,  "d" },
+    { EPC_NV_SYSPART,     48, "dksc(0,1,8)" },
+    { EPC_NV_OSLOADER,    18, "sash" },
+    { EPC_NV_OSFILE,      28, "unix" },
+    { EPC_NV_DBGTTY,      20, "multi(0)serial(0)" },
+    { EPC_NV_DISKLESS,    1,  "0" },
+    { EPC_NV_TZ,          8,  "PST8PDT" },
+    { EPC_NV_OSPART,      48, "dksc(0,1,0)" },
+    { EPC_NV_AUTOLOAD,    1,  "No" },
+    { EPC_NV_ROOT,        20, "dks0d1s0" },
+    { EPC_NV_SCSIHOSTID,  1,  "0" },
+    { EPC_NV_SGILOGO,     1,  "y" },
+    { EPC_NV_NONSTOP,     1,  "0" },
+    { EPC_NV_LBAUD,       5,  "9600" },
+    { EPC_NV_RBAUD,       5,  "19200" },
+};
+
+static uint8_t ip19_nv_old_checksum(SGI_IP19State *s)
+{
+    uint8_t checksum = 0xa5;
+    unsigned i;
+
+    /*
+     * Match IRIX's oldnvchecksum(): it reads byte 0 of each 32-byte
+     * XRAM page 32 times and rotates through carry.  The checksum byte
+     * itself contributes nothing because it is included an even number
+     * of times.
+     */
+    for (i = 0; i < EPC_NVRAM_SIZE; i++) {
+        uint8_t v = s->epc_nvram[i & 0x3e0];
+
+        if (v != EPC_NV_OLD_CHECKSUM) {
+            checksum ^= v;
+        }
+        checksum = (checksum << 1) | (checksum >> 7);
+    }
+    return checksum;
+}
+
+static uint8_t ip19_nv_new_checksum(SGI_IP19State *s)
+{
+    uint8_t checksum = 0xa5;
+    unsigned i;
+
+    for (i = 0; i < EPC_NV_HIGHFREE; i++) {
+        if (i != EPC_NV_NEW_CHECKSUM && i != EPC_NV_RESTART) {
+            checksum ^= s->epc_nvram[i];
+        }
+        checksum = (checksum << 1) | (checksum >> 7);
+    }
+    return checksum;
+}
+
+
+static void ip19_epc_nvram_defaults(SGI_IP19State *s)
+{
+    static const char serial[] = "S1234567";
+    struct tm tm;
+    unsigned i, tod_cycle;
+    time_t now;
+
+    memset(s->epc_nvram, 0, sizeof(s->epc_nvram));
+    for (i = 0; i < ARRAY_SIZE(ip19_nv_defaults); i++) {
+        size_t len = strlen(ip19_nv_defaults[i].value);
+
+        if (len > ip19_nv_defaults[i].length) {
+            len = ip19_nv_defaults[i].length;
+        }
+        memcpy(&s->epc_nvram[ip19_nv_defaults[i].offset],
+               ip19_nv_defaults[i].value, len);
+    }
+
+    s->epc_nvram[EPC_NV_REVISION] = 9; /* PROM-reported NV_BROKEN_REV */
+
+    /* Valid system-controller/NVRAM serial number. */
+    s->epc_nvram[EPC_NV_SNUMVALID] = EPC_NV_SERIAL_MAGIC;
+    s->epc_nvram[EPC_NV_SNUMSIZE] = sizeof(serial) - 1;
+    memcpy(&s->epc_nvram[EPC_NV_SERIALNUM], serial, sizeof(serial));
+
+    /*
+     * Seed the TOD leap-cycle byte so rtodc() does not treat the clock
+     * as bogus on first read.  It is derived exactly as IRIX does from
+     * the two-digit RTC year and month.
+     */
+    now = time(NULL);
+    gmtime_r(&now, &tm);
+    tod_cycle = ((((tm.tm_year + 1900) % 100) % 4 == 2 && tm.tm_mon >= 2) ||
+                 (((tm.tm_year + 1900) % 100) % 4 == 3) ||
+                 (((tm.tm_year + 1900) % 100) % 4 == 0 && tm.tm_mon < 2)) + 1;
+    s->epc_nvram[EPC_NV_TOD_CYCLE] = tod_cycle;
+
+    /* Both checksum variants are used by different PROM/kernel vintages. */
+    s->epc_nvram[EPC_NV_OLD_CHECKSUM] = 0;
+    s->epc_nvram[EPC_NV_OLD_CHECKSUM] = ip19_nv_old_checksum(s);
+    s->epc_nvram[EPC_NV_NEW_CHECKSUM] = ip19_nv_new_checksum(s);
 }
 
 /*
@@ -885,9 +1541,27 @@ static uint64_t ip19_epc_ctrl_read(SGI_IP19State *s, unsigned reg)
     case EPC_IMSET:
     case EPC_IMRST:
         return 0;
+    case EPC_TINDEX:
+        /*
+         * ee_init() drains the transmit DMA before programming the
+         * controller:
+         *     while (TINDEX != TTOP)
+         *         ;
+         * The EPC Ethernet engine is not modelled yet, so never report
+         * a pending transmit entry and let the driver continue to the
+         * rest of its initialization.
+         */
+        return s->epc_regs[(EPC_TTOP - EPC_CTRL_BASE) >> 3];
+    case EPC_PRST:
+        return s->epc_prst;
     case EPC_IERRC:
-        s->epc_regs[(EPC_IERR - EPC_CTRL_BASE) >> 3] = 0;
-        return 0;
+        idx = (EPC_IERR - EPC_CTRL_BASE) >> 3;
+        {
+            uint64_t value = s->epc_regs[idx];
+
+            s->epc_regs[idx] = 0;
+            return value;
+        }
     default:
         break;
     }
@@ -904,6 +1578,9 @@ static void ip19_epc_ctrl_write(SGI_IP19State *s, unsigned reg, uint64_t val)
     unsigned idx;
 
     switch (reg) {
+    case EPC_ISTAT:
+        /* ISTAT is status-only; mask updates go through IMSET/IMRST. */
+        return;
     case EPC_IMSET:
         s->epc_imask |= val;
         ip19_epc_update_irq(s);
@@ -912,15 +1589,16 @@ static void ip19_epc_ctrl_write(SGI_IP19State *s, unsigned reg, uint64_t val)
         s->epc_imask &= ~val;
         ip19_epc_update_irq(s);
         return;
-    case EPC_ISTAT:
-        s->epc_imask = val;
-        ip19_epc_update_irq(s);
+    case EPC_PRSTSET:
+        s->epc_prst |= val;
         return;
     case EPC_PRSTCLR:
+        s->epc_prst &= ~val;
+        return;
     case EPC_IERR:
-        idx = (reg - EPC_CTRL_BASE) >> 3;
-        s->epc_regs[idx] = val;
-        ip19_epc_update_irq(s);
+    case EPC_IERRC:
+        idx = (EPC_IERR - EPC_CTRL_BASE) >> 3;
+        s->epc_regs[idx] = (reg == EPC_IERRC) ? 0 : val;
         return;
     default:
         break;
@@ -933,81 +1611,133 @@ static void ip19_epc_ctrl_write(SGI_IP19State *s, unsigned reg, uint64_t val)
     }
 }
 
-static void ip19_io4_bad_ioa(SGI_IP19State *s, MemTxAttrs attrs)
+static unsigned ip19_io4_padap_type(SGI_IP19State *s, unsigned padap)
 {
-    s->io4_ebus_error |= 0x0008 | 0x0001; /* BADIOA | STICKY */
-    ip19_set_pending(s, ip19_attached_cpu(attrs), 3); /* IO4ERR_LEVEL */
+    uint64_t reg;
+
+    if (padap >= 8) {
+        return IO4_ADAP_NULL;
+    }
+    reg = s->cfg_regs[IP19_SLOT_IO4][padap < 4 ? CFG_IO4_IODEV0
+                                              : CFG_IO4_IODEV1];
+    return (reg >> ((padap & 3) * 8)) & 0xff;
+}
+
+static bool ip19_io4_padap_enabled(SGI_IP19State *s, unsigned padap)
+{
+    return padap < 8 &&
+           (s->cfg_regs[IP19_SLOT_IO4][CFG_IO4_ADAP] & (1ULL << padap));
+}
+
+static void ip19_io4_bad_ioa(SGI_IP19State *s)
+{
+    uint64_t mask = s->cfg_regs[IP19_SLOT_IO4][CFG_IO4_INTRMASK];
+    uint64_t vector = s->cfg_regs[IP19_SLOT_IO4][CFG_IO4_INTRVECTOR];
+
+    s->io4_ebus_error |= IO4_EBUSERROR_BADIOA | IO4_EBUSERROR_STICKY;
+
+    if ((mask & IO4_INTRMASK_ERROR) && !(mask & IO4_INTRMASK_DISABLE) &&
+        vector) {
+        s->io4_error_vector = vector;
+        ip19_deliver_vector(s, vector);
+    }
 }
 
 static MemTxResult ip19_io4_read(void *opaque, hwaddr addr, uint64_t *data,
                                  unsigned size, MemTxAttrs attrs)
 {
     SGI_IP19State *s = opaque;
-    uint64_t rel = addr;
-    unsigned region = (rel >> 19) & 0xf;
-    unsigned local = rel & 0xffff;
+    hwaddr abs = IP19_IO4_REGION_BASE + addr;
+    unsigned region = (abs >> 19) & 0xf;
+    unsigned padap = (addr >> 16) & 7;
+    unsigned local = addr & 0xffff;
+    unsigned type;
 
-    if (region == IP19_EPC_REGION && ((rel >> 16) & 7) == 0 &&
-        local == 0) {
-        ip19_io4_bad_ioa(s, attrs);
-        *data = ~0ULL;
-        return MEMTX_OK;
-    }
-    if (region == IP19_EPC_REGION) {
-        if (local >= EPC_DUART_BASE &&
-            local < EPC_DUART_BASE + 3 * EPC_DUART_STRIDE) {
-            unsigned duart = (local - EPC_DUART_BASE) / EPC_DUART_STRIDE;
-            unsigned ch_off = (local - EPC_DUART_BASE) % EPC_DUART_STRIDE;
-            unsigned chan = (ch_off & EPC_DUART_CHAN_A) ? 1 : 0;
-            unsigned lane = ch_off - (chan ? EPC_DUART_CHAN_A : 0);
-
-            if (lane == 0x07) {
-                *data = ip19_epc_duart_read(s, duart, chan, false);
-                return MEMTX_OK;
-            }
-            if (lane == 0x17) {
-                *data = ip19_epc_duart_read(s, duart, chan, true);
-                return MEMTX_OK;
-            }
-            *data = 0;
-            return MEMTX_OK;
-        }
-        if (local >= EPC_NVRTC_BASE && local < EPC_DUART_BASE) {
-            /*
-             * Dallas-style NVRAM/RTC. XRAM is paged: byte lane offsets
-             * (k << 3) + 7, k == 0x20 selects the page register.
-             * RTC bank at +0x200 with indirect ADDR/DATA registers.
-             */
-            unsigned nvr_off = local - EPC_NVRTC_BASE;
-            unsigned k = (nvr_off >> 3) & 0x3f;
-
-            if (nvr_off >= 0x200 && nvr_off < 0x220) {
-                if (nvr_off == 0x207) {
-                    *data = s->epc_rtc_addr;
-                } else if (nvr_off == 0x20f) {
-                    *data = s->epc_rtc_regs[s->epc_rtc_addr & 0xf];
-                } else {
-                    *data = 0;
-                }
-                return MEMTX_OK;
-            }
-            if (k == 0x20) {
-                *data = s->epc_xram_page;
-            } else {
-                *data = s->epc_nvram[((s->epc_xram_page << 5) |
-                                      (k & 0x1f)) & 0xfff];
-            }
-            return MEMTX_OK;
-        }
-        if (local >= EPC_CTRL_BASE &&
-            local < EPC_CTRL_BASE + sizeof(s->epc_regs)) {
-            *data = ip19_epc_ctrl_read(s, local & ~0x7ULL);
-            return MEMTX_OK;
-        }
-        *data = 0;
-        return MEMTX_OK;
-    }
     *data = ~0ULL;
+
+    if (region != IP19_EPC_REGION) {
+        ip19_io4_bad_ioa(s);
+        return MEMTX_OK;
+    }
+
+    type = ip19_io4_padap_type(s, padap);
+    if (padap == IP19_S1_PADAP) {
+        /*
+         * S1 is a higher-priority subregion of the machine address
+         * space.  Only holes outside its register window reach the IO4
+         * decoder.
+         */
+        if (!ip19_io4_padap_enabled(s, padap) ||
+            (type != IO4_ADAP_SCSI && type != IO4_ADAP_SCIP) ||
+            local >= IP19_S1_SIZE) {
+            ip19_io4_bad_ioa(s);
+        }
+        return MEMTX_OK;
+    }
+    if (padap != IP19_EPC_PADAP || type != IO4_ADAP_EPC ||
+        !ip19_io4_padap_enabled(s, padap)) {
+        ip19_io4_bad_ioa(s);
+        return MEMTX_OK;
+    }
+
+    if (local >= EPC_NVRTC_BASE && local < EPC_DUART_BASE) {
+        /*
+         * Dallas-style NVRAM/RTC. XRAM is paged: byte lane offsets
+         * (k << 3) + 7, k == 0x20 selects the page register.
+         * RTC bank at +0x200 with indirect ADDR/DATA registers.
+         */
+        unsigned nvr_off = local - EPC_NVRTC_BASE;
+        unsigned k = (nvr_off >> 3) & 0x3f;
+
+        if (nvr_off >= 0x200 && nvr_off < 0x220) {
+            if (nvr_off == 0x207) {
+                *data = s->epc_rtc_addr;
+            } else if (nvr_off == 0x20f) {
+                *data = ip19_epc_rtc_read_reg(s, s->epc_rtc_addr);
+            } else {
+                *data = 0;
+            }
+            return MEMTX_OK;
+        }
+        if (k == 0x20) {
+            *data = s->epc_xram_page;
+        } else {
+            *data = s->epc_nvram[((s->epc_xram_page << 5) |
+                                  (k & 0x1f)) & 0xfff];
+        }
+        return MEMTX_OK;
+    }
+    if (local >= EPC_CTRL_BASE &&
+        local < EPC_CTRL_BASE + sizeof(s->epc_regs)) {
+        *data = ip19_epc_ctrl_read(s, local & ~0x7ULL);
+        return MEMTX_OK;
+    }
+
+    if (local >= EPC_ENETPROM_BASE &&
+        local < EPC_ENETPROM_BASE + 6 * 16) {
+        /*
+         * EPC Ethernet ID PROM.  if_eeedtinit() reads 32-bit words at
+         * each 16-byte slot plus 4 and takes the low byte; the PROM
+         * uses the byte lane at +7.  Both are the same station address.
+         */
+        static const uint8_t mac[6] = {
+            0x08, 0x00, 0x69, 0x19, 0x00, 0x01, /* SGI 08:00:69 */
+        };
+        unsigned lane = local & 0xf;
+
+        unsigned slot = (local - EPC_ENETPROM_BASE) >> 4;
+
+        if ((lane == 4 || lane == 7) && slot < ARRAY_SIZE(mac)) {
+            /* if_ee reads slot 5 first, so the PROM stores MAC in reverse. */
+            *data = mac[ARRAY_SIZE(mac) - 1 - slot];
+        } else {
+            *data = 0;
+        }
+        return MEMTX_OK;
+    }
+
+    /* EPC PROM and unimplemented PBUS devices. */
+    *data = 0;
     return MEMTX_OK;
 }
 
@@ -1015,48 +1745,53 @@ static MemTxResult ip19_io4_write(void *opaque, hwaddr addr, uint64_t val,
                                   unsigned size, MemTxAttrs attrs)
 {
     SGI_IP19State *s = opaque;
-    uint64_t rel = addr;
-    unsigned region = (rel >> 19) & 0xf;
-    unsigned local = rel & 0xffff;
+    hwaddr abs = IP19_IO4_REGION_BASE + addr;
+    unsigned region = (abs >> 19) & 0xf;
+    unsigned padap = (addr >> 16) & 7;
+    unsigned local = addr & 0xffff;
+    unsigned type;
 
-    if (region == IP19_EPC_REGION && ((rel >> 16) & 7) == 0 &&
-        local == 0) {
-        ip19_io4_bad_ioa(s, attrs);
+    if (region != IP19_EPC_REGION) {
+        ip19_io4_bad_ioa(s);
         return MEMTX_OK;
     }
-    if (region == IP19_EPC_REGION) {
-        if (local >= EPC_DUART_BASE &&
-            local < EPC_DUART_BASE + 3 * EPC_DUART_STRIDE) {
-            unsigned duart = (local - EPC_DUART_BASE) / EPC_DUART_STRIDE;
-            unsigned ch_off = (local - EPC_DUART_BASE) % EPC_DUART_STRIDE;
-            unsigned chan = (ch_off & EPC_DUART_CHAN_A) ? 1 : 0;
-            unsigned lane = ch_off - (chan ? EPC_DUART_CHAN_A : 0);
 
-            if (lane == 0x07) {
-                ip19_epc_duart_write(s, duart, chan, false, val & 0xff);
-            } else if (lane == 0x17) {
-                ip19_epc_duart_write(s, duart, chan, true, val & 0xff);
-            }
-        } else if (local >= EPC_NVRTC_BASE && local < EPC_DUART_BASE) {
-            unsigned nvr_off = local - EPC_NVRTC_BASE;
-            unsigned k = (nvr_off >> 3) & 0x3f;
-
-            if (nvr_off >= 0x200 && nvr_off < 0x220) {
-                if (nvr_off == 0x207) {
-                    s->epc_rtc_addr = val & 0xff;
-                } else if (nvr_off == 0x20f) {
-                    s->epc_rtc_regs[s->epc_rtc_addr & 0xf] = val & 0xff;
-                }
-            } else if (k == 0x20) {
-                s->epc_xram_page = val & 0xff;
-            } else {
-                s->epc_nvram[((s->epc_xram_page << 5) |
-                              (k & 0x1f)) & 0xfff] = val & 0xff;
-            }
-        } else if (local >= EPC_CTRL_BASE &&
-                   local < EPC_CTRL_BASE + sizeof(s->epc_regs)) {
-            ip19_epc_ctrl_write(s, local & ~0x7ULL, val);
+    type = ip19_io4_padap_type(s, padap);
+    if (padap == IP19_S1_PADAP) {
+        if (!ip19_io4_padap_enabled(s, padap) ||
+            (type != IO4_ADAP_SCSI && type != IO4_ADAP_SCIP) ||
+            local >= IP19_S1_SIZE) {
+            ip19_io4_bad_ioa(s);
         }
+        return MEMTX_OK;
+    }
+    if (padap != IP19_EPC_PADAP || type != IO4_ADAP_EPC ||
+        !ip19_io4_padap_enabled(s, padap)) {
+        ip19_io4_bad_ioa(s);
+        return MEMTX_OK;
+    }
+
+    if (local >= EPC_NVRTC_BASE && local < EPC_DUART_BASE) {
+        unsigned nvr_off = local - EPC_NVRTC_BASE;
+        unsigned k = (nvr_off >> 3) & 0x3f;
+
+        if (nvr_off >= 0x200 && nvr_off < 0x220) {
+            if (nvr_off == 0x207) {
+                s->epc_rtc_addr = val & 0xff;
+            } else if (nvr_off == 0x20f) {
+                ip19_epc_rtc_write_reg(s, s->epc_rtc_addr, val & 0xff);
+            }
+        } else if (k == 0x20) {
+            s->epc_xram_page = val & 0xff;
+        } else {
+            s->epc_nvram[((s->epc_xram_page << 5) |
+                          (k & 0x1f)) & 0xfff] = val & 0xff;
+        }
+        return MEMTX_OK;
+    }
+    if (local >= EPC_CTRL_BASE &&
+        local < EPC_CTRL_BASE + sizeof(s->epc_regs)) {
+        ip19_epc_ctrl_write(s, local & ~0x7ULL, val);
     }
     return MEMTX_OK;
 }
@@ -1221,35 +1956,15 @@ static void ip19_cfg_defaults(SGI_IP19State *s, MachineState *machine)
         s->cfg_regs[IP19_SLOT_CPU][base + CFG_PROC_CACHE_SZ] = mem_size_code;
     }
 
-    /* MC3 on slot 1 */
-    s->cfg_regs[IP19_SLOT_MC3][CFG_BOARD_ENABLE] = 0x01;
-    s->cfg_regs[IP19_SLOT_MC3][CFG_BOARD_TYPE] = 0x09; /* MC3 */
-    s->cfg_regs[IP19_SLOT_MC3][CFG_BOARD_LEVEL] = 0x01;
-    s->cfg_regs[IP19_SLOT_MC3][CFG_MC3_TYPE] = 0x02;
-    s->cfg_regs[IP19_SLOT_MC3][CFG_MC3_REVLEVEL] = 0x03;
-    s->cfg_regs[IP19_SLOT_MC3][CFG_MC3_BISTRESULT] = 0;
-    s->cfg_regs[IP19_SLOT_MC3][CFG_MC3_LEAFCTLENB] = 0x0f;
-    s->cfg_regs[IP19_SLOT_MC3][CFG_MC3_BANKENB] = 0x01;
-    /* Bring-up uses one 256 MiB bank until bank interleave is modelled. */
-    for (unsigned leaf = 0; leaf < 2; leaf++) {
-        for (unsigned bank = 0; bank < 4; bank++) {
-            s->cfg_regs[IP19_SLOT_MC3][CFG_MC3_BANK(leaf, bank,
-                                                   MC3_BANK_SIZE)] =
-                MC3_NOBANK;
-        }
-    }
-    s->cfg_regs[IP19_SLOT_MC3][CFG_MC3_BANK(0, 0, MC3_BANK_SIZE)] =
-        mem_size_code;
-    s->cfg_regs[IP19_SLOT_MC3][CFG_MC3_BANK(0, 0, MC3_BANK_BASE)] = 0x00;
-    s->cfg_regs[IP19_SLOT_MC3][CFG_MC3_BANK(0, 0, MC3_BANK_IF)] = 0x00;
-    s->cfg_regs[IP19_SLOT_MC3][CFG_MC3_BANK(0, 0, MC3_BANK_IP)] = 0x00;
-
     /* IO4 on slot 2 */
     s->cfg_regs[IP19_SLOT_IO4][CFG_BOARD_ENABLE] = 0x01;
     s->cfg_regs[IP19_SLOT_IO4][CFG_BOARD_TYPE] = 0x0a; /* IO4 */
-    s->cfg_regs[IP19_SLOT_IO4][CFG_BOARD_LEVEL] = 0x01;
-    s->cfg_regs[IP19_SLOT_IO4][CFG_IO4_REVTYPE] =
-        (IO4_REV_LEVEL << 4) | IO4_TYPE_VALUE;
+    s->cfg_regs[IP19_SLOT_IO4][CFG_BOARD_LEVEL] = 0x21;
+    s->io4_lw = IP19_EPC_REGION;
+    s->io4_sw = (uint64_t)IP19_EPC_REGION << 8;
+    s->cfg_regs[IP19_SLOT_IO4][CFG_IO4_ADAP] =
+        (1ULL << IP19_EPC_PADAP) | (1ULL << IP19_S1_PADAP);
+    s->cfg_regs[IP19_SLOT_IO4][CFG_IO4_INTRMASK] = IO4_INTRMASK_ERROR;
     /* IODEV bytes are indexed by physical adapter number. */
     s->cfg_regs[IP19_SLOT_IO4][CFG_IO4_IODEV0] = IO4_ADAP_EPC << 8;
     s->cfg_regs[IP19_SLOT_IO4][CFG_IO4_IODEV1] = IO4_ADAP_SCSI;
@@ -1332,6 +2047,26 @@ static void sgi_ip19_init(MachineState *machine)
         MIPSCPU *cpu = mips_cpu_create_with_clock(machine->cpu_type, cpuclk,
                                                   TARGET_BIG_ENDIAN);
 
+        /*
+         * IRIX 6.5.22 IP19 reaches the K2 refill handler before any
+         * KPTE/kptbl TLB entry is wired.  Let the CPU synthesize that
+         * entry for this machine only; Indy's R4000SC stays unchanged.
+         */
+        cpu->ip19_kpte_workaround = true;
+        /*
+         * IP19 uses R4000/R4400 CPUs whose Context and XContext have a
+         * shared PTEBase field.  IRIX 6.5.22 writes the KPTE base only to
+         * Context, while its utlbmiss handler reads XContext; model the
+         * shared field for this machine only.
+         */
+        cpu->ip19_pte_base_shared = true;
+        /*
+         * Route K1 (uncached) accesses to the IO4 small window to the
+         * private alias, leaving cached references to 0x10080000.. as
+         * ordinary RAM on 512 MiB machines.
+         */
+        cpu->ip19_io4_window = true;
+        cpu->env.CP0_PRid = IP19_CPU_PRID;
         CPU(cpu)->cpu_index = i;
         cpu->env.CP0_Config0 &= ~(1U << 17);
         cpu_mips_irq_init_cpu(cpu);
@@ -1341,16 +2076,52 @@ static void sgi_ip19_init(MachineState *machine)
         }
     }
 
-    qemu_chr_fe_init(&s->chr, serial_hd(0), &error_abort);
-    qemu_chr_fe_set_handlers(&s->chr, ip19_epc_can_receive, ip19_epc_receive,
-                             ip19_epc_event, NULL, s, NULL, true);
+    for (i = 0; i < 3; i++) {
+        qemu_irq irq;
+
+        s->epc_duart[i] = sgi_z8530_create(i == 2 ? serial_hd(0) : NULL,
+                                           NULL);
+        irq = qemu_allocate_irq(ip19_epc_duart_irq, s, i);
+        qdev_connect_gpio_out_named(DEVICE(s->epc_duart[i]), "irq", 0, irq);
+    }
+    s->cc_uart_chr = serial_hd(0);
+    s->epc_prst = 0;
     s->cc_uart_rx = 0;
     s->cc_uart_rx_ready = false;
     s->rtc_epoch_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+    s->epc_rtc_base_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+    s->epc_rtc_base_sec = (int64_t)time(NULL);
+    memset(s->epc_rtc_regs, 0, sizeof(s->epc_rtc_regs));
+    s->epc_rtc_regs[NVR_RTCA] = NVR_OSC_ON;
+    s->epc_rtc_regs[NVR_RTCB] = NVR_DM | NVR_MILTIME;
+    s->epc_rtc_regs[NVR_RTCD] = NVR_VRT;
+    g_strlcpy(s->sysctlr_serial, "S1234567", sizeof(s->sysctlr_serial));
+    ip19_epc_nvram_defaults(s);
 
-    memory_region_add_subregion(sysmem, 0, machine->ram);
+    for (i = 0; i < IP19_MAX_CPUS; i++) {
+        s->cmp_ctx[i].s = s;
+        s->cmp_ctx[i].cpu = i;
+        s->cmp_timer[i] = timer_new_ns(QEMU_CLOCK_HOST, ip19_cmp_expire,
+                                       &s->cmp_ctx[i]);
+    }
 
-    memory_region_init_rom(&s->prom, NULL, "ip19.prom", IP19_PROM_SIZE,
+    s->mc3 = sgi_mc3_create(machine->ram, machine->ram_size,
+                            SGI_MC3_INTLV_STABLE);
+    /*
+     * MC3 memory spans the low physical window, but the CC, IO4, GIO,
+     * EAROM and PROM devices also decode inside it.  Keep the memory
+     * region below those device windows so their subregions win no
+     * matter which order the machine's regions are added in.
+     */
+    memory_region_add_subregion_overlap(sysmem, 0,
+                                        sgi_mc3_memory_region(s->mc3), -1);
+
+    /*
+     * Keep the PROM in writable RAM: the kernel treats all low physical
+     * memory as usable, including the PROM window, and DMA/cached
+     * references must reach the same bytes as code fetch and K1 accesses.
+     */
+    memory_region_init_ram(&s->prom, NULL, "ip19.prom", IP19_PROM_SIZE,
                            &error_fatal);
     memory_region_add_subregion(sysmem, IP19_PROM_BASE, &s->prom);
     {
@@ -1370,8 +2141,10 @@ static void sgi_ip19_init(MachineState *machine)
                           IP19_LWIN_SIZE);
     memory_region_add_subregion(sysmem, IP19_LWIN_BASE, &s->lwin);
 
-    memory_region_init_ram(&s->flash, NULL, "ip19.flash", IP19_FLASH_SIZE,
-                           &error_fatal);
+    s->flash_data = g_malloc(IP19_FLASH_SIZE);
+    memset(s->flash_data, 0xff, IP19_FLASH_SIZE);
+    memory_region_init_io(&s->flash, NULL, &ip19_flash_ops, s, "ip19.flash",
+                          IP19_FLASH_SIZE);
     memory_region_add_subregion(sysmem, IP19_FLASH_BASE, &s->flash);
     memory_region_init_alias(&s->flash_alias, NULL, "ip19.flash-lwin-lo",
                              &s->flash, 0, 0x80000);
@@ -1384,57 +2157,98 @@ static void sgi_ip19_init(MachineState *machine)
             qemu_find_file(QEMU_FILE_TYPE_BIOS, "io4prom.bin");
 
         if (filename) {
-            load_image_targphys(filename, IP19_FLASH_BASE, IP19_FLASH_SIZE,
-                                NULL);
+            g_autofree gchar *buf = NULL;
+            gsize len = 0;
 
+            if (g_file_get_contents(filename, &buf, &len, NULL)) {
+                memcpy(s->flash_data, buf, MIN(len, IP19_FLASH_SIZE));
+            }
         }
     }
 
     memory_region_init_io(&s->cc, NULL, &ip19_cc_ops, s, "ip19.cc",
                           IP19_CC_SIZE);
-    memory_region_add_subregion(sysmem, IP19_CC_BASE, &s->cc);
+    memory_region_add_subregion(sysmem, IP19_LOCAL_ALIAS(IP19_CC_BASE), &s->cc);
 
     ip19_cfg_defaults(s, machine);
     memory_region_init_io(&s->cfg, NULL, &ip19_cfg_ops, s, "ip19.cfg",
                           IP19_CFG_SIZE);
-    memory_region_add_subregion(sysmem, IP19_CFG_BASE, &s->cfg);
+    memory_region_add_subregion(&s->cfg, IP19_SLOT_MC3 << 11,
+                                sgi_mc3_config_region(s->mc3));
+    memory_region_add_subregion(sysmem, IP19_LOCAL_ALIAS(IP19_CFG_BASE), &s->cfg);
 
     memory_region_init_ram(&s->bustag, NULL, "ip19.bustag",
                            IP19_BUSTAG_SIZE, &error_fatal);
-    memory_region_add_subregion(sysmem, IP19_BUSTAG_BASE, &s->bustag);
+    memory_region_add_subregion(sysmem, IP19_LOCAL_ALIAS(IP19_BUSTAG_BASE), &s->bustag);
 
     memory_region_init_io(&s->wginput, NULL, &ip19_ram_ops, s, "ip19.wginput",
                           IP19_WGINPUT_SIZE);
-    memory_region_add_subregion(sysmem, IP19_WGINPUT_BASE, &s->wginput);
+    memory_region_add_subregion(sysmem, IP19_LOCAL_ALIAS(IP19_WGINPUT_BASE), &s->wginput);
 
     memory_region_init_io(&s->rtc, NULL, &ip19_rtc_ops, s, "ip19.rtc",
                           IP19_RTC_SIZE);
-    memory_region_add_subregion(sysmem, IP19_RTC_BASE, &s->rtc);
+    memory_region_add_subregion(sysmem, IP19_LOCAL_ALIAS(IP19_RTC_BASE), &s->rtc);
 
     ip19_earom_defaults(s);
     memory_region_init_io(&s->earom, NULL, &ip19_earom_ops, s, "ip19.earom",
                           IP19_EAROM_SIZE);
-    memory_region_add_subregion(sysmem, IP19_EAROM_BASE, &s->earom);
+    memory_region_add_subregion(sysmem, IP19_LOCAL_ALIAS(IP19_EAROM_BASE), &s->earom);
 
     memory_region_init_io(&s->led, NULL, &ip19_ram_ops, s, "ip19.led",
                           IP19_LED_SIZE);
-    memory_region_add_subregion(sysmem, IP19_LED_BASE, &s->led);
+    memory_region_add_subregion(sysmem, IP19_LOCAL_ALIAS(IP19_LED_BASE), &s->led);
 
     memory_region_init_io(&s->sync, NULL, &ip19_sync_ops, s, "ip19.sync",
                           IP19_SYNC_SIZE);
-    memory_region_add_subregion(sysmem, IP19_SYNC_BASE, &s->sync);
+    memory_region_add_subregion(sysmem, IP19_LOCAL_ALIAS(IP19_SYNC_BASE), &s->sync);
 
     memory_region_init_io(&s->io4, NULL, &ip19_io4_ops, s, "ip19.io4",
                           IP19_IO4_SIZE);
-    memory_region_add_subregion(sysmem, IP19_IO4_BASE, &s->io4);
+    for (i = 0; i < 3; i++) {
+        memory_region_add_subregion(&s->io4,
+            (IP19_EPC_PADAP << 16) + EPC_DUART_BASE +
+            i * EPC_DUART_STRIDE,
+            sgi_z8530_memory_region(s->epc_duart[i]));
+    }
+    memory_region_add_subregion(sysmem, IP19_IO4_REGION_BASE, &s->io4);
 
-    sgi_s1_attach(sysmem, IP19_S1_BASE, blk_by_name("ip19disk"),
-                  blk_by_name("ip19cdrom"), blk_by_name("ip19cdrom2"));
+    s->s1 = sgi_s1_attach(sysmem, IP19_S1_BASE, blk_by_name("ip19disk"),
+                          blk_by_name("ip19cdrom"), blk_by_name("ip19cdrom2"));
+    {
+        qemu_irq irq = qemu_allocate_irq(ip19_s1_irq, s, 0);
+
+        qdev_connect_gpio_out_named(DEVICE(s->s1), "sysbus-irq", 0, irq);
+    }
 
 
     memory_region_init_io(&s->gio, NULL, &ip19_gio_ops, s, "ip19.gio",
                           IP19_GIO_SIZE);
-    memory_region_add_subregion(sysmem, IP19_GIO_BASE, &s->gio);
+    memory_region_add_subregion(sysmem, IP19_LOCAL_ALIAS(IP19_GIO_BASE), &s->gio);
+}
+
+static void sgi_ip19_reset(MachineState *machine, ResetType type)
+{
+    SGI_IP19State *s = SGI_IP19_MACHINE(machine);
+    CPUState *cs;
+    int i;
+
+    qemu_devices_reset(type);
+
+    for (i = 0; i < IP19_MAX_CPUS; i++) {
+        if (s->cmp_timer[i]) {
+            timer_del(s->cmp_timer[i]);
+        }
+        s->cmpint[i] = false;
+        s->cmpreg[i] = 0;
+    }
+
+    /*
+     * mips_cpu_reset_hold() restores CP0 PRId from the CPU model.  Keep
+     * the IP19 revision visible after every machine reset as well.
+     */
+    CPU_FOREACH(cs) {
+        MIPS_CPU(cs)->env.CP0_PRid = IP19_CPU_PRID;
+    }
 }
 
 static void sgi_ip19_class_init(ObjectClass *oc, const void *data)
@@ -1443,6 +2257,7 @@ static void sgi_ip19_class_init(ObjectClass *oc, const void *data)
 
     mc->desc = "SGI IP19 (Everest Challenge/Onyx)";
     mc->init = sgi_ip19_init;
+    mc->reset = sgi_ip19_reset;
     mc->max_cpus = IP19_MAX_CPUS;
     mc->default_cpus = 1;
     mc->default_cpu_type = MIPS_CPU_TYPE_NAME("R4000SC");

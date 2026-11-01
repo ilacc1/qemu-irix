@@ -859,6 +859,20 @@ void helper_dmtc0_entrylo1(CPUMIPSState *env, uint64_t arg1)
 void helper_mtc0_context(CPUMIPSState *env, target_ulong arg1)
 {
     env->CP0_Context = (env->CP0_Context & 0x007FFFFF) | (arg1 & ~0x007FFFFF);
+#if defined(TARGET_MIPS64)
+    /*
+     * IP19 uses R4000/R4400 parts, where Context and XContext do not have
+     * independent PTEBase fields.  IRIX 6.5.22 programs only Context (to
+     * KPTEBASE << 2) and its refill handler reads XContext, so mirror the
+     * shared PTEBase bits.  Keep every other CPU model unchanged.
+     */
+    if (env_archcpu(env)->ip19_pte_base_shared) {
+        target_ulong mask = (~0ULL) << (env->SEGBITS - 7);
+
+        env->CP0_XContext = (env->CP0_XContext & ~mask) |
+                            (env->CP0_Context & mask);
+    }
+#endif
 }
 
 void helper_mtc0_memorymapid(CPUMIPSState *env, target_ulong arg1)
@@ -1347,6 +1361,12 @@ void helper_mtc0_xcontext(CPUMIPSState *env, target_ulong arg1)
 {
     target_ulong mask = (1ULL << (env->SEGBITS - 7)) - 1;
     env->CP0_XContext = (env->CP0_XContext & mask) | (arg1 & ~mask);
+#if defined(TARGET_MIPS64)
+    if (env_archcpu(env)->ip19_pte_base_shared) {
+        env->CP0_Context = (env->CP0_Context & mask) |
+                           (env->CP0_XContext & ~mask);
+    }
+#endif
 }
 
 void helper_mtc0_framemask(CPUMIPSState *env, target_ulong arg1)

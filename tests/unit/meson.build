@@ -174,6 +174,17 @@ if have_ga and host_os == 'linux'
   test_deps += {'test-qga': qga}
 endif
 
+if have_system
+  test_sgi_mc3 = executable('test-sgi-mc3',
+    ['test-sgi-mc3.c', 'test-sgi-mc3-stubs.c',
+     meson.project_source_root() / 'hw/mips/sgi_mc3.c', genh],
+    dependencies: [qemuutil, qom, hwcore])
+  test_sgi_z8530 = executable('test-sgi-z8530',
+    ['test-sgi-z8530.c', 'test-sgi-z8530-stubs.c',
+     meson.project_source_root() / 'hw/mips/sgi_z8530.c', genh],
+    dependencies: [qemuutil, qom, hwcore])
+endif
+
 test_env = environment()
 test_env.set('G_TEST_SRCDIR', meson.current_source_dir())
 test_env.set('G_TEST_BUILDDIR', meson.current_build_dir())
@@ -215,3 +226,18 @@ foreach test_name, extra: tests
        suite: ['unit'] +
               (slow_tests.has_key(test_name) ? ['slow'] : []))
 endforeach
+
+if have_system
+  test('test-sgi-mc3', test_sgi_mc3,
+       env: test_env,
+       args: ['--tap', '-k'],
+       protocol: 'tap',
+       timeout: 30,
+       suite: ['unit'])
+  test('test-sgi-z8530', test_sgi_z8530,
+       env: test_env,
+       args: ['--tap', '-k'],
+       protocol: 'tap',
+       timeout: 30,
+       suite: ['unit'])
+endif
