@@ -2456,6 +2456,7 @@ static void ip19_preload_io4_segments(const char *filename)
 }
 
 extern uint64_t sgi_idle_pc;
+extern int sgi_idle_on;
 extern int sgi_idle_sleep;
 
 /*
@@ -2533,6 +2534,12 @@ static void sgi_ip19_init(MachineState *machine)
      * machines.
      */
     sgi_idle_pc = 0xa8000000000ea174ULL;
+    /*
+     * The IP19 local_idle halt/sleep path can lose the CC scheduler
+     * clock on both CPUs.  Leave it disabled by default; IP19_IDLE=1
+     * enables the old experimental path for testing.
+     */
+    sgi_idle_on = g_getenv("IP19_IDLE") != NULL;
     {
         const char *idle_sleep = g_getenv("SGI_IDLE_SLEEP");
 
@@ -2596,7 +2603,8 @@ static void sgi_ip19_init(MachineState *machine)
         irq = qemu_allocate_irq(ip19_epc_duart_irq, s, i);
         qdev_connect_gpio_out_named(DEVICE(s->epc_duart[i]), "irq", 0, irq);
     }
-    s->cc_uart_chr = serial_hd(0);
+    /* CC UART is a sysctlr command channel, not the user console. */
+    s->cc_uart_chr = NULL;
     s->epc_prst = 0;
     s->cc_uart_rx = 0;
     s->cc_uart_rx_ready = false;
