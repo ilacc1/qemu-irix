@@ -38,16 +38,7 @@ TAP_IF="${IRIX_TAP_IF:-tap-iris}"
 MTTCG="${IRIX_MTTCG:-1}"
 
 if [ -z "$DISK" ]; then
-  for candidate in "$DIR/../ip19-yoda2.raw" "$DIR/ip19-yoda2.raw"; do
-    if [ -f "$candidate" ]; then
-      DISK="$candidate"
-      DISK_FORMAT=raw
-      break
-    fi
-  done
-fi
-if [ -z "$DISK" ]; then
-  for candidate in "$DIR/ip19-installed.chd" "$DIR/../ip19-installed.chd"; do
+  for candidate in "$DIR/ip19-main.chd" "$DIR/../ip19-main.chd"; do
     if [ -f "$candidate" ]; then
       DISK="$candidate"
       DISK_FORMAT=chd
@@ -56,7 +47,7 @@ if [ -z "$DISK" ]; then
   done
 fi
 if [ -z "$DISK" ]; then
-  echo "ERROR: no Challenge disk found; set IRIX_DISK." >&2
+  echo "ERROR: main Challenge image ip19-main.chd not found; set IRIX_DISK." >&2
   exit 1
 fi
 

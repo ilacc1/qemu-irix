@@ -46,19 +46,9 @@ if not defined BIOS (
 for %%F in ("%BIOS%") do set "BIOS_DIR=%%~dpF"
 
 if not "%IRIX_DISK%"=="" set "DISK=%IRIX_DISK%"
-if "%DISK%"=="" if exist "%BASE%ip19-yoda2-java.chd" set "DISK=%BASE%ip19-yoda2-java.chd"
-if "%DISK%"=="" if exist "%BASE%..\ip19-yoda2-java.chd" set "DISK=%BASE%..\ip19-yoda2-java.chd"
-if "%DISK%"=="" if exist "%BASE%ip19-installed.chd" set "DISK=%BASE%ip19-installed.chd"
-if "%DISK%"=="" if exist "%BASE%..\ip19-installed.chd" set "DISK=%BASE%..\ip19-installed.chd"
-if "%DISK%"=="" if exist "%BASE%..\..\ip19-installed.chd" set "DISK=%BASE%..\..\ip19-installed.chd"
-if "%DISK%"=="" if exist "%BASE%..\ip19-yoda2.raw" (
-    set "DISK=%BASE%..\ip19-yoda2.raw"
-    set "IRIX_DISK_FORMAT=raw"
-)
-if "%DISK%"=="" if exist "%BASE%..\..\ip19-yoda2.raw" (
-    set "DISK=%BASE%..\..\ip19-yoda2.raw"
-    set "IRIX_DISK_FORMAT=raw"
-)
+if "%DISK%"=="" if exist "%BASE%ip19-main.chd" set "DISK=%BASE%ip19-main.chd"
+if "%DISK%"=="" if exist "%BASE%..\ip19-main.chd" set "DISK=%BASE%..\ip19-main.chd"
+if "%DISK%"=="" set "DISK=%BASE%ip19-main.chd"
 if not "%IRIX_SMP%"=="" set "SMP=%IRIX_SMP%"
 if "%SMP%"=="" set "SMP=2"
 if not "%IRIX_RAM%"=="" set "RAM=%IRIX_RAM%"
