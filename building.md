@@ -28,8 +28,8 @@ the SGI/IP24 support and the CHD block driver added (branch
 qemu-irix/
 ├── readme.md
 ├── building.md
-├── run-irix.sh              # Linux launcher
-├── run-irix.bat             # Windows launcher
+├── run-indy.sh              # Linux launcher
+├── run-indy.bat             # Windows launcher
 ├── build.sh                 # Linux configure + build helper
 ├── build.bat                # Windows configure + build helper (MSYS2)
 ├── sgi/                      # SGI firmware and NVRAM seeds
@@ -53,8 +53,8 @@ attached as the install/overlay CD:
 | File | Purpose | Where it goes |
 |------|---------|---------------|
 | `ip24prom.070-9101-011.bin` | IP24 PROM BIOS (bios set `b10`, the `indy_4020` default), 524288 bytes | In the repo: `sgi/indy/` |
-| `A CHD image of Irix` | The bootable IRIX 6.5 disk (CHD format) | You supply it; path set via `IRIX_DISK` (Linux) or `IRIX_DISK`/`DISK` in `run-irix.bat` |
-| CDROM ISO (optional) | CD on SCSI ID 4 (drive always present; media loaded when configured) | Anywhere; path set via `IRIX_CDROM` (Linux) or `CDROM` in `run-irix.bat` |
+| `A CHD image of Irix` | The bootable IRIX 6.5 disk (CHD format) | You supply it; path set via `IRIX_DISK` (Linux) or `IRIX_DISK`/`DISK` in `run-indy.bat` |
+| CDROM ISO (optional) | CD on SCSI ID 4 (drive always present; media loaded when configured) | Anywhere; path set via `IRIX_CDROM` (Linux) or `CDROM` in `run-indy.bat` |
 | `nvram/{eeprom,rtc}` | PROM NVRAM seed (IP24 uses a DS1386 8 KiB RTC) | In the repo: `sgi/indy/nvram/`; seeded automatically into `build/nvram/indy_4020/` on first run |
 
 The PROM image is the `ip24prom.070-9101-011.bin` member of the MAME
@@ -164,7 +164,7 @@ Notes on the options:
 - `--target-list=mips64-softmmu` — build only the MIPS64 system emulator,
   which is where the `indy` machine lives. Building one target keeps the build
   small and fast.
-- `--enable-gtk` — the graphical window used by `run-irix.sh`.
+- `--enable-gtk` — the graphical window used by `run-indy.sh`.
 - `--disable-werror` — do not turn warnings into errors. Recommended, since a
   newer host compiler may warn about upstream code.
 - `--disable-docs` — skip Sphinx documentation (not needed to run).
@@ -209,7 +209,7 @@ into place and point the launcher at it:
 ```sh
 # from the repository root
 cp /path/to/irix65_4020.chd ~/irix65_4020.chd
-IRIX_DISK=~/irix65_4020.chd ./run-irix.sh
+IRIX_DISK=~/irix65_4020.chd ./run-indy.sh
 ```
 
 NVRAM is seeded automatically on first run from
@@ -218,7 +218,7 @@ NVRAM is seeded automatically on first run from
 ### 2.5 Run
 
 ```sh
-./run-irix.sh
+./run-indy.sh
 ```
 
 This launches QEMU with the Indy machine, the PROM, the CHD disk on SCSI ID 1,
@@ -281,14 +281,14 @@ pacman -S --needed \
     mingw-w64-x86_64-gtk3
 ```
 
-`run-irix.bat` finds your MSYS2 through the `MSYS2_ROOT` environment
+`run-indy.bat` finds your MSYS2 through the `MSYS2_ROOT` environment
 variable and falls back to `msys64` next to the script. If your MSYS2
 lives anywhere else, set it before running the launcher, e.g. in
 `cmd.exe`:
 
 ```
 set MSYS2_ROOT=C:\msys64
-run-irix.bat
+run-indy.bat
 ```
 
 (or set it permanently under System Properties → Environment Variables).
@@ -393,16 +393,16 @@ The result is `build\qemu-system-mips64.exe`.
 The PROM and NVRAM seeds already ship in `sgi/indy/`; no copy step is
 needed. Put your IRIX 6.5 disk image wherever you like and point the
 launcher at it with `IRIX_DISK`. The default is `irix65_4020.chd` next to
-`run-irix.bat`.
+`run-indy.bat`.
 
 ### 3.6 Run
 
-`run-irix.bat` is the packaged launcher. It expects the release layout
+`run-indy.bat` is the packaged launcher. It expects the release layout
 produced by `release.bat`, with the source build under `qemu\`:
 
 ```
 qemu-irix\
-├── run-irix.bat
+├── run-indy.bat
 ├── install.bat
 ├── msys64\                 # GTK/SDL runtime DLLs
 ├── sgi\indy\...            # PROM and NVRAM seeds
@@ -412,7 +412,7 @@ qemu-irix\
 From a **`cmd.exe`** prompt in that directory:
 
 ```
-run-irix.bat
+run-indy.bat
 ```
 
 It looks for MSYS2 in `%MSYS2_ROOT%`, else falls back to `msys64` next to
@@ -433,10 +433,10 @@ the script. It uses:
 The launcher also sets `SGI_GFX_SYNC`, `SGI_WD_SYNC`, and `SGI_CHD_SYNC` to
 `0` unless already defined, which keeps the asynchronous worker paths on.
 
-Edit the paths at the top of `run-irix.bat` if your layout differs.
+Edit the paths at the top of `run-indy.bat` if your layout differs.
 
 A plain source checkout builds into `build\` at the top level, so
-`run-irix.bat` does not find the binary there. Use the direct command in
+`run-indy.bat` does not find the binary there. Use the direct command in
 section 3.7 for a smoke test, or run `release.bat` to produce the packaged
 layout.
 
@@ -467,7 +467,7 @@ Check the binary reports the `indy` machine:
   re-run `./configure`. Delete `build/` first if you are changing options.
 - **`nettle_gcm_digest` error on Windows.** You are missing
   `--disable-nettle --disable-gcrypt --disable-gnutls`; see section 3.2.
-- **`qemu-system-mips64` not found by `run-irix.sh`.** Build it first
+- **`qemu-system-mips64` not found by `run-indy.sh`.** Build it first
   (section 2.3); the launcher checks for it and prints this reminder.
 - **No window / no display.** Without GTK, run with `-display none` (headless)
   and drive the guest through the PIO Telnet console and the monitor.
@@ -488,7 +488,7 @@ Linux:
 sudo apt-get install -y git build-essential python3 python3-venv \
     ninja-build meson pkg-config libglib2.0-dev libpixman-1-dev libgtk-3-dev
 ./build.sh
-IRIX_DISK=/path/to/irix65_4020.chd ./run-irix.sh
+IRIX_DISK=/path/to/irix65_4020.chd ./run-indy.sh
 ```
 
 Windows (MSYS2 MINGW64 shell):
@@ -503,4 +503,4 @@ build.bat
 ```
 
 then (from `cmd.exe`, with `IRIX_DISK` set to your IRIX 6.5 CHD)
-`run-irix.bat`.
+`run-indy.bat`.

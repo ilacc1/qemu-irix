@@ -60,7 +60,7 @@
 # "wav"/"none"/"off", see above), IRIX_AUDIO_WAV (default run/chime.wav).
 # IRIX_ESCC_LOG: set to a directory to capture the two ESCC serial
 # ports (kernel serial console) to files there, e.g.
-#   IRIX_ESCC_LOG=run/escc ./run-irix.sh
+#   IRIX_ESCC_LOG=run/escc ./run-indy.sh
 # then in the PROM Command Monitor: `setenv console d`, then `boot`.
 # IRIX_ESCC_SOCK: path of a unix socket for the second ESCC port, so the
 # guest's serial console can be driven from the host.
@@ -75,7 +75,7 @@
 #                    shutdown can leave the overlay inconsistent.  Delete
 #                    the overlay to start over; IRIX_DISK_OVERLAY names
 #                    it.
-# Extra QEMU args may be appended: ./run-irix.sh -d guest_errors
+# Extra QEMU args may be appended: ./run-indy.sh -d guest_errors
 #
 # Tuning switches (value-based; 0 and unset both mean "offload enabled"):
 # The launcher pins all three to 0 (async worker threads) unless already
@@ -110,13 +110,13 @@ MACHINE=${IRIX_MACHINE:-indy}
 # bios set b10 = index 0 = MAME indy_4020's default BIOS.
 BIOS_IMAGE=${IRIX_BIOS:-ip24prom.070-9101-011.bin}
 # Optional CD image (SCSI ID 4). Leave IRIX_CDROM unset for no CD, e.g.:
-#   IRIX_DISK=~/irix65_4020.chd IRIX_CDROM=~/overlay.iso ./run-irix.sh
+#   IRIX_DISK=~/irix65_4020.chd IRIX_CDROM=~/overlay.iso ./run-indy.sh
 CDROM_ISO=${IRIX_CDROM:-}
 PIO_TELNET_PORT=${IRIX_TELNET_PORT:-4444}
 MON_SOCK=${IRIX_MONITOR:-$ROOT_DIR/run/mon.sock}
 # The disk image is supplied by the user (not distributed with this
 # repository): point IRIX_DISK at your IRIX 6.5 CHD for the Indy, e.g.
-#   IRIX_DISK=~/irix65_4020.chd ./run-irix.sh
+#   IRIX_DISK=~/irix65_4020.chd ./run-indy.sh
 # A file named irix65_4020.chd next to this script is used by default.
 DISK=${IRIX_DISK:-$ROOT_DIR/../irix53.chd}
 

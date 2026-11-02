@@ -11,8 +11,8 @@
 #   ./install.sh
 #
 # The IRIX disk image itself is NOT included: put irix65_4020.chd next
-# to run-irix.sh, or point IRIX_DISK at it, e.g.
-#   IRIX_DISK=~/irix65_4020.chd ./run-irix.sh
+# to run-indy.sh, or point IRIX_DISK at it, e.g.
+#   IRIX_DISK=~/irix65_4020.chd ./run-indy.sh
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -35,7 +35,7 @@ if [ -n "$STILL_MISSING" ]; then
 fi
 echo "All runtime libraries present (bundled lib/)."
 
-chmod +x "$BIN" run-irix.sh install.sh 2>/dev/null || true
+chmod +x "$BIN" run-indy.sh run-challenge.sh install.sh 2>/dev/null || true
 
 if [ ! -f sgi/indy/ip24prom.070-9101-011.bin ]; then
     echo "ERROR: sgi/indy/ip24prom.070-9101-011.bin missing - re-extract the tarball." >&2
@@ -45,9 +45,13 @@ if [ ! -f sgi/indy/nvram/rtc ]; then
     echo "ERROR: sgi/indy/nvram/rtc missing - re-extract the tarball." >&2
     exit 1
 fi
+if [ ! -f sgi/challenge/ip19prom.bin ]; then
+    echo "ERROR: sgi/challenge/ip19prom.bin missing - re-extract the tarball." >&2
+    exit 1
+fi
 
 # Bridged networking needs a TAP interface owned by you (default tap-iris).
-# This only REPORTS; setup is documented in networking.md. run-irix.sh
+# This only REPORTS; setup is documented in networking.md. run-indy.sh
 # boots without networking when the TAP is absent; use IRIX_NETMODE=user
 # for SLIRP (if built in) or IRIX_NONET=1 to skip networking entirely.
 if ip tuntap show 2>/dev/null | grep -q .; then
@@ -59,9 +63,9 @@ else
 fi
 
 if [ ! -f "${IRIX_DISK:-irix65_4020.chd}" ]; then
-    echo "Reminder: put irix65_4020.chd next to run-irix.sh, or set IRIX_DISK"
+    echo "Reminder: put irix65_4020.chd next to run-indy.sh, or set IRIX_DISK"
     echo "to your IRIX 6.5 disk image before running, e.g.:"
-    echo "  IRIX_DISK=\$HOME/irix65_4020.chd ./run-irix.sh"
+    echo "  IRIX_DISK=\$HOME/irix65_4020.chd ./run-indy.sh"
 fi
 
 echo "Done."

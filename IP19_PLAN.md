@@ -127,7 +127,7 @@ Challenge/Onyx graphics device.
 - Reconcile the QEMU `.bin` (unswizzled) with the physical `.hex` (swizzled);
   do not silently truncate the last ROM bytes.
 - Start with `-smp 1 -m 512M`; keep `max_cpus=4`.
-- Add a `run-ip19.sh` harness with GTK display, serial file, monitor socket,
+- Add a `run-challenge.sh` harness with GTK display, serial file, monitor socket,
   optional GDB, and debug switches.
 - **Acceptance:** first instruction is `j 0xbfc003c0`; no address-error loop;
   one CPU and 512 MiB configured.

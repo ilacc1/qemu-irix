@@ -1,0 +1,84 @@
+@echo off
+rem ============================================================================
+rem  SGI Challenge/Onyx (IP19) - IRIX 6.5 startup script for Windows.
+rem
+rem  Requires the IP19 PROM under sgi\challenge and a user-supplied CHD.
+rem  Set IRIX_DISK to the installed Challenge disk image.
+rem ============================================================================
+setlocal
+cd /d "%~dp0"
+
+set "MSYS2=%MSYS2_ROOT%"
+if "%MSYS2%"=="" set "MSYS2=msys64"
+if not exist "%MSYS2%\mingw64\bin\libgtk-3-0.dll" (
+    echo ERROR: MSYS2 MinGW64 runtime not found under "%MSYS2%".
+    echo Set MSYS2_ROOT to your MSYS2 install directory.
+    goto end
+)
+set "PATH=%MSYS2%\mingw64\bin;%PATH%"
+
+set "QEMU=qemu\build\qemu-system-mips64.exe"
+set "BIOS=sgi\challenge\ip19prom.bin"
+if not "%IRIX_DISK%"=="" set "DISK=%IRIX_DISK%"
+if "%DISK%"=="" set "DISK=ip19-installed.chd"
+if not "%IRIX_SMP%"=="" set "SMP=%IRIX_SMP%"
+if "%SMP%"=="" set "SMP=2"
+if not "%IRIX_RAM%"=="" set "RAM=%IRIX_RAM%"
+if "%RAM%"=="" set "RAM=2G"
+set "DISK_FORMAT=chd"
+if not "%IRIX_DISK_FORMAT%"=="" set "DISK_FORMAT=%IRIX_DISK_FORMAT%"
+
+if not exist "%QEMU%" (
+    echo ERROR: %QEMU% not found - build it first.
+    goto end
+)
+if not exist "%BIOS%" (
+    echo ERROR: %BIOS% not found.
+    goto end
+)
+if not exist "%DISK%" (
+    echo ERROR: disk image %DISK% not found - set IRIX_DISK.
+    goto end
+)
+
+set "CDROM_ARGS="
+if not "%IRIX_CD%"=="" if exist "%IRIX_CD%" (
+    set "CDROM_ARGS=-drive "file=%IRIX_CD%,format=raw,if=none,id=ip19cdrom,readonly=on""
+)
+set "CDROM2_ARGS="
+if not "%IRIX_CD2%"=="" if exist "%IRIX_CD2%" (
+    set "CDROM2_ARGS=-drive "file=%IRIX_CD2%,format=raw,if=none,id=ip19cdrom2,readonly=on""
+)
+
+set "TAP_IF=%IRIX_TAP_IF%"
+if "%TAP_IF%"=="" set "TAP_IF=my-tap"
+set "NET_ARGS="
+if "%IRIX_NONET%"=="" (
+    netsh interface show interface name="%TAP_IF%" >nul 2>&1
+    if errorlevel 1 (
+        echo WARNING: no "%TAP_IF%" TAP adapter found - guest will have no network.
+        echo See https://github.com/ilacc1/qemu-irix/blob/master/networking.md
+    ) else (
+        set "NET_ARGS=-net "nic,model=epc-enet,netdev=net0" -netdev "tap,ifname=%TAP_IF%,id=net0""
+    )
+)
+
+set "SNAP_ARGS="
+if "%IRIX_SNAPSHOT%"=="1" set "SNAP_ARGS=-snapshot"
+
+echo Starting SGI Challenge/Onyx (IRIX 6.5) ...
+echo   CPUs:         %SMP%
+echo   RAM:          %RAM%
+echo   Disk:         %DISK%
+echo   Serial:       telnet 127.0.0.1 4444
+echo   QEMU monitor: telnet 127.0.0.1 5555
+echo.
+
+"%QEMU%" -M ip19 -smp %SMP% -m %RAM% -bios "%BIOS%" -L "sgi\challenge" %SNAP_ARGS% -drive "file=%DISK%,format=%DISK_FORMAT%,if=none,id=ip19disk" %CDROM_ARGS% %CDROM2_ARGS% %NET_ARGS% -display gtk,zoom-to-fit=on -serial "telnet:127.0.0.1:4444,server=on,wait=off" -monitor "telnet:127.0.0.1:5555,server=on,wait=off" %*
+
+set "RC=%ERRORLEVEL%"
+echo.
+echo QEMU exited with code %RC%.
+
+:end
+exit /b %RC%

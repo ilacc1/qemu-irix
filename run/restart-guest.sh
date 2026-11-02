@@ -7,22 +7,33 @@
 # (comm == qemu-system-mip AND IRIX_QEMU_MATCH in the cmdline) instead of a
 # bare pkill pattern, so only the intended machine is touched.
 #
-# Usage: run/restart-guest.sh [--no-launch] [--match PATTERN]
-#   --no-launch       only stop the running guest
-#   --match PATTERN   cmdline substring; default $IRIX_QEMU_MATCH or "-M indy"
+# Usage: run/restart-guest.sh --match PATTERN [--run-script SCRIPT]
+#                           [--no-launch]
+#   --match PATTERN       required cmdline substring (or $IRIX_QEMU_MATCH)
+#   --run-script SCRIPT   launcher to start (or $IRIX_RUN_SCRIPT)
+#   --no-launch           only stop the running guest
 set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 LAUNCH=1
-MATCH=${IRIX_QEMU_MATCH:--M indy}
-RUN_SCRIPT=${IRIX_RUN_SCRIPT:-./run-irix.sh}
+MATCH=${IRIX_QEMU_MATCH:-}
+RUN_SCRIPT=${IRIX_RUN_SCRIPT:-}
 while [ $# -gt 0 ]; do
     case "$1" in
         --no-launch) LAUNCH=0; shift ;;
         --match) MATCH=$2; shift 2 ;;
+        --run-script) RUN_SCRIPT=$2; shift 2 ;;
         *) echo "unknown argument: $1" >&2; exit 64 ;;
     esac
 done
+if [ -z "$MATCH" ]; then
+    echo "restart-guest: --match (or IRIX_QEMU_MATCH) is required" >&2
+    exit 64
+fi
+if [ "$LAUNCH" = 1 ] && [ -z "$RUN_SCRIPT" ]; then
+    echo "restart-guest: --run-script (or IRIX_RUN_SCRIPT) is required" >&2
+    exit 64
+fi
 
 stop_guest() {
     local pid stopped=0

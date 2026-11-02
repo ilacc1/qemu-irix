@@ -2,7 +2,7 @@
 rem ============================================================================
 rem  SGI Indy (IP24) - IRIX 6.5 startup script for Windows (MSYS2 build).
 rem
-rem  Mirrors run-irix.sh: indy machine, PROM sgi\indy\ip24prom.070-9101-011.bin,
+rem  Mirrors run-indy.sh: indy machine, PROM sgi\indy\ip24prom.070-9101-011.bin,
 rem  NVRAM seeded from sgi\indy\nvram beside first run, CHD disk supplied by
 rem  the user via IRIX_DISK (not distributed with this repository).
 rem ============================================================================

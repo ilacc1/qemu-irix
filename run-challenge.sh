@@ -2,7 +2,7 @@
 # IP19/Challenge (Everest) launcher.
 #
 # Headless console/monitor harness:
-#   IRIX_HEADLESS=1 IRIX_DISK=... ./run-ip19.sh
+#   IRIX_HEADLESS=1 IRIX_DISK=... ./run-challenge.sh
 # exposes:
 #   run/ip19-serial.sock  (guest serial console)
 #   run/ip19-mon.sock     (QEMU HMP monitor)
@@ -12,6 +12,13 @@
 #   IRIX_DISK=...       target 1, format IRIX_DISK_FORMAT (default chd)
 #   IRIX_CD=...         target 5, format IRIX_CD_FORMAT (default raw)
 #   IRIX_CD2=...        target 6
+#
+# Network (EPC et0):
+#   IRIX_NET=tap        attach to host bridge via IRIX_TAP_IF (default)
+#   IRIX_NET=user       attach QEMU user-mode networking (slirp)
+#   IRIX_NET=off        leave the NIC disconnected
+#   IRIX_NET=<spec>     pass any other -nic specification through
+# The default TAP interface is tap-iris, matching run-indy.sh.
 DIR=$(dirname "$0")
 QEMU="$DIR/build/qemu-system-mips64"
 PROM="$DIR/sgi/challenge/ip19prom.bin"
@@ -24,6 +31,9 @@ DISPLAY_MODE="${IRIX_DISPLAY:-gtk,zoom-to-fit=on}"
 MON_SOCK="${IRIX_MONITOR:-$DIR/run/ip19-mon.sock}"
 SERIAL_SOCK="${IRIX_SERIAL_SOCK:-$DIR/run/ip19-serial.sock}"
 SNAPSHOT="${IRIX_SNAPSHOT:-0}"
+NET="${IRIX_NET:-tap}"
+NET_PORT="${IRIX_NET_PORT:-2323}"
+TAP_IF="${IRIX_TAP_IF:-tap-iris}"
 
 if [ ! -f "$PROM" ]; then
   echo "ip19prom.bin not found in sgi/challenge/; set PROM=..." >&2
@@ -48,6 +58,27 @@ if [ -n "$CD2" ]; then
   set -- "$@" -drive \
     "file=$CD2,format=${IRIX_CD2_FORMAT:-raw},if=none,id=ip19cdrom2,readonly=on"
 fi
+
+case "$NET" in
+  off|none|"")
+    ;;
+  tap)
+    if ! (command -v ip >/dev/null 2>&1 && ip link show "$TAP_IF" >/dev/null 2>&1); then
+      echo "WARNING: TAP interface '$TAP_IF' not found - guest will have no network." >&2
+      echo "See networking.md to set it up." >&2
+    else
+      set -- "$@" -net "nic,model=epc-enet,netdev=net0" \
+        -netdev "tap,id=net0,ifname=$TAP_IF,script=,downscript="
+    fi
+    ;;
+  user)
+    set -- "$@" -nic \
+      "user,model=epc-enet,net=10.6.2.0/24,host=10.6.2.2,dhcpstart=10.6.2.15,hostfwd=tcp:127.0.0.1:${NET_PORT}-10.6.2.1:23"
+    ;;
+  *)
+    set -- "$@" -nic "$NET"
+    ;;
+esac
 
 if [ "${IRIX_HEADLESS:-0}" = 1 ]; then
   mkdir -p "$DIR/run"

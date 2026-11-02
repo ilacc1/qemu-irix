@@ -54,11 +54,12 @@ ldd "$EXE" | awk '/=> \//{print $1 "=" $3}' | while IFS='=' read -r soname path;
 done
 
 cp -r "$ROOT_DIR/sgi" "$UBUNTU_STAGE/"
-cp "$ROOT_DIR/run-irix.sh" "$ROOT_DIR/install.sh" \
+cp "$ROOT_DIR/run-indy.sh" "$ROOT_DIR/run-challenge.sh" "$ROOT_DIR/install.sh" \
    "$ROOT_DIR/readme.md" "$ROOT_DIR/building.md" "$ROOT_DIR/networking.md" \
    "$UBUNTU_STAGE/"
 chmod +x "$UBUNTU_STAGE/build/qemu-system-mips64" \
-         "$UBUNTU_STAGE/run-irix.sh" "$UBUNTU_STAGE/install.sh"
+         "$UBUNTU_STAGE/run-indy.sh" "$UBUNTU_STAGE/run-challenge.sh" \
+         "$UBUNTU_STAGE/install.sh"
 
 # Sanity: everything must resolve through the bundle.
 if LD_LIBRARY_PATH="$UBUNTU_STAGE/lib" ldd "$UBUNTU_STAGE/build/qemu-system-mips64" \
@@ -105,7 +106,7 @@ if [ "$WITH_WINDOWS" -eq 1 ]; then
     cp -r "$ROOT_DIR/sgi" "$WIN_STAGE/"
     # CRLF for everything cmd.exe parses (normalize first: repo copies
     # may be LF or CRLF depending on checkout settings).
-    for f in run-irix.bat install.bat; do
+    for f in run-indy.bat install.bat; do
         sed 's/\r$//' "$ROOT_DIR/$f" | sed 's/$/\r/' > "$WIN_STAGE/$f"
     done
     cp "$ROOT_DIR/readme.md" "$ROOT_DIR/building.md" "$ROOT_DIR/networking.md" \

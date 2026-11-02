@@ -7,6 +7,20 @@
 > SMP topology, MC3/RAM limits, bootstrap sequence and the first 2-CPU
 > bring-up are documented in [`IP19_SMP.md`](IP19_SMP.md).
 
+## Network/telnet checkpoint (2026-11-01)
+
+- Installed 2-CPU/2-GiB IP19 root on `ip19-yoda2.raw` boots to
+  `yoda console login:`.
+- `/etc/sys_id` is `yoda`; `/etc/hosts` contains `10.6.2.1 yoda`.
+- IRIX network startup is enabled with `chkconfig network on`; no startup
+  script was modified. `ifconfig-1.options` contains only `up` so the
+  EPC interface reaches `UP,RUNNING` at boot.
+- Host TAP is `tap-iris` on `br0`; no SLIRP is used by default.
+- Verified: host `ping 10.6.2.1` succeeds, `telnet 10.6.2.1` logs in as
+  `root` (no password), and `hostname` returns `yoda`.
+- Launchers are explicit: `run-indy.sh/.bat`, `run-indy53.sh`, and
+  `run-challenge.sh/.bat`.
+
 ## SMP bring-up checkpoint (2026-11-01, 2 CPUs/2 GiB booting)
 
 - An IP19 is a 4-slice CPU board. Two CPUs is the common board population
@@ -260,7 +274,7 @@ Preserved state:
 - Reproduction: create `qemu-img create -f qcow2 -F raw -b
   ip19-installed.raw over.qcow2`, then
   `IRIX_HEADLESS=1 IRIX_DISK=.../over.qcow2 IRIX_DISK_FORMAT=qcow2
-  ./run-ip19.sh`; select menu 1 (or 5 and `boot -f dksc(0,1,0)/unix`).
+  ./run-challenge.sh`; select menu 1 (or 5 and `boot -f dksc(0,1,0)/unix`).
   Console logs/traces are in `ip19boot/con*.log`, `ip19boot/sig*.log`.
 
 Next concrete steps:
@@ -392,7 +406,7 @@ Verified in QEMU with the rebuilt PROM and `-smp 1 -m 512M`:
   CPU-busy in user mode; full installation did not complete in the test
   window.
 - Generic harness completed: `run/console.py` works with any machine's
-  serial socket; `run-ip19.sh` exposes `run/ip19-serial.sock` and
+  serial socket; `run-challenge.sh` exposes `run/ip19-serial.sock` and
   `run/ip19-mon.sock` with `IRIX_HEADLESS=1`; `run/restart-guest.sh`
   accepts `--match`/`IRIX_QEMU_MATCH` and `IRIX_RUN_SCRIPT`.
 
@@ -459,7 +473,7 @@ Goal: enough emulation to boot IRIX on IP19 with multiple CPUs (M:N host/guest f
 - `tlb_helper.c` touches requester_id (already present in tree).
 - IP19/Challenge PROM built: `sgi/challenge/ip19prom.bin` (QEMU raw),
   `ip19prom.hex` (swizzled EPROM image), plus `ip19prom.coff`/map/nm.
-  `run-ip19.sh` loads the raw image from `sgi/challenge/`.
+  `run-challenge.sh` loads the raw image from `sgi/challenge/`.
 
 ## What IRIX expects (from headers/kernel)
 
@@ -490,7 +504,7 @@ Goal: enough emulation to boot IRIX on IP19 with multiple CPUs (M:N host/guest f
 | VME, other boards | No. | Missing | Defer. |
 
 ## Immediate next steps (do one by one)
-1. **PROM present**: built at `sgi/challenge/ip19prom.bin`; `run-ip19.sh` uses it. Continue with CC/EAROM/EPC bring-up.
+1. **PROM present**: built at `sgi/challenge/ip19prom.bin`; `run-challenge.sh` uses it. Continue with CC/EAROM/EPC bring-up.
 2. **Fix CC essentials**: SPNUM to include real slot/proc from attrs/cpu index. SYSCONFIG to look plausible. Ensure KZRESET doesn't immediately kill emulation. Make IP/HPIL/CEL updates actually observable.
 3. **MC3 minimal**: Add minimal MC3 model on slot 1 with bank covering machine->ram. Put enough in config registers.
 4. **EAROM minimal**: Provide plausible EAROM values (EBUS/CPU/RTC frequencies, checksums) so PROM doesn't bail.

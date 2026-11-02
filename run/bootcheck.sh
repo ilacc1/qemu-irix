@@ -51,14 +51,14 @@ pc_of() {
 }
 
 # Stop any running guest, then start a fresh one.
-run/restart-guest.sh --no-launch >/dev/null 2>&1
+run/restart-guest.sh --match "-M indy" --no-launch >/dev/null 2>&1
 
 QEMU_ARGS=()
 if [ -n "$LOGFILE" ]; then
     QEMU_ARGS=(-d int,mmu -D "$LOGFILE")
 fi
 
-setsid ./run-irix.sh "${QEMU_ARGS[@]}" >/tmp/irix-run.log 2>/tmp/irix-store.log </dev/null &
+setsid ./run-indy.sh "${QEMU_ARGS[@]}" >/tmp/irix-run.log 2>/tmp/irix-store.log </dev/null &
 disown || true
 
 # Wait for the monitor socket to show up.

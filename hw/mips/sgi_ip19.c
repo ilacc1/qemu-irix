@@ -37,9 +37,11 @@
 #include "system/runstate.h"
 #include "system/system.h"
 #include "target/mips/cpu.h"
+#include "net/net.h"
 #include "qapi/error.h"
 #include "qemu/datadir.h"
 #include "qemu/error-report.h"
+#include "qemu/mem-reentrancy.h"
 #include "qemu/host-utils.h"
 #include "qemu/timer.h"
 #include <time.h>
@@ -326,6 +328,11 @@ struct SGI_IP19State {
     char sysctlr_serial[16];
     uint32_t io4_ebus_error;
     uint64_t io4_error_vector;
+
+    NICConf epc_nic_conf;
+    NICState *nic;
+    MemReentrancyGuard epc_reentrancy_guard;
+    uint8_t epc_mac[6];
 
     qemu_irq cpu_irq[IP19_MAX_CPUS][8];
 
@@ -1363,8 +1370,34 @@ static const MemoryRegionOps ip19_earom_ops = {
 #define EPC_DUART_STRIDE    0x1000
 #define EPC_DUART_CHAN_A    0x08
 #define EPC_CTRL_BASE       0xa100
+#define EPC_EADDR_BASE      0xa200
+#define EPC_TCMD            0xa230
+#define EPC_RCMD            0xa238
+#define EPC_TBASELO         0xa250
+#define EPC_TBASEHI         0xa258
+#define EPC_TLIMIT          0xa260
 #define EPC_TINDEX          0xa268
 #define EPC_TTOP            0xa270
+#define EPC_TBPTR           0xa278
+#define EPC_TSTAT           0xa280
+#define EPC_RBASELO         0xa2a0
+#define EPC_RBASEHI         0xa2a8
+#define EPC_RLIMIT          0xa2b0
+#define EPC_RINDEX          0xa2b8
+#define EPC_RTOP            0xa2c0
+#define EPC_RBPTR           0xa2c8
+#define EPC_RSTAT           0xa2d0
+
+#define EPC_ENET_BUFSZ      2048
+#define EPC_ENET_DATA       2
+#define EPC_ENET_STAT       2044
+#define EPC_ENET_LENMASK    0x7ff
+#define EPC_ENET_STSHFT     16
+#define EPC_ENET_STMASK     0xff
+#define EPC_ENET_ST_GOOD    0x20
+#define EPC_ENET_ST_END     0x10
+#define EPC_ENET_XS_SUCCESS 0x08
+#define EPC_ENET_RCMDRECV   0xc0
 
 #define EPC_ISTAT           0xa100
 #define EPC_IMSET           0xa108
@@ -1730,6 +1763,162 @@ static void ip19_epc_update_irq(SGI_IP19State *s)
     }
 }
 
+/*
+ * EPC Ethernet scatter/gather engine (if_ee.c).  The controller walks a
+ * ring of 2048-byte buffers in guest physical memory.  The guest owns
+ * TTOP/RTOP and the model owns TINDEX/RINDEX; each packet starts at
+ * offset 2 and the transmit length is a little-endian halfword at offset
+ * 0, while the receive status is a big-endian word at offset 2044.
+ */
+static uint64_t ip19_epc_get_reg(SGI_IP19State *s, unsigned reg)
+{
+    return s->epc_regs[(reg - EPC_CTRL_BASE) >> 3];
+}
+
+static void ip19_epc_set_reg(SGI_IP19State *s, unsigned reg, uint64_t val)
+{
+    s->epc_regs[(reg - EPC_CTRL_BASE) >> 3] = val;
+}
+
+static unsigned ip19_epc_enet_nbufs(uint64_t limit)
+{
+    return 1U << ((limit & 7) + 1);
+}
+
+static uint64_t ip19_epc_enet_base(SGI_IP19State *s, unsigned lo_reg,
+                                   unsigned hi_reg)
+{
+    return ip19_epc_get_reg(s, lo_reg) |
+           (ip19_epc_get_reg(s, hi_reg) << 32);
+}
+
+static void ip19_epc_dma_read(hwaddr addr, void *buf, unsigned len)
+{
+    if (address_space_read(&address_space_memory, addr,
+                           MEMTXATTRS_UNSPECIFIED, buf, len) != MEMTX_OK) {
+        memset(buf, 0, len);
+    }
+}
+
+static void ip19_epc_dma_write(hwaddr addr, const void *buf, unsigned len)
+{
+    address_space_write(&address_space_memory, addr, MEMTXATTRS_UNSPECIFIED,
+                        buf, len);
+}
+
+static void ip19_epc_enet_tx_pump(SGI_IP19State *s)
+{
+    uint64_t base = ip19_epc_enet_base(s, EPC_TBASELO, EPC_TBASEHI);
+    unsigned nbufs = ip19_epc_enet_nbufs(ip19_epc_get_reg(s, EPC_TLIMIT));
+    unsigned mask = nbufs - 1;
+    unsigned tindex = ip19_epc_get_reg(s, EPC_TINDEX) & mask;
+    unsigned ttop = ip19_epc_get_reg(s, EPC_TTOP) & mask;
+    uint8_t packet[EPC_ENET_BUFSZ];
+
+    if (!base) {
+        /* The driver has not programmed the ring; drop queued entries. */
+        ip19_epc_set_reg(s, EPC_TINDEX, ttop);
+        return;
+    }
+
+    while (tindex != ttop) {
+        uint64_t buf = base + (uint64_t)tindex * EPC_ENET_BUFSZ;
+        uint8_t hdr[2];
+        uint8_t status[4];
+        unsigned len;
+
+        ip19_epc_dma_read(buf, hdr, sizeof(hdr));
+        len = hdr[0] | (hdr[1] << 8);
+        if (len >= 14 && len <= sizeof(packet)) {
+            ip19_epc_dma_read(buf + EPC_ENET_DATA, packet, len);
+            if (s->nic) {
+                qemu_send_packet(qemu_get_queue(s->nic), packet, len);
+            }
+        }
+
+        stl_be_p(status, EPC_ENET_XS_SUCCESS << EPC_ENET_STSHFT);
+        ip19_epc_dma_write(buf + EPC_ENET_STAT, status, sizeof(status));
+        tindex = (tindex + 1) & mask;
+    }
+    ip19_epc_set_reg(s, EPC_TINDEX, tindex);
+}
+
+static bool ip19_epc_enet_rx_ready(SGI_IP19State *s)
+{
+    uint64_t base = ip19_epc_enet_base(s, EPC_RBASELO, EPC_RBASEHI);
+    unsigned nbufs;
+    unsigned mask;
+    unsigned rindex;
+    unsigned rtop;
+
+    if (!s->nic || !base) {
+        return false;
+    }
+    if (!(ip19_epc_get_reg(s, EPC_RCMD) & EPC_ENET_RCMDRECV)) {
+        return false;
+    }
+
+    nbufs = ip19_epc_enet_nbufs(ip19_epc_get_reg(s, EPC_RLIMIT));
+    mask = nbufs - 1;
+    rindex = ip19_epc_get_reg(s, EPC_RINDEX) & mask;
+    rtop = ip19_epc_get_reg(s, EPC_RTOP) & mask;
+    return ((rtop - rindex) & mask) != 0;
+}
+
+static bool ip19_epc_enet_can_receive(NetClientState *nc)
+{
+    SGI_IP19State *s = qemu_get_nic_opaque(nc);
+
+    return ip19_epc_enet_rx_ready(s);
+}
+
+static ssize_t ip19_epc_enet_receive(NetClientState *nc, const uint8_t *buf,
+                                     size_t size)
+{
+    SGI_IP19State *s = qemu_get_nic_opaque(nc);
+    uint64_t base = ip19_epc_enet_base(s, EPC_RBASELO, EPC_RBASEHI);
+    unsigned nbufs = ip19_epc_enet_nbufs(ip19_epc_get_reg(s, EPC_RLIMIT));
+    unsigned mask = nbufs - 1;
+    unsigned rindex = ip19_epc_get_reg(s, EPC_RINDEX) & mask;
+    uint64_t dst = base + (uint64_t)rindex * EPC_ENET_BUFSZ;
+    uint8_t packet[EPC_ENET_BUFSZ];
+    uint8_t hdr[2];
+    uint8_t status[4];
+    uint32_t rstat;
+    unsigned len;
+
+    if (!ip19_epc_enet_rx_ready(s) || size < 6 || size > 1514) {
+        /* Returning the size drops an unusable frame. */
+        return size;
+    }
+
+    len = MAX(size, 60);
+    memcpy(packet, buf, size);
+    memset(packet + size, 0, len - size);
+
+    hdr[0] = len & 0xff;
+    hdr[1] = (len >> 8) & 0xff;
+    rstat = ((EPC_ENET_ST_GOOD | EPC_ENET_ST_END) << EPC_ENET_STSHFT) |
+            (len & EPC_ENET_LENMASK);
+
+    ip19_epc_dma_write(dst, hdr, sizeof(hdr));
+    ip19_epc_dma_write(dst + EPC_ENET_DATA, packet, len);
+    stl_be_p(status, rstat);
+    ip19_epc_dma_write(dst + EPC_ENET_STAT, status, sizeof(status));
+
+    ip19_epc_set_reg(s, EPC_RINDEX, (rindex + 1) & mask);
+    s->epc_ipend |= 0x04;             /* EPC_INTR_ENET */
+    ip19_epc_update_irq(s);
+    return size;
+}
+
+static NetClientInfo ip19_epc_net_info = {
+    .type = NET_CLIENT_DRIVER_NIC,
+    .size = sizeof(NICState),
+    .can_receive = ip19_epc_enet_can_receive,
+    .receive = ip19_epc_enet_receive,
+};
+
 static uint64_t ip19_epc_ctrl_read(SGI_IP19State *s, unsigned reg)
 {
     unsigned idx;
@@ -1741,16 +1930,11 @@ static uint64_t ip19_epc_ctrl_read(SGI_IP19State *s, unsigned reg)
     case EPC_IMRST:
         return 0;
     case EPC_TINDEX:
-        /*
-         * ee_init() drains the transmit DMA before programming the
-         * controller:
-         *     while (TINDEX != TTOP)
-         *         ;
-         * The EPC Ethernet engine is not modelled yet, so never report
-         * a pending transmit entry and let the driver continue to the
-         * rest of its initialization.
-         */
-        return s->epc_regs[(EPC_TTOP - EPC_CTRL_BASE) >> 3];
+        return ip19_epc_get_reg(s, EPC_TINDEX);
+    case EPC_RINDEX:
+        /* Polling the receive index acknowledges the EPC ENET source. */
+        s->epc_ipend &= ~0x04;        /* EPC_INTR_ENET */
+        return ip19_epc_get_reg(s, EPC_RINDEX);
     case EPC_PRST:
         return s->epc_prst;
     case EPC_IERRC:
@@ -1798,6 +1982,27 @@ static void ip19_epc_ctrl_write(SGI_IP19State *s, unsigned reg, uint64_t val)
     case EPC_IERRC:
         idx = (EPC_IERR - EPC_CTRL_BASE) >> 3;
         s->epc_regs[idx] = (reg == EPC_IERRC) ? 0 : val;
+        return;
+    case EPC_TTOP:
+        ip19_epc_set_reg(s, EPC_TTOP, val);
+        ip19_epc_enet_tx_pump(s);
+        return;
+    case EPC_TBASELO:
+    case EPC_TLIMIT:
+        ip19_epc_set_reg(s, reg, val);
+        ip19_epc_enet_tx_pump(s);
+        return;
+    case EPC_RTOP:
+        ip19_epc_set_reg(s, EPC_RTOP, val);
+        if (s->nic) {
+            qemu_flush_queued_packets(qemu_get_queue(s->nic));
+        }
+        return;
+    case EPC_RCMD:
+        ip19_epc_set_reg(s, EPC_RCMD, val);
+        if (s->nic) {
+            qemu_flush_queued_packets(qemu_get_queue(s->nic));
+        }
         return;
     default:
         break;
@@ -1919,16 +2124,13 @@ static MemTxResult ip19_io4_read(void *opaque, hwaddr addr, uint64_t *data,
          * each 16-byte slot plus 4 and takes the low byte; the PROM
          * uses the byte lane at +7.  Both are the same station address.
          */
-        static const uint8_t mac[6] = {
-            0x08, 0x00, 0x69, 0x19, 0x00, 0x01, /* SGI 08:00:69 */
-        };
         unsigned lane = local & 0xf;
 
         unsigned slot = (local - EPC_ENETPROM_BASE) >> 4;
 
-        if ((lane == 4 || lane == 7) && slot < ARRAY_SIZE(mac)) {
+        if ((lane == 4 || lane == 7) && slot < sizeof(s->epc_mac)) {
             /* if_ee reads slot 5 first, so the PROM stores MAC in reverse. */
-            *data = mac[ARRAY_SIZE(mac) - 1 - slot];
+            *data = s->epc_mac[sizeof(s->epc_mac) - 1 - slot];
         } else {
             *data = 0;
         }
@@ -2320,6 +2522,13 @@ static void sgi_ip19_init(MachineState *machine)
     s->epc_rtc_regs[NVR_RTCD] = NVR_VRT;
     g_strlcpy(s->sysctlr_serial, "S1234567", sizeof(s->sysctlr_serial));
     ip19_epc_nvram_defaults(s);
+    /* SGI OUI; replaced by an explicit -nic mac= if one is supplied. */
+    s->epc_mac[0] = 0x08;
+    s->epc_mac[1] = 0x00;
+    s->epc_mac[2] = 0x69;
+    s->epc_mac[3] = 0x19;
+    s->epc_mac[4] = 0x00;
+    s->epc_mac[5] = 0x01;
 
     for (i = 0; i < IP19_MAX_CPUS; i++) {
         s->cmp_ctx[i].s = s;
@@ -2447,6 +2656,38 @@ static void sgi_ip19_init(MachineState *machine)
     memory_region_init_io(&s->gio, NULL, &ip19_gio_ops, s, "ip19.gio",
                           IP19_GIO_SIZE);
     memory_region_add_subregion(sysmem, IP19_LOCAL_ALIAS(IP19_GIO_BASE), &s->gio);
+
+    /*
+     * Attach a host net backend when the user supplied -nic/-net nic.
+     * With no backend the EPC Ethernet registers still behave normally,
+     * but packets are dropped, preserving the offline default.
+     */
+    {
+        NICInfo *nd = qemu_find_nic_info("epc-enet", true, NULL);
+
+        if (nd) {
+            static const uint8_t zero[6] = { 0 };
+            static const uint8_t qemu_default[5] =
+                { 0x52, 0x54, 0x00, 0x12, 0x34 };
+
+            if (!memcmp(nd->macaddr.a, zero, sizeof(zero)) ||
+                !memcmp(nd->macaddr.a, qemu_default,
+                        sizeof(qemu_default))) {
+                memcpy(nd->macaddr.a, s->epc_mac, sizeof(s->epc_mac));
+            } else {
+                memcpy(s->epc_mac, nd->macaddr.a, sizeof(s->epc_mac));
+            }
+            s->epc_nic_conf.macaddr = nd->macaddr;
+            s->epc_nic_conf.peers.ncs[0] = nd->netdev;
+            s->epc_nic_conf.peers.queues = nd->netdev ? 1 : 0;
+            s->nic = qemu_new_nic(&ip19_epc_net_info, &s->epc_nic_conf,
+                                  "epc-enet", "ip19",
+                                  &s->epc_reentrancy_guard, s);
+            nd->instantiated = 1;
+            qemu_format_nic_info_str(qemu_get_queue(s->nic),
+                                     s->epc_nic_conf.macaddr.a);
+        }
+    }
 }
 
 static void sgi_ip19_reset(MachineState *machine, ResetType type)
@@ -2495,6 +2736,10 @@ static void sgi_ip19_reset(MachineState *machine, ResetType type)
     memset(s->ile, 0, sizeof(s->ile));
     memset(s->igrmask, 0, sizeof(s->igrmask));
     memset(s->cel, 0, sizeof(s->cel));
+    memset(s->epc_regs, 0, sizeof(s->epc_regs));
+    s->epc_imask = 0;
+    s->epc_ipend = 0;
+    s->epc_prst = 0;
     s->bootmaster_claimed = false;
     s->rtc_yield_armed = false;
     s->rtc_yield_until_ns = 0;
