@@ -46,6 +46,18 @@
 #include "qemu/timer.h"
 #include <time.h>
 
+static bool ip19_hold_secondaries(void)
+{
+    static int hold = -1;
+
+    if (hold < 0) {
+        const char *e = g_getenv("IP19_HOLD_CPUS");
+
+        hold = e && (e[0] == '1' || e[0] == 'y' || e[0] == 'Y');
+    }
+    return hold;
+}
+
 static bool ip19_debug_enabled(void)
 {
     static int enabled = -1;
@@ -132,7 +144,8 @@ static bool ip19_debug_enabled(void)
 #define IP19_LOCAL_ALIAS(_phys) \
     (IP19_LOCAL_ALIAS_BASE + ((_phys) - IP19_LOCAL_PHYS_BASE))
 
-#define IP19_RTC_HZ         50000000ULL
+#define IP19_RTC_HZ         47619048ULL
+#define IP19_CPU_HZ         500000000ULL
 
 /*
  * IP19 uses R4000SC parts at revision 3.0 or later.  The IP19 kernel is
@@ -423,7 +436,8 @@ static uint64_t ip19_rtc_value(SGI_IP19State *s)
      * QEMU_CLOCK_HOST is system uptime, so subtract the machine-start
      * epoch before scaling; otherwise the 50 MHz multiply overflows.
      */
-    uint64_t ns = qemu_clock_get_ns(QEMU_CLOCK_HOST) - s->rtc_epoch_ns;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+    uint64_t ns = now - s->rtc_epoch_ns;
     uint64_t hz = IP19_RTC_HZ;
     const char *div = g_getenv("IP19_RTC_DIV");
 
@@ -2432,6 +2446,70 @@ static void ip19_preload_io4_segments(const char *filename)
     }
 }
 
+extern uint64_t sgi_idle_pc;
+extern int sgi_idle_sleep;
+
+/*
+ * The stock IP19 PROM has two emulator-visible quirks: its large-window
+ * helpers truncate an XKPHYS address with 32-bit add, and its cache tests
+ * use physical 0 as scratch.  It also has no safe late-secondary-CPU wait.
+ * Apply the known instruction fixups to the loaded RAM image, but only when
+ * the original word is present.  The PROM file is never modified, and an
+ * already-updated/rebuilt PROM is left alone.
+ */
+static void ip19_prom_compat_fixups(SGI_IP19State *s)
+{
+    static const struct {
+        uint32_t offset;
+        uint32_t old_word;
+        uint32_t new_word;
+    } fixups[] = {
+        { 0x00cb4, 0x3c048000, 0x3c048080 },
+        { 0x016a8, 0x15000029, 0x15000043 },
+        { 0x016c4, 0x15000022, 0x1500003c },
+        { 0x01764, 0x3c048000, 0x3c048080 },
+        { 0x01be0, 0x0ff00668, 0x10000033 },
+        { 0x01e88, 0x00852020, 0x0085202d },
+        { 0x01e98, 0x00852020, 0x0085202d },
+        { 0x01eac, 0x00852020, 0x0085202d },
+        { 0x01ebc, 0x00852020, 0x0085202d },
+        { 0x01ed0, 0x00852020, 0x0085202d },
+        { 0x01ee0, 0x00852020, 0x0085202d },
+        { 0x01ef4, 0x00852020, 0x0085202d },
+        { 0x01f04, 0x00852020, 0x0085202d },
+        { 0x024ac, 0x3c048000, 0x3c048080 },
+        { 0x03b58, 0x3c0a8000, 0x3c098080 },
+        { 0x03b90, 0x3c0a8000, 0x3c098080 },
+        { 0x03d84, 0x3c0a8000, 0x3c098080 },
+        { 0x03da0, 0x3c0a8000, 0x3c098080 },
+        { 0x03dd8, 0x3c0a8000, 0x3c098080 },
+        { 0x03df8, 0x3c0a8000, 0x3c098080 },
+        { 0x03ed0, 0x3c098000, 0x3c098080 },
+        { 0x03f98, 0x3c098000, 0x3c098080 },
+        { 0x0e640, 0x24080078, 0x240800f3 },
+        { 0x0efdc, 0x0ff02e05, 0x00000000 },
+        { 0x0efec, 0x0ff02e05, 0x00000000 },
+        { 0x0effc, 0x0ff02e05, 0x00000000 },
+        { 0x0f000, 0x3c058000, 0x3c058080 },
+        { 0x0f008, 0x0ff02e05, 0x00000000 },
+        { 0x0f018, 0x0ff02e05, 0x00000000 },
+        { 0x0f024, 0x0ff02e05, 0x00000000 },
+    };
+    uint8_t *prom = memory_region_get_ram_ptr(&s->prom);
+    unsigned i;
+    unsigned applied = 0;
+
+    for (i = 0; i < ARRAY_SIZE(fixups); i++) {
+        uint8_t *word = prom + fixups[i].offset;
+
+        if (ldl_be_p(word) == fixups[i].old_word) {
+            stl_be_p(word, fixups[i].new_word);
+            applied++;
+        }
+    }
+    IP19_DPRINT("PROM compatibility fixups applied: %u\n", applied);
+}
+
 static void sgi_ip19_init(MachineState *machine)
 {
     SGI_IP19State *s = SGI_IP19_MACHINE(machine);
@@ -2439,8 +2517,24 @@ static void sgi_ip19_init(MachineState *machine)
     Clock *cpuclk;
     int i, j;
 
+    /*
+     * IRIX 6.5 IP19 idles by polling local_idle rather than using WAIT.
+     * Reuse the existing idle-spin halt hook with the IP19 address; the
+     * default in target/mips remains the Indy IP24 address for other
+     * machines.
+     */
+    sgi_idle_pc = 0xa8000000000ea174ULL;
+    {
+        const char *idle_sleep = g_getenv("SGI_IDLE_SLEEP");
+
+        sgi_idle_sleep = idle_sleep &&
+                         !(idle_sleep[0] == '0' ||
+                           idle_sleep[0] == 'n' ||
+                           idle_sleep[0] == 'N');
+    }
+
     cpuclk = clock_new(OBJECT(machine), "cpu-refclk");
-    clock_set_hz(cpuclk, IP19_RTC_HZ);
+    clock_set_hz(cpuclk, IP19_CPU_HZ);
 
     for (i = 0; i < machine->smp.cpus; i++) {
         MIPSCPU *cpu = mips_cpu_create_with_clock(machine->cpu_type, cpuclk,
@@ -2472,9 +2566,9 @@ static void sgi_ip19_init(MachineState *machine)
          * claims the master group.  start_powered_off makes the generic
          * CPU reset keep them halted on machine reset as well.
          */
-        CPU(cpu)->start_powered_off = (i != 0);
-        CPU(cpu)->halted = (i != 0);
-        s->cpu_held[i] = (i != 0);
+        CPU(cpu)->start_powered_off = ip19_hold_secondaries() && (i != 0);
+        CPU(cpu)->halted = ip19_hold_secondaries() && (i != 0);
+        s->cpu_held[i] = ip19_hold_secondaries() && (i != 0);
         IP19_DPRINT("init cpu %d index %u held %d\n", i,
                     CPU(cpu)->cpu_index, s->cpu_held[i]);
         cpu->env.CP0_Config0 &= ~(1U << 17);
@@ -2562,8 +2656,16 @@ static void sgi_ip19_init(MachineState *machine)
             qemu_find_file(QEMU_FILE_TYPE_BIOS, firmware);
 
         if (filename) {
-            load_image_targphys(filename, IP19_PROM_BASE, IP19_PROM_SIZE,
-                                NULL);
+            g_autofree gchar *prom_buf = NULL;
+            gsize prom_len = 0;
+
+            if (g_file_get_contents(filename, &prom_buf, &prom_len, NULL)) {
+                memcpy(memory_region_get_ram_ptr(&s->prom), prom_buf,
+                       MIN(prom_len, IP19_PROM_SIZE));
+            } else {
+                error_report("ip19: cannot read PROM image '%s'", filename);
+            }
+            ip19_prom_compat_fixups(s);
         } else {
             error_report("ip19: no PROM image '%s'", firmware);
         }
@@ -2759,7 +2861,8 @@ static void sgi_ip19_reset(MachineState *machine, ResetType type)
         }
         s->cmpint[i] = false;
         s->cmpreg[i] = 0;
-        s->cpu_held[i] = i != 0 && i < machine->smp.cpus;
+        s->cpu_held[i] = ip19_hold_secondaries() &&
+                         i != 0 && i < machine->smp.cpus;
     }
 
     /*

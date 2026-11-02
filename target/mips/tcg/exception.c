@@ -89,6 +89,7 @@ void helper_wait(CPUMIPSState *env)
 uint64_t sgi_idle_pc = 0xffffffff8815dd24ULL;
 uint32_t sgi_idle_thresh = 100;
 int sgi_idle_on = 1;
+int sgi_idle_sleep = 0;
 /* PROM menu poll loop: spins with interrupts masked, so halting is unsafe
  * (nothing guarantees a wakeup). Yield the host instead; guest-visible:
  * nothing but slower spinning. SGI_PROM_PC=0 or SGI_PROM_SPIN=0 disables. */
@@ -165,6 +166,23 @@ void helper_sgi_idle_check(CPUMIPSState *env)
         return;
     }
     if (++idle_count < sgi_idle_thresh) {
+        return;
+    }
+    if (sgi_idle_sleep) {
+        int64_t deadline = g_get_monotonic_time() + 5000;
+
+        idle_count = 0;
+        while (g_get_monotonic_time() < deadline) {
+            int64_t left = deadline - g_get_monotonic_time();
+            struct timespec idle_ts = {
+                left / 1000000,
+                (left % 1000000) * 1000,
+            };
+
+            if (!nanosleep(&idle_ts, NULL) || errno != EINTR) {
+                break;
+            }
+        }
         return;
     }
     /*

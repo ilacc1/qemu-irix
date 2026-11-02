@@ -25,6 +25,10 @@ if not "%IRIX_SMP%"=="" set "SMP=%IRIX_SMP%"
 if "%SMP%"=="" set "SMP=2"
 if not "%IRIX_RAM%"=="" set "RAM=%IRIX_RAM%"
 if "%RAM%"=="" set "RAM=2G"
+if not "%IRIX_MTTCG%"=="" set "MTTCG=%IRIX_MTTCG%"
+if "%MTTCG%"=="" set "MTTCG=1"
+set "MTTCG_ARGS="
+if "%MTTCG%"=="1" set "MTTCG_ARGS=-accel tcg,thread=multi"
 set "DISK_FORMAT=chd"
 if not "%IRIX_DISK_FORMAT%"=="" set "DISK_FORMAT=%IRIX_DISK_FORMAT%"
 
@@ -74,7 +78,7 @@ echo   Serial:       telnet 127.0.0.1 4444
 echo   QEMU monitor: telnet 127.0.0.1 5555
 echo.
 
-"%QEMU%" -M ip19 -smp %SMP% -m %RAM% -bios "%BIOS%" -L "sgi\challenge" %SNAP_ARGS% -drive "file=%DISK%,format=%DISK_FORMAT%,if=none,id=ip19disk" %CDROM_ARGS% %CDROM2_ARGS% %NET_ARGS% -display gtk,zoom-to-fit=on -serial "telnet:127.0.0.1:4444,server=on,wait=off" -monitor "telnet:127.0.0.1:5555,server=on,wait=off" %*
+"%QEMU%" -M ip19 -smp %SMP% -m %RAM% %MTTCG_ARGS% -bios "%BIOS%" -L "sgi\challenge" %SNAP_ARGS% -drive "file=%DISK%,format=%DISK_FORMAT%,if=none,id=ip19disk" %CDROM_ARGS% %CDROM2_ARGS% %NET_ARGS% -display gtk,zoom-to-fit=on -serial "telnet:127.0.0.1:4444,server=on,wait=off" -monitor "telnet:127.0.0.1:5555,server=on,wait=off" %*
 
 set "RC=%ERRORLEVEL%"
 echo.

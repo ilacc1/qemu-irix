@@ -20,6 +20,10 @@
   `root` (no password), and `hostname` returns `yoda`.
 - Launchers are explicit: `run-indy.sh/.bat`, `run-indy53.sh`, and
   `run-challenge.sh/.bat`.
+- MTTCG is forced for Challenge with `-accel tcg,thread=multi`
+  (`IRIX_MTTCG=1`; default in `run-challenge.sh/.bat`). Verified with two
+  separate host threads (`CPU 0/TCG`, `CPU 1/TCG`), 2 CPUs detected, and
+  telnet login. QEMU still prints its conservative MIPS64 MTTCG warning.
 
 ## SMP bring-up checkpoint (2026-11-01, 2 CPUs/2 GiB booting)
 

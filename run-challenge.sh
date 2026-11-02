@@ -34,6 +34,7 @@ SNAPSHOT="${IRIX_SNAPSHOT:-0}"
 NET="${IRIX_NET:-tap}"
 NET_PORT="${IRIX_NET_PORT:-2323}"
 TAP_IF="${IRIX_TAP_IF:-tap-iris}"
+MTTCG="${IRIX_MTTCG:-1}"
 
 if [ ! -f "$PROM" ]; then
   echo "ip19prom.bin not found in sgi/challenge/; set PROM=..." >&2
@@ -41,6 +42,10 @@ fi
 
 set -- -M ip19 -smp "$SMP" -m "$RAM" \
   -bios "$PROM" -L "$DIR/sgi/challenge"
+
+if [ "$MTTCG" = 1 ]; then
+  set -- "$@" -accel tcg,thread=multi
+fi
 
 if [ "$SNAPSHOT" = 1 ]; then
   set -- "$@" -snapshot
