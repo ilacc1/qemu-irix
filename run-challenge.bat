@@ -131,7 +131,7 @@ echo   QEMU monitor: telnet 127.0.0.1 5555
 echo.
 
 if /I "%IRIX_CONSOLE%"=="window" (
-    start "SGI Challenge - serial console" "%QEMU%" -M ip19 -smp %SMP% -m %RAM% %MTTCG_ARGS% -bios "%BIOS%" -L "%BIOS_DIR%" %SNAP_ARGS% -drive "file=%DISK%,format=%DISK_FORMAT%,if=none,id=ip19disk" %CDROM_ARGS% %CDROM2_ARGS% %NET_ARGS% -parallel none -display none -serial stdio -monitor "telnet:127.0.0.1:5555,server=on,wait=off" %*
+    start "SGI Challenge - serial console" "%QEMU%" -M ip19 -smp %SMP% -m %RAM% %MTTCG_ARGS% -bios "%BIOS%" -L "%BIOS_DIR%" %SNAP_ARGS% -drive "file=%DISK%,format=%DISK_FORMAT%,if=none,id=ip19disk" %CDROM_ARGS% %CDROM2_ARGS% %NET_ARGS% -parallel none -display none -serial stdio -monitor none %*
     set "RC=0"
     goto end
 )
