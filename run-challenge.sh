@@ -25,6 +25,7 @@ PROM="$DIR/sgi/challenge/ip19prom.bin"
 DISK="$IRIX_DISK"
 CD="$IRIX_CD"
 CD2="$IRIX_CD2"
+DISK_FORMAT="${IRIX_DISK_FORMAT:-chd}"
 SMP="${IRIX_SMP:-1}"
 RAM="${IRIX_RAM:-512M}"
 DISPLAY_MODE="${IRIX_DISPLAY:-gtk,zoom-to-fit=on}"
@@ -36,11 +37,29 @@ NET_PORT="${IRIX_NET_PORT:-2323}"
 TAP_IF="${IRIX_TAP_IF:-tap-iris}"
 MTTCG="${IRIX_MTTCG:-1}"
 
+if [ -z "$DISK" ]; then
+  for candidate in "$DIR/ip19-installed.chd" "$DIR/../ip19-installed.chd"; do
+    if [ -f "$candidate" ]; then
+      DISK="$candidate"
+      DISK_FORMAT=chd
+      break
+    fi
+  done
+fi
+if [ -z "$DISK" ] && [ -f "$DIR/../ip19-yoda2.raw" ]; then
+  DISK="$DIR/../ip19-yoda2.raw"
+  DISK_FORMAT=raw
+fi
+if [ -z "$DISK" ]; then
+  echo "ERROR: no Challenge disk found; set IRIX_DISK." >&2
+  exit 1
+fi
+
 if [ ! -f "$PROM" ]; then
   echo "ip19prom.bin not found in sgi/challenge/; set PROM=..." >&2
 fi
 
-set -- -M ip19 -smp "$SMP" -m "$RAM" \
+set -- -M ip19 -smp "$SMP" -m "$RAM" -parallel none \
   -bios "$PROM" -L "$DIR/sgi/challenge"
 
 if [ "$MTTCG" = 1 ]; then
@@ -53,7 +72,7 @@ fi
 
 if [ -n "$DISK" ]; then
   set -- "$@" -drive \
-    "file=$DISK,format=${IRIX_DISK_FORMAT:-chd},if=none,id=ip19disk"
+    "file=$DISK,format=$DISK_FORMAT,if=none,id=ip19disk"
 fi
 if [ -n "$CD" ]; then
   set -- "$@" -drive \

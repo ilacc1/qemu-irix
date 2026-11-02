@@ -20,6 +20,12 @@ set "PATH=%MSYS2%\mingw64\bin;%PATH%"
 set "QEMU=qemu\build\qemu-system-mips64.exe"
 set "BIOS=sgi\challenge\ip19prom.bin"
 if not "%IRIX_DISK%"=="" set "DISK=%IRIX_DISK%"
+if "%DISK%"=="" if exist "ip19-installed.chd" set "DISK=ip19-installed.chd"
+if "%DISK%"=="" if exist "..\ip19-installed.chd" set "DISK=..\ip19-installed.chd"
+if "%DISK%"=="" if exist "..\ip19-yoda2.raw" (
+    set "DISK=..\ip19-yoda2.raw"
+    set "IRIX_DISK_FORMAT=raw"
+)
 if "%DISK%"=="" set "DISK=ip19-installed.chd"
 if not "%IRIX_SMP%"=="" set "SMP=%IRIX_SMP%"
 if "%SMP%"=="" set "SMP=2"
@@ -94,7 +100,7 @@ echo   Console:      %IRIX_CONSOLE%
 echo   QEMU monitor: telnet 127.0.0.1 5555
 echo.
 
-"%QEMU%" -M ip19 -smp %SMP% -m %RAM% %MTTCG_ARGS% -bios "%BIOS%" -L "sgi\challenge" %SNAP_ARGS% -drive "file=%DISK%,format=%DISK_FORMAT%,if=none,id=ip19disk" %CDROM_ARGS% %CDROM2_ARGS% %NET_ARGS% -display "%DISPLAY_MODE%" -serial "%SERIAL_SPEC%" -monitor "telnet:127.0.0.1:5555,server=on,wait=off" %*
+"%QEMU%" -M ip19 -smp %SMP% -m %RAM% %MTTCG_ARGS% -bios "%BIOS%" -L "sgi\challenge" %SNAP_ARGS% -drive "file=%DISK%,format=%DISK_FORMAT%,if=none,id=ip19disk" %CDROM_ARGS% %CDROM2_ARGS% %NET_ARGS% -parallel none -display "%DISPLAY_MODE%" -serial "%SERIAL_SPEC%" -monitor "telnet:127.0.0.1:5555,server=on,wait=off" %*
 
 set "RC=%ERRORLEVEL%"
 echo.
