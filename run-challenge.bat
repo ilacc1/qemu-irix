@@ -83,10 +83,10 @@ if not "%IRIX_CD2%"=="" if exist "%IRIX_CD2%" (
 )
 
 rem Console selection:
-rem   shell  = run the VM in this console (default)
-rem   window = spawn a separate console window
+rem   window = GTK window with the serial console (default)
+rem   shell  = run the VM in this console
 rem   telnet = no serial window; telnet 127.0.0.1:4444
-if "%IRIX_CONSOLE%"=="" set "IRIX_CONSOLE=shell"
+if "%IRIX_CONSOLE%"=="" set "IRIX_CONSOLE=window"
 set "DISPLAY_MODE=gtk,zoom-to-fit=on"
 set "SERIAL_SPEC=vc"
 if /I "%IRIX_CONSOLE%"=="shell" (
@@ -122,7 +122,7 @@ echo   Console:      %IRIX_CONSOLE%
 echo.
 
 if /I "%IRIX_CONSOLE%"=="window" (
-    start "SGI Challenge - serial console" "%QEMU%" -M ip19 -smp %SMP% -m %RAM% %MTTCG_ARGS% -bios "%BIOS%" -L "%BIOS_DIR%" %SNAP_ARGS% -drive "file=%DISK%,format=%DISK_FORMAT%,if=none,id=ip19disk" %CDROM_ARGS% %CDROM2_ARGS% %NET_ARGS% -parallel none -display none -serial stdio -monitor none %*
+    start "SGI Challenge" "%QEMU%" -M ip19 -smp %SMP% -m %RAM% %MTTCG_ARGS% -bios "%BIOS%" -L "%BIOS_DIR%" %SNAP_ARGS% -drive "file=%DISK%,format=%DISK_FORMAT%,if=none,id=ip19disk" %CDROM_ARGS% %CDROM2_ARGS% %NET_ARGS% -parallel none -display gtk,zoom-to-fit=on -serial vc -monitor none %*
     set "RC=0"
     goto end
 )
