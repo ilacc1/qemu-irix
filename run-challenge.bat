@@ -83,10 +83,10 @@ if not "%IRIX_CD2%"=="" if exist "%IRIX_CD2%" (
 )
 
 rem Console selection:
-rem   window = new console window with the serial console (default)
-rem   shell  = no window; serial console on this shell
+rem   shell  = run the VM in this console (default)
+rem   window = spawn a separate console window
 rem   telnet = no serial window; telnet 127.0.0.1:4444
-if "%IRIX_CONSOLE%"=="" set "IRIX_CONSOLE=window"
+if "%IRIX_CONSOLE%"=="" set "IRIX_CONSOLE=shell"
 if /I "%IRIX_CONSOLE%"=="shell" (
     set "DISPLAY_MODE=none"
     set "SERIAL_SPEC=stdio"
