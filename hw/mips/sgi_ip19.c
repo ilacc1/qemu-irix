@@ -46,6 +46,15 @@
 #include "qemu/timer.h"
 #include <time.h>
 
+static time_t ip19_timegm(struct tm *tm)
+{
+#ifdef _WIN32
+    return _mkgmtime(tm);
+#else
+    return timegm(tm);
+#endif
+}
+
 static bool ip19_hold_secondaries(void)
 {
     static int hold = -1;
@@ -1621,7 +1630,7 @@ static void ip19_epc_rtc_write_reg(SGI_IP19State *s, unsigned reg,
         tm.tm_mon = mon ? mon - 1 : 0;
         tm.tm_year = year + 70;
         tm.tm_isdst = 0;
-        t = timegm(&tm);
+        t = ip19_timegm(&tm);
         if (t != (time_t)-1) {
             s->epc_rtc_base_sec = t;
             s->epc_rtc_base_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
