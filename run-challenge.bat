@@ -54,6 +54,22 @@ if not "%IRIX_CD2%"=="" if exist "%IRIX_CD2%" (
     set "CDROM2_ARGS=-drive "file=%IRIX_CD2%,format=raw,if=none,id=ip19cdrom2,readonly=on""
 )
 
+rem Console selection:
+rem   window = GTK window showing the serial VC (default)
+rem   shell  = no window; serial console on this shell
+rem   telnet = no serial window; telnet 127.0.0.1:4444
+if "%IRIX_CONSOLE%"=="" set "IRIX_CONSOLE=window"
+if /I "%IRIX_CONSOLE%"=="shell" (
+    set "DISPLAY_MODE=none"
+    set "SERIAL_SPEC=stdio"
+) else if /I "%IRIX_CONSOLE%"=="telnet" (
+    set "DISPLAY_MODE=gtk,zoom-to-fit=on"
+    set "SERIAL_SPEC=telnet:127.0.0.1:4444,server=on,wait=off"
+) else (
+    set "DISPLAY_MODE=gtk,zoom-to-fit=on"
+    set "SERIAL_SPEC=vc"
+)
+
 set "TAP_IF=%IRIX_TAP_IF%"
 if "%TAP_IF%"=="" set "TAP_IF=my-tap"
 set "NET_ARGS="
@@ -74,11 +90,11 @@ echo Starting SGI Challenge/Onyx (IRIX 6.5) ...
 echo   CPUs:         %SMP%
 echo   RAM:          %RAM%
 echo   Disk:         %DISK%
-echo   Serial:       telnet 127.0.0.1 4444
+echo   Console:      %IRIX_CONSOLE%
 echo   QEMU monitor: telnet 127.0.0.1 5555
 echo.
 
-"%QEMU%" -M ip19 -smp %SMP% -m %RAM% %MTTCG_ARGS% -bios "%BIOS%" -L "sgi\challenge" %SNAP_ARGS% -drive "file=%DISK%,format=%DISK_FORMAT%,if=none,id=ip19disk" %CDROM_ARGS% %CDROM2_ARGS% %NET_ARGS% -display gtk,zoom-to-fit=on -serial "telnet:127.0.0.1:4444,server=on,wait=off" -monitor "telnet:127.0.0.1:5555,server=on,wait=off" %*
+"%QEMU%" -M ip19 -smp %SMP% -m %RAM% %MTTCG_ARGS% -bios "%BIOS%" -L "sgi\challenge" %SNAP_ARGS% -drive "file=%DISK%,format=%DISK_FORMAT%,if=none,id=ip19disk" %CDROM_ARGS% %CDROM2_ARGS% %NET_ARGS% -display "%DISPLAY_MODE%" -serial "%SERIAL_SPEC%" -monitor "telnet:127.0.0.1:5555,server=on,wait=off" %*
 
 set "RC=%ERRORLEVEL%"
 echo.

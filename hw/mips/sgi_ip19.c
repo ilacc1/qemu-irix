@@ -1657,7 +1657,7 @@ static const struct {
     { EPC_NV_DISKLESS,    1,  "0" },
     { EPC_NV_TZ,          8,  "PST8PDT" },
     { EPC_NV_OSPART,      48, "dksc(0,1,0)" },
-    { EPC_NV_AUTOLOAD,    1,  "No" },
+    { EPC_NV_AUTOLOAD,    1,  "Y" },
     { EPC_NV_ROOT,        20, "dks0d1s0" },
     { EPC_NV_SCSIHOSTID,  1,  "0" },
     { EPC_NV_SGILOGO,     1,  "y" },
