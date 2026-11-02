@@ -119,7 +119,7 @@ echo   CPUs:         %SMP%
 echo   RAM:          %RAM%
 echo   Disk:         %DISK%
 echo   Console:      %IRIX_CONSOLE%
-echo   QEMU monitor: telnet 127.0.0.1 5555
+echo   Console:      %IRIX_CONSOLE%
 echo.
 
 if /I "%IRIX_CONSOLE%"=="window" (
@@ -128,7 +128,7 @@ if /I "%IRIX_CONSOLE%"=="window" (
     goto end
 )
 
-"%QEMU%" -M ip19 -smp %SMP% -m %RAM% %MTTCG_ARGS% -bios "%BIOS%" -L "%BIOS_DIR%" %SNAP_ARGS% -drive "file=%DISK%,format=%DISK_FORMAT%,if=none,id=ip19disk" %CDROM_ARGS% %CDROM2_ARGS% %NET_ARGS% -parallel none -display "%DISPLAY_MODE%" -serial "%SERIAL_SPEC%" -monitor "telnet:127.0.0.1:5555,server=on,wait=off" %*
+"%QEMU%" -M ip19 -smp %SMP% -m %RAM% %MTTCG_ARGS% -bios "%BIOS%" -L "%BIOS_DIR%" %SNAP_ARGS% -drive "file=%DISK%,format=%DISK_FORMAT%,if=none,id=ip19disk" %CDROM_ARGS% %CDROM2_ARGS% %NET_ARGS% -parallel none -display "%DISPLAY_MODE%" -serial "%SERIAL_SPEC%" -monitor none %*
 
 set "RC=%ERRORLEVEL%"
 echo.
