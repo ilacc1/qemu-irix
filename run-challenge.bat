@@ -87,15 +87,15 @@ rem   shell  = run the VM in this console (default)
 rem   window = spawn a separate console window
 rem   telnet = no serial window; telnet 127.0.0.1:4444
 if "%IRIX_CONSOLE%"=="" set "IRIX_CONSOLE=shell"
+set "DISPLAY_MODE=gtk,zoom-to-fit=on"
+set "SERIAL_SPEC=vc"
 if /I "%IRIX_CONSOLE%"=="shell" (
     set "DISPLAY_MODE=none"
     set "SERIAL_SPEC=stdio"
-) else if /I "%IRIX_CONSOLE%"=="telnet" (
+)
+if /I "%IRIX_CONSOLE%"=="telnet" (
     set "DISPLAY_MODE=none"
     set "SERIAL_SPEC=telnet:127.0.0.1:4444,server=on,wait=off"
-) else (
-    set "DISPLAY_MODE=gtk,zoom-to-fit=on"
-    set "SERIAL_SPEC=vc"
 )
 
 set "TAP_IF=%IRIX_TAP_IF%"
@@ -118,7 +118,6 @@ echo Starting SGI Challenge/Onyx (IRIX 6.5) ...
 echo   CPUs:         %SMP%
 echo   RAM:          %RAM%
 echo   Disk:         %DISK%
-echo   Console:      %IRIX_CONSOLE%
 echo   Console:      %IRIX_CONSOLE%
 echo.
 
