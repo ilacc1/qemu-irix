@@ -10,7 +10,7 @@
 
 #include "trace.h"
 
-#define DEFAULT_BACKSCROLL 512
+#define DEFAULT_BACKSCROLL 1000
 #define CONSOLE_CURSOR_PERIOD 500
 
 static const pixman_color_t color_table_rgb[2][8] = {
@@ -21,7 +21,7 @@ static const pixman_color_t color_table_rgb[2][8] = {
         [QEMU_COLOR_CYAN]    = QEMU_PIXMAN_COLOR(0x00, 0xaa, 0xaa),  /* cyan */
         [QEMU_COLOR_RED]     = QEMU_PIXMAN_COLOR(0xaa, 0x00, 0x00),  /* red */
         [QEMU_COLOR_MAGENTA] = QEMU_PIXMAN_COLOR(0xaa, 0x00, 0xaa),  /* magenta */
-        [QEMU_COLOR_YELLOW]  = QEMU_PIXMAN_COLOR(0xaa, 0xaa, 0x00),  /* yellow */
+        [QEMU_COLOR_YELLOW]  = QEMU_PIXMAN_COLOR(0xff, 0xb0, 0x00), /* amber */  /* yellow */
         [QEMU_COLOR_WHITE]   = QEMU_PIXMAN_COLOR_GRAY,
     },
     {   /* bright */
@@ -31,7 +31,7 @@ static const pixman_color_t color_table_rgb[2][8] = {
         [QEMU_COLOR_CYAN]    = QEMU_PIXMAN_COLOR(0x00, 0xff, 0xff),  /* cyan */
         [QEMU_COLOR_RED]     = QEMU_PIXMAN_COLOR(0xff, 0x00, 0x00),  /* red */
         [QEMU_COLOR_MAGENTA] = QEMU_PIXMAN_COLOR(0xff, 0x00, 0xff),  /* magenta */
-        [QEMU_COLOR_YELLOW]  = QEMU_PIXMAN_COLOR(0xff, 0xff, 0x00),  /* yellow */
+        [QEMU_COLOR_YELLOW]  = QEMU_PIXMAN_COLOR(0xff, 0xc0, 0x40), /* amber */  /* yellow */
         [QEMU_COLOR_WHITE]   = QEMU_PIXMAN_COLOR(0xff, 0xff, 0xff),  /* white */
     }
 };
@@ -881,6 +881,12 @@ size_t vt100_input(QemuVT100 *vt, const uint8_t *buf, size_t len)
                            vt->update_y1 - vt->update_y0);
     }
     return len;
+}
+
+void vt100_scroll_by(QemuVT100 *vt, int ydelta)
+{
+    vt100_scroll(vt, ydelta);
+    vt100_refresh(vt);
 }
 
 void vt100_keysym(QemuVT100 *vt, int keysym)

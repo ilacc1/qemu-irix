@@ -36,6 +36,7 @@ NET="${IRIX_NET:-tap}"
 NET_PORT="${IRIX_NET_PORT:-2323}"
 TAP_IF="${IRIX_TAP_IF:-tap-iris}"
 MTTCG="${IRIX_MTTCG:-1}"
+CONSOLE="${IRIX_CONSOLE:-window}"
 
 if [ -z "$DISK" ]; then
   for candidate in "$DIR/ip19-main.chd" "$DIR/../ip19-main.chd"; do
@@ -107,7 +108,18 @@ if [ "${IRIX_HEADLESS:-0}" = 1 ]; then
     -serial "unix:$SERIAL_SOCK,server=on,wait=off" \
     -monitor "unix:$MON_SOCK,server,nowait"
 else
-  set -- "$@" -display "$DISPLAY_MODE" -serial stdio -monitor none
+  case "$CONSOLE" in
+    shell)
+      set -- "$@" -display none -serial stdio -monitor none
+      ;;
+    telnet)
+      set -- "$@" -display none \
+        -serial "telnet:127.0.0.1:4444,server=on,wait=off" -monitor none
+      ;;
+    *)
+      set -- "$@" -display "$DISPLAY_MODE" -serial vc -monitor none
+      ;;
+  esac
 fi
 
 exec "$QEMU" "$@"

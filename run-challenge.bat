@@ -44,6 +44,7 @@ if not defined BIOS (
     goto end
 )
 for %%F in ("%BIOS%") do set "BIOS_DIR=%%~dpF"
+if "%BIOS_DIR:~-1%"=="\" set "BIOS_DIR=%BIOS_DIR:~0,-1%"
 
 if not "%IRIX_DISK%"=="" set "DISK=%IRIX_DISK%"
 if "%DISK%"=="" if exist "%BASE%ip19-main.chd" set "DISK=%BASE%ip19-main.chd"
@@ -83,12 +84,17 @@ if not "%IRIX_CD2%"=="" if exist "%IRIX_CD2%" (
 )
 
 rem Console selection:
-rem   window = GTK window with the serial console (default)
+rem   window = dedicated console window (default)
+rem   gtk    = GTK window with serial VC/View menu
 rem   shell  = run the VM in this console
 rem   telnet = no serial window; telnet 127.0.0.1:4444
 if "%IRIX_CONSOLE%"=="" set "IRIX_CONSOLE=window"
 set "DISPLAY_MODE=gtk,zoom-to-fit=on"
 set "SERIAL_SPEC=vc"
+if /I "%IRIX_CONSOLE%"=="console" (
+    set "DISPLAY_MODE=gtk,zoom-to-fit=on"
+    set "SERIAL_SPEC=stdio"
+)
 if /I "%IRIX_CONSOLE%"=="shell" (
     set "DISPLAY_MODE=none"
     set "SERIAL_SPEC=stdio"

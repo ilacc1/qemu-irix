@@ -44,6 +44,10 @@ typedef struct VirtualGfxConsole {
     double preferred_scale;
     double scale_x;
     double scale_y;
+    bool text_console;
+    bool scroll_updating;
+    GtkWidget *scrollbar;
+    GtkAdjustment *scroll_adjust;
 #if defined(CONFIG_OPENGL)
     QemuGLShader *gls;
     EGLContext ectx;

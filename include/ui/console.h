@@ -369,6 +369,10 @@ QemuConsole *qemu_console_lookup_by_device_name(const char *device_id,
                                                 uint32_t head, Error **errp);
 QEMUCursor *qemu_console_get_cursor(QemuConsole *con);
 bool qemu_console_is_graphic(QemuConsole *con);
+int qemu_text_console_backscroll(QemuConsole *con);
+int qemu_text_console_height(QemuConsole *con);
+int qemu_text_console_offset(QemuConsole *con);
+void qemu_text_console_scroll_to(QemuConsole *con, int offset);
 bool qemu_console_is_fixedsize(QemuConsole *con);
 bool qemu_console_is_gl_blocked(QemuConsole *con);
 char *qemu_console_get_label(QemuConsole *con);

@@ -400,6 +400,33 @@ static void *gd_win32_get_hwnd(VirtualConsole *vc)
 
 /** DisplayState Callbacks **/
 
+static void gd_text_scroll_update(VirtualConsole *vc)
+{
+    int height = qemu_text_console_height(vc->gfx.dcl.con);
+    int back = qemu_text_console_backscroll(vc->gfx.dcl.con);
+    int off = qemu_text_console_offset(vc->gfx.dcl.con);
+
+    if (!vc->gfx.scroll_adjust) {
+        return;
+    }
+    vc->gfx.scroll_updating = true;
+    gtk_adjustment_set_upper(vc->gfx.scroll_adjust, back + height);
+    gtk_adjustment_set_page_size(vc->gfx.scroll_adjust, height);
+    gtk_adjustment_set_value(vc->gfx.scroll_adjust, off);
+    vc->gfx.scroll_updating = false;
+}
+
+static void gd_text_scroll_changed(GtkAdjustment *adj, void *opaque)
+{
+    VirtualConsole *vc = opaque;
+
+    if (vc->gfx.scroll_updating) {
+        return;
+    }
+    qemu_text_console_scroll_to(vc->gfx.dcl.con,
+                                (int)gtk_adjustment_get_value(adj));
+}
+
 static void gd_update(DisplayChangeListener *dcl,
                       int fbx, int fby, int fbw, int fbh)
 {
@@ -414,6 +441,9 @@ static void gd_update(DisplayChangeListener *dcl,
 
     if (!gtk_widget_get_realized(vc->gfx.drawing_area)) {
         return;
+    }
+    if (vc->gfx.text_console) {
+        gd_text_scroll_update(vc);
     }
 
     if (vc->gfx.convert) {
@@ -2234,7 +2264,7 @@ static void gd_vc_vte_init(GtkDisplayState *s, VirtualConsole *vc,
 #endif
 #endif
 
-    vte_terminal_set_scrollback_lines(VTE_TERMINAL(vc->vte.terminal), -1);
+    vte_terminal_set_scrollback_lines(VTE_TERMINAL(vc->vte.terminal), 1000);
     vte_terminal_set_size(VTE_TERMINAL(vc->vte.terminal),
                           VC_TERM_X_MIN, VC_TERM_Y_MIN);
 
@@ -2820,8 +2850,23 @@ add_gfx_console(GtkDisplayState *s, QemuConsole *con)
     gtk_widget_set_can_focus(vc->gfx.drawing_area, TRUE);
 
     vc->type = GD_VC_GFX;
-    vc->tab_item = vc->gfx.drawing_area;
     vc->focus = vc->gfx.drawing_area;
+    if (!qemu_console_is_graphic(con)) {
+        GtkWidget *box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+
+        vc->gfx.text_console = true;
+        vc->gfx.scroll_adjust = gtk_adjustment_new(0, 0, 1, 1, 10, 1);
+        vc->gfx.scrollbar = gtk_scrollbar_new(GTK_ORIENTATION_VERTICAL,
+                                              vc->gfx.scroll_adjust);
+        gtk_range_set_inverted(GTK_RANGE(vc->gfx.scrollbar), TRUE);
+        g_signal_connect(vc->gfx.scroll_adjust, "value-changed",
+                         G_CALLBACK(gd_text_scroll_changed), vc);
+        gtk_box_pack_start(GTK_BOX(box), vc->gfx.drawing_area, TRUE, TRUE, 0);
+        gtk_box_pack_end(GTK_BOX(box), vc->gfx.scrollbar, FALSE, FALSE, 0);
+        vc->tab_item = box;
+    } else {
+        vc->tab_item = vc->gfx.drawing_area;
+    }
     gtk_notebook_append_page(GTK_NOTEBOOK(s->notebook),
                              vc->tab_item, gtk_label_new(vc->label));
 

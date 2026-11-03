@@ -21,7 +21,7 @@ typedef struct TextAttributes {
 } TextAttributes;
 
 #define TEXT_ATTRIBUTES_DEFAULT ((TextAttributes) { \
-    .fgcol = QEMU_COLOR_WHITE,                      \
+    .fgcol = QEMU_COLOR_YELLOW,                     \
     .bgcol = QEMU_COLOR_BLACK                       \
 })
 
@@ -91,5 +91,6 @@ size_t vt100_input(QemuVT100 *vt, const uint8_t *buf, size_t len);
 void vt100_keysym(QemuVT100 *vt, int keysym);
 void vt100_set_image(QemuVT100 *vt, pixman_image_t *image);
 void vt100_refresh(QemuVT100 *vt);
+void vt100_scroll_by(QemuVT100 *vt, int ydelta);
 
 #endif

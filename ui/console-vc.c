@@ -184,6 +184,39 @@ static void vc_chr_set_echo(Chardev *chr, bool echo)
     drv->console->vt.echo = echo;
 }
 
+int qemu_text_console_backscroll(QemuConsole *con)
+{
+    QemuTextConsole *s = QEMU_TEXT_CONSOLE(con);
+    return s->vt.backscroll_height;
+}
+
+int qemu_text_console_height(QemuConsole *con)
+{
+    QemuTextConsole *s = QEMU_TEXT_CONSOLE(con);
+    return s->vt.height;
+}
+
+int qemu_text_console_offset(QemuConsole *con)
+{
+    QemuTextConsole *s = QEMU_TEXT_CONSOLE(con);
+    return (s->vt.y_base - s->vt.y_displayed + s->vt.total_height) %
+           s->vt.total_height;
+}
+
+void qemu_text_console_scroll_to(QemuConsole *con, int offset)
+{
+    QemuTextConsole *s = QEMU_TEXT_CONSOLE(con);
+    int cur = qemu_text_console_offset(con);
+
+    if (offset < 0) {
+        offset = 0;
+    }
+    if (offset > s->vt.backscroll_height) {
+        offset = s->vt.backscroll_height;
+    }
+    vt100_scroll_by(&s->vt, cur - offset);
+}
+
 void qemu_text_console_update_size(QemuTextConsole *c)
 {
     qemu_console_text_resize(QEMU_CONSOLE(c), c->vt.width, c->vt.height);

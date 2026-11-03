@@ -82,13 +82,36 @@ if errorlevel 1 (
     set "NET_ARGS=-net "nic,model=seeq80c03,netdev=net0" -netdev "tap,ifname=my-tap,id=net0""
 )
 
+rem Console: window exposes the PIO console as a GTK serial VC; shell uses
+rem stdio; telnet uses the original PIO socket.
+if "%IRIX_CONSOLE%"=="" set "IRIX_CONSOLE=window"
+set "DISPLAY_MODE=gtk,zoom-to-fit=on"
+set "SERIAL_ARGS=-serial null -serial null -serial vc"
+if /I "%IRIX_CONSOLE%"=="console" (
+    set "DISPLAY_MODE=gtk,zoom-to-fit=on"
+    set "SERIAL_ARGS=-serial null -serial null -serial stdio"
+)
+if /I "%IRIX_CONSOLE%"=="shell" (
+    set "DISPLAY_MODE=none"
+    set "SERIAL_ARGS=-serial null -serial null -serial stdio"
+)
+if /I "%IRIX_CONSOLE%"=="telnet" (
+    set "DISPLAY_MODE=none"
+    set "SERIAL_ARGS=-serial null -serial null -chardev "socket,host=127.0.0.1,port=4444,server=on,wait=off,id=pc" -serial chardev:pc"
+)
+
+if /I "%IRIX_CONSOLE%"=="window" (
+    start "SGI Indy" "%QEMU%" -M indy,audiodev=sgiaudio -audiodev "%IRIX_AUDIO%,id=sgiaudio" -global sgi-mc.simms=0x0eee -global sgi-mc.mc-rev=3 -m 512M -bios "%BIOS%" -drive "file=%DISK%,format=chd,if=scsi,bus=0,unit=1,media=disk,cache=writethrough" %CDROM_ARGS% %NET_ARGS% -parallel none -display gtk,zoom-to-fit=on -serial null -serial null -serial vc -monitor none %*
+    set "RC=0"
+    goto end
+)
+
 echo Starting SGI Indy (IRIX 6.5) ...
 echo   Disk:         %DISK%
-echo   PIO console:  telnet 127.0.0.1 4444
-echo   QEMU monitor: telnet 127.0.0.1 5555
+echo   Console:      %IRIX_CONSOLE%
 echo.
 
-"%QEMU%" -M indy,audiodev=sgiaudio -audiodev "%IRIX_AUDIO%,id=sgiaudio" -global sgi-mc.simms=0x0eee -global sgi-mc.mc-rev=3 -m 512M -bios "%BIOS%" -drive "file=%DISK%,format=chd,if=scsi,bus=0,unit=1,media=disk,cache=writethrough" %CDROM_ARGS% %NET_ARGS% -display gtk,zoom-to-fit=on -serial null -serial null -chardev "socket,host=127.0.0.1,port=4444,server=on,wait=off,id=pc" -serial chardev:pc -monitor "tcp:127.0.0.1:5555,server=on,wait=off" %*
+"%QEMU%" -M indy,audiodev=sgiaudio -audiodev "%IRIX_AUDIO%,id=sgiaudio" -global sgi-mc.simms=0x0eee -global sgi-mc.mc-rev=3 -m 512M -bios "%BIOS%" -drive "file=%DISK%,format=chd,if=scsi,bus=0,unit=1,media=disk,cache=writethrough" %CDROM_ARGS% %NET_ARGS% -parallel none -display "%DISPLAY_MODE%" %SERIAL_ARGS% -monitor none %*
 
 set "RC=%ERRORLEVEL%"
 echo.
