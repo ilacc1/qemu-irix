@@ -400,6 +400,67 @@ static void *gd_win32_get_hwnd(VirtualConsole *vc)
 
 /** DisplayState Callbacks **/
 
+static void gd_text_cell_at(VirtualConsole *vc, double x, double y,
+                             int *col, int *row)
+{
+    int cols = qemu_text_console_width(vc->gfx.dcl.con);
+    int rows = qemu_text_console_height(vc->gfx.dcl.con);
+    int w = surface_width(vc->gfx.ds);
+    int h = surface_height(vc->gfx.ds);
+
+    *col = (int)(x / vc->gfx.scale_x * cols / w);
+    *row = (int)(y / vc->gfx.scale_y * rows / h);
+    *col = CLAMP(*col, 0, cols - 1);
+    *row = CLAMP(*row, 0, rows - 1);
+}
+
+static char *gd_text_selection(VirtualConsole *vc)
+{
+    GString *str = g_string_new(NULL);
+    int x0 = vc->gfx.sel_x0, y0 = vc->gfx.sel_y0;
+    int x1 = vc->gfx.sel_x1, y1 = vc->gfx.sel_y1;
+    int rows = qemu_text_console_height(vc->gfx.dcl.con);
+
+    if (y0 > y1 || (y0 == y1 && x0 > x1)) {
+        int t;
+        t = x0; x0 = x1; x1 = t;
+        t = y0; y0 = y1; y1 = t;
+    }
+    for (int y = y0; y <= y1 && y < rows; y++) {
+        int start = y == y0 ? x0 : 0;
+        int end = y == y1 ? x1 : qemu_text_console_width(vc->gfx.dcl.con) - 1;
+
+        for (int x = start; x <= end; x++) {
+            int ch = qemu_text_console_get_char(vc->gfx.dcl.con, x, y);
+            g_string_append_c(str, ch ? ch : ' ');
+        }
+        if (y != y1) {
+            g_string_append_c(str, '\n');
+        }
+    }
+    return g_string_free(str, FALSE);
+}
+
+static void gd_text_copy_selection(VirtualConsole *vc)
+{
+    g_autofree char *text = gd_text_selection(vc);
+    GtkClipboard *cb = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
+
+    if (text && text[0]) {
+        gtk_clipboard_set_text(cb, text, -1);
+    }
+}
+
+static void gd_text_paste(VirtualConsole *vc)
+{
+    GtkClipboard *cb = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
+    g_autofree char *text = gtk_clipboard_wait_for_text(cb);
+
+    if (text && text[0]) {
+        qemu_text_console_send_text(vc->gfx.dcl.con, text);
+    }
+}
+
 static void gd_text_scroll_update(VirtualConsole *vc)
 {
     int height = qemu_text_console_height(vc->gfx.dcl.con);
@@ -952,6 +1013,41 @@ void gd_update_scale(VirtualConsole *vc, int ww, int wh, int fbw, int fbh)
  * presentation of the guest content.
  */
 
+static void gd_text_draw_selection(VirtualConsole *vc, cairo_t *cr,
+                                   int wx_offset, int wy_offset, int fbw,
+                                   int fbh)
+{
+    int cols = qemu_text_console_width(vc->gfx.dcl.con);
+    int rows = qemu_text_console_height(vc->gfx.dcl.con);
+    int x0 = vc->gfx.sel_x0, y0 = vc->gfx.sel_y0;
+    int x1 = vc->gfx.sel_x1, y1 = vc->gfx.sel_y1;
+    double cw = (double)fbw / cols;
+    double ch = (double)fbh / rows;
+
+    if (!vc->gfx.text_selecting && x0 == x1 && y0 == y1) {
+        return;
+    }
+    if (y0 > y1 || (y0 == y1 && x0 > x1)) {
+        int t;
+        t = x0; x0 = x1; x1 = t;
+        t = y0; y0 = y1; y1 = t;
+    }
+
+    cairo_save(cr);
+    cairo_set_source_rgba(cr, 0.35, 0.65, 1.0, 0.35);
+    for (int y = y0; y <= y1; y++) {
+        int start = y == y0 ? x0 : 0;
+        int end = y == y1 ? x1 : cols - 1;
+
+        cairo_rectangle(cr,
+                        wx_offset / vc->gfx.scale_x + start * cw,
+                        wy_offset / vc->gfx.scale_y + y * ch,
+                        (end - start + 1) * cw, ch);
+    }
+    cairo_fill(cr);
+    cairo_restore(cr);
+}
+
 static gboolean gd_draw_event(GtkWidget *widget, cairo_t *cr, void *opaque)
 {
     VirtualConsole *vc = opaque;
@@ -1024,6 +1120,10 @@ static gboolean gd_draw_event(GtkWidget *widget, cairo_t *cr, void *opaque)
                              wy_offset / vc->gfx.scale_y);
     cairo_paint(cr);
 
+    if (vc->gfx.text_console) {
+        gd_text_draw_selection(vc, cr, wx_offset, wy_offset, fbw, fbh);
+    }
+
     return TRUE;
 }
 
@@ -1069,6 +1169,16 @@ static gboolean gd_motion_event(GtkWidget *widget, GdkEventMotion *motion,
 
     trace_gd_motion_event(ww_widget, wh_widget,
                           gtk_widget_get_scale_factor(widget), fbx, fby);
+
+    if (vc->gfx.text_console) {
+        if (vc->gfx.text_selecting &&
+            (motion->state & GDK_BUTTON1_MASK)) {
+            gd_text_cell_at(vc, motion->x, motion->y,
+                            &vc->gfx.sel_x1, &vc->gfx.sel_y1);
+            gtk_widget_queue_draw(vc->gfx.drawing_area);
+        }
+        return TRUE;
+    }
 
     if (qemu_input_is_absolute(vc->gfx.dcl.con)) {
         if (fbx < 0 || fby < 0 ||
@@ -1129,6 +1239,35 @@ static gboolean gd_button_event(GtkWidget *widget, GdkEventButton *button,
     VirtualConsole *vc = opaque;
     GtkDisplayState *s = vc->s;
     InputButton btn;
+
+    if (vc->gfx.text_console) {
+        if (button->button == 1) {
+            if (button->type == GDK_BUTTON_PRESS) {
+                gd_text_cell_at(vc, button->x, button->y,
+                                &vc->gfx.sel_x0, &vc->gfx.sel_y0);
+                vc->gfx.sel_x1 = vc->gfx.sel_x0;
+                vc->gfx.sel_y1 = vc->gfx.sel_y0;
+                vc->gfx.text_selecting = true;
+                gtk_widget_queue_draw(vc->gfx.drawing_area);
+                return TRUE;
+            }
+            if (button->type == GDK_BUTTON_RELEASE && vc->gfx.text_selecting) {
+                gd_text_cell_at(vc, button->x, button->y,
+                                &vc->gfx.sel_x1, &vc->gfx.sel_y1);
+                vc->gfx.text_selecting = false;
+                if (vc->gfx.sel_x0 != vc->gfx.sel_x1 ||
+                    vc->gfx.sel_y0 != vc->gfx.sel_y1) {
+                    gd_text_copy_selection(vc);
+                }
+                gtk_widget_queue_draw(vc->gfx.drawing_area);
+                return TRUE;
+            }
+        }
+        if (button->button == 3 && button->type == GDK_BUTTON_PRESS) {
+            gd_text_paste(vc);
+            return TRUE;
+        }
+    }
 
     /* implicitly grab the input at the first click in the relative mode */
     if (button->button == 1 && button->type == GDK_BUTTON_PRESS &&
@@ -2354,6 +2493,12 @@ static void gd_connect_vc_gfx_signals(VirtualConsole *vc)
     } else {
         g_signal_connect(vc->gfx.drawing_area, "key-press-event",
                          G_CALLBACK(gd_text_key_down), vc);
+        g_signal_connect(vc->gfx.drawing_area, "button-press-event",
+                         G_CALLBACK(gd_button_event), vc);
+        g_signal_connect(vc->gfx.drawing_area, "button-release-event",
+                         G_CALLBACK(gd_button_event), vc);
+        g_signal_connect(vc->gfx.drawing_area, "motion-notify-event",
+                         G_CALLBACK(gd_motion_event), vc);
     }
 }
 

@@ -46,6 +46,8 @@ typedef struct VirtualGfxConsole {
     double scale_y;
     bool text_console;
     bool scroll_updating;
+    bool text_selecting;
+    int sel_x0, sel_y0, sel_x1, sel_y1;
     GtkWidget *scrollbar;
     GtkAdjustment *scroll_adjust;
 #if defined(CONFIG_OPENGL)
