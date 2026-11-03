@@ -34,10 +34,9 @@ def drain(s, wait=0.4):
 
 def main():
     args = sys.argv[1:]
-    if args and not args[0].startswith("/") and not args[0].endswith(".sock"):
-        path = DEFAULT_SOCK
-    elif args:
-        path = Path(args[0])
+    if args and (args[0].startswith("tcp:") or
+                 args[0].startswith("/") or args[0].endswith(".sock")):
+        path = Path(args[0]) if not args[0].startswith("tcp:") else args[0]
         args = args[1:]
     else:
         path = DEFAULT_SOCK
@@ -45,9 +44,13 @@ def main():
         print(__doc__)
         return 1
 
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.settimeout(5)
-    s.connect(str(path))
+    if str(path).startswith("tcp:"):
+        host, port = str(path)[4:].rsplit(":", 1)
+        s = socket.create_connection((host, int(port)), timeout=5)
+    else:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(5)
+        s.connect(str(path))
     banner = drain(s)
     for cmd in args:
         s.sendall((cmd + "\n").encode())

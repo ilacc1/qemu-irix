@@ -87,6 +87,7 @@ void helper_wait(CPUMIPSState *env)
  * they stay fast. No guest modification; sleeps are always safe.
  * SGI_IDLE_PC=0 or SGI_IDLE_SPIN=0 disables; SGI_IDLE_THRESH tunes. */
 uint64_t sgi_idle_pc = 0xffffffff8815dd24ULL;
+uint64_t sgi_idle_pc_alt = 0;
 uint32_t sgi_idle_thresh = 100;
 int sgi_idle_on = 1;
 int sgi_idle_sleep = 0;

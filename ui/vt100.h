@@ -53,6 +53,7 @@ struct QemuVT100 {
     int total_height;
     int backscroll_height;
     int x, y;
+    bool wrap_pending;
     int y_displayed;
     int y_base;
     TextCell *cells;

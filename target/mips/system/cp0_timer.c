@@ -43,9 +43,18 @@ static void cpu_mips_timer_update(CPUMIPSState *env)
 
     now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     wait = env->CP0_Compare - cpu_mips_get_count_val(env);
-    /* Clamp interval to overflow if virtual time had not progressed */
-    if (!wait) {
-        wait = UINT32_MAX;
+    /*
+     * A late host timer callback can leave Count already past Compare.
+     * In that case the unsigned subtraction underflows to almost 2^32
+     * ticks, which suppresses every following scheduler tick for about
+     * 17 seconds at 250 MHz.  Re-arm after a normal 10 ms scheduler
+     * interval instead, avoiding both the wrap and an interrupt storm.
+     */
+    if (!wait || (int32_t)wait < 0) {
+        wait = clock_ns_to_ticks(cpu->count_clock, 10 * 1000000ULL);
+        if (!wait) {
+            wait = 1;
+        }
     }
     next_ns = now_ns + clock_ticks_to_ns(cpu->count_clock, wait);
     timer_mod(env->timer, next_ns);

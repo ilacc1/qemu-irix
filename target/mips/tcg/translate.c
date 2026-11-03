@@ -15169,6 +15169,7 @@ static void mips_tr_insn_start(DisasContextBase *dcbase, CPUState *cs)
  * (helper_sgi_idle_check). One compare per translated instruction; zero
  * execution cost unless the idle PC matches. */
 extern uint64_t sgi_idle_pc;
+extern uint64_t sgi_idle_pc_alt;
 extern int sgi_idle_on;
 extern uint64_t sgi_prom_pc;
 extern int sgi_prom_on;
@@ -15180,7 +15181,10 @@ static void mips_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
     int insn_bytes;
     int is_slot;
 
-    if (sgi_idle_on && ctx->base.pc_next == (target_ulong)sgi_idle_pc) {
+    if (sgi_idle_on &&
+        (ctx->base.pc_next == (target_ulong)sgi_idle_pc ||
+         (sgi_idle_pc_alt &&
+          ctx->base.pc_next == (target_ulong)sgi_idle_pc_alt))) {
         save_cpu_state(ctx, 1);
         gen_helper_sgi_idle_check(tcg_env);
     }

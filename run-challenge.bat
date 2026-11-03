@@ -58,6 +58,8 @@ if not "%IRIX_MTTCG%"=="" set "MTTCG=%IRIX_MTTCG%"
 if "%MTTCG%"=="" set "MTTCG=1"
 set "MTTCG_ARGS="
 if "%MTTCG%"=="1" set "MTTCG_ARGS=-accel tcg,thread=multi"
+rem Temporary default while debugging PROM boot failures.
+if "%IRIX_MONITOR%"=="" set "IRIX_MONITOR=tcp:127.0.0.1:4445,server=on,wait=off"
 set "DISK_FORMAT=chd"
 if not "%IRIX_DISK_FORMAT%"=="" set "DISK_FORMAT=%IRIX_DISK_FORMAT%"
 
@@ -74,9 +76,11 @@ if not exist "%DISK%" (
     goto end
 )
 
-set "CDROM_ARGS="
+rem Keep one CD-ROM drive present even with no media, so the GTK
+rem removable-media menu can be used to insert an ISO later.
+set "CDROM_ARGS=-drive "if=none,id=ip19cdrom,media=cdrom""
 if not "%IRIX_CD%"=="" if exist "%IRIX_CD%" (
-    set "CDROM_ARGS=-drive "file=%IRIX_CD%,format=raw,if=none,id=ip19cdrom,readonly=on""
+    set "CDROM_ARGS=-drive "file=%IRIX_CD%,format=raw,if=none,id=ip19cdrom,media=cdrom,readonly=on""
 )
 set "CDROM2_ARGS="
 if not "%IRIX_CD2%"=="" if exist "%IRIX_CD2%" (
@@ -128,12 +132,12 @@ echo   Console:      %IRIX_CONSOLE%
 echo.
 
 if /I "%IRIX_CONSOLE%"=="window" (
-    start "SGI Challenge" "%QEMU%" -M ip19 -smp %SMP% -m %RAM% %MTTCG_ARGS% -bios "%BIOS%" -L "%BIOS_DIR%" %SNAP_ARGS% -drive "file=%DISK%,format=%DISK_FORMAT%,if=none,id=ip19disk" %CDROM_ARGS% %CDROM2_ARGS% %NET_ARGS% -parallel none -display gtk,zoom-to-fit=on -serial vc -monitor none %*
+    start "SGI Challenge" "%QEMU%" -M ip19 -smp %SMP% -m %RAM% %MTTCG_ARGS% -bios "%BIOS%" -L "%BIOS_DIR%" %SNAP_ARGS% -drive "file=%DISK%,format=%DISK_FORMAT%,if=none,id=ip19disk" %CDROM_ARGS% %CDROM2_ARGS% %NET_ARGS% -parallel none -display gtk,zoom-to-fit=on -serial vc -monitor "%IRIX_MONITOR%" %*
     set "RC=0"
     goto end
 )
 
-"%QEMU%" -M ip19 -smp %SMP% -m %RAM% %MTTCG_ARGS% -bios "%BIOS%" -L "%BIOS_DIR%" %SNAP_ARGS% -drive "file=%DISK%,format=%DISK_FORMAT%,if=none,id=ip19disk" %CDROM_ARGS% %CDROM2_ARGS% %NET_ARGS% -parallel none -display "%DISPLAY_MODE%" -serial "%SERIAL_SPEC%" -monitor none %*
+"%QEMU%" -M ip19 -smp %SMP% -m %RAM% %MTTCG_ARGS% -bios "%BIOS%" -L "%BIOS_DIR%" %SNAP_ARGS% -drive "file=%DISK%,format=%DISK_FORMAT%,if=none,id=ip19disk" %CDROM_ARGS% %CDROM2_ARGS% %NET_ARGS% -parallel none -display "%DISPLAY_MODE%" -serial "%SERIAL_SPEC%" -monitor "%IRIX_MONITOR%" %*
 
 set "RC=%ERRORLEVEL%"
 echo.

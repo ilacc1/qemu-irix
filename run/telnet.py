@@ -12,6 +12,7 @@ import re
 import socket
 import sys
 import time
+from pathlib import Path
 
 IAC = 255
 DONT = 254
@@ -106,10 +107,14 @@ def main():
     ap.add_argument("--pass", dest="password", default="")
     ap.add_argument("--wait", type=float, default=3.0)
     ap.add_argument("--timeout", type=float, default=30.0)
+    ap.add_argument("--command-file")
     ap.add_argument("command", nargs="*")
     args = ap.parse_args()
 
-    cmd = " ".join(args.command)
+    if args.command_file:
+        cmd = Path(args.command_file).read_text()
+    else:
+        cmd = " ".join(args.command)
     sock = socket.create_connection((args.host, args.port), timeout=10)
 
     text, ok = wait_for(sock, r"login|name|username", args.wait)

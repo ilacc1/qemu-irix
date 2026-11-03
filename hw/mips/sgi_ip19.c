@@ -265,6 +265,7 @@ static bool ip19_debug_enabled(void)
 /* CC local-interrupt enable bits in EV_ILE. */
 #define EV_ILE_EBUSINT      0x01
 #define EV_ILE_CMPINT       0x02
+#define EV_ILE_UARTINT      0x04
 
 #define SCC_RR0_TX_EMPTY    0x04
 
@@ -325,6 +326,7 @@ struct SGI_IP19State {
     uint64_t cel[IP19_MAX_CPUS];
     uint32_t cmpreg[IP19_MAX_CPUS];
     bool cmpint[IP19_MAX_CPUS];
+    bool uartint[IP19_MAX_CPUS];
     QEMUTimer *cmp_timer[IP19_MAX_CPUS];
     IP19CmpTimer cmp_ctx[IP19_MAX_CPUS];
     uint64_t wgdst;
@@ -481,6 +483,9 @@ static void ip19_update_irq(SGI_IP19State *s, unsigned cpu)
      */
     if (s->cmpint[cpu] && (s->ile[cpu] & EV_ILE_CMPINT)) {
         cause |= IP19_CAUSE_IP3;
+    }
+    if (s->uartint[cpu] && (s->ile[cpu] & EV_ILE_UARTINT)) {
+        cause |= IP19_CAUSE_IP4;
     }
     for (ip = 0; ip < 8; ip++) {
         /*
@@ -660,6 +665,15 @@ static void ip19_cc_uart_push(SGI_IP19State *s, uint8_t ch)
         s->cc_uart_fifo[s->cc_uart_head] = ch;
         s->cc_uart_head = next;
     }
+}
+
+static void ip19_cc_uart_irq(SGI_IP19State *s, unsigned cpu)
+{
+    if (cpu >= IP19_MAX_CPUS) {
+        cpu = 0;
+    }
+    s->uartint[cpu] = true;
+    ip19_update_irq(s, cpu);
 }
 
 static void ip19_cc_uart_putc(SGI_IP19State *s, uint8_t ch)
@@ -884,6 +898,11 @@ static MemTxResult ip19_cc_write(void *opaque, hwaddr off, uint64_t val,
         /* EV_CIPL124 takes a mask of local interrupt classes. */
         if (val & EV_ILE_CMPINT) {
             s->cmpint[cpu] = false;
+        }
+        if (val & EV_ILE_UARTINT) {
+            s->uartint[cpu] = false;
+        }
+        if (val & (EV_ILE_CMPINT | EV_ILE_UARTINT)) {
             ip19_update_irq(s, cpu);
         }
         /* fall through */
@@ -934,10 +953,9 @@ static MemTxResult ip19_cc_write(void *opaque, hwaddr off, uint64_t val,
         ip19_cc_uart_putc(s, ch);
 
         /*
-         * Minimal sysctlr protocol responder: answer the debug-switch
-         * query with VDS_NO_DIAGS so bring-up can skip the very slow
-         * destructive IO4/map-RAM diagnostics.  Other commands are
-         * terminated and ignored.
+         * Minimal sysctlr protocol responder for the CC UART path.
+         * It answers the PROM debug query and the sysctlrd/sysctlr
+         * GET requests, and accepts SET commands such as SC_MESSAGE.
          */
         if (ch == 0x18) {                 /* SC_ESCAPE */
             s->cc_cmd_len = 0;
@@ -947,64 +965,61 @@ static MemTxResult ip19_cc_write(void *opaque, hwaddr off, uint64_t val,
                 s->cc_cmd[s->cc_cmd_len++] = ch;
             }
             if (ch == 0x0a) {             /* SC_TERM */
-                if (s->cc_cmd_len >= 5 && s->cc_cmd[1] == 0x47 &&
-                    s->cc_cmd[2] == 0x44 && s->cc_cmd[3] == 0x44) {
-                    /*
-                     * Debug-switch query.  Report VDS_NO_DIAGS so
-                     * bring-up skips the very slow destructive
-                     * IO4/map-RAM diagnostics.
-                     */
-                    static const uint8_t resp[] = {
-                        0x52, 0x44, 0x44, '0', '0', '1', '0', 0
-                    };
-                    for (unsigned i = 0; i < sizeof(resp); i++) {
-                        ip19_cc_uart_push(s, resp[i]);
-                    }
-                } else if (s->cc_cmd_len >= 5 && s->cc_cmd[1] == 0x47 &&
-                           s->cc_cmd[2] == 0x53 &&
-                           s->cc_cmd[3] == 0x53) {
-                    /*
-                     * SC_GET SC_SERIAL: reply R, sequence, type, then
-                     * the NUL-terminated serial number.  The PROM and
-                     * kernel both use this to validate the system
-                     * controller serial.
-                     */
-                    unsigned len = strlen(s->sysctlr_serial) + 1;
+                if (s->cc_cmd_len >= 4 && s->cc_cmd[1] == 0x47) {
+                    uint8_t seq = s->cc_cmd[2];
+                    uint8_t type = s->cc_cmd[3];
 
-                    if (len > 10) {
-                        len = 10;
-                    }
                     ip19_cc_uart_push(s, 0x52);      /* SC_RESP */
-                    ip19_cc_uart_push(s, 0x53);      /* SC_SERIAL */
-                    ip19_cc_uart_push(s, 0x53);      /* SC_SERIAL */
-                    for (unsigned i = 0; i < len; i++) {
-                        uint8_t c = i < strlen(s->sysctlr_serial)
-                                    ? s->sysctlr_serial[i] : 0;
-                        ip19_cc_uart_push(s, c);
-                        if (c == 0) {
-                            break;
-                        }
-                    }
-                } else if (s->cc_cmd_len >= 4 && s->cc_cmd[1] == 0x53 &&
-                           s->cc_cmd[2] == 0x53) {
-                    /*
-                     * SC_SET SC_SERIAL: store a new NUL-padded serial
-                     * (up to the 10-byte protocol limit).
-                     */
-                    unsigned len = s->cc_cmd_len - 4;
-                    unsigned i;
+                    ip19_cc_uart_push(s, seq);
+                    ip19_cc_uart_push(s, type);
 
-                    if (len > sizeof(s->sysctlr_serial) - 1) {
-                        len = sizeof(s->sysctlr_serial) - 1;
+                    if (type == 0x44) {              /* SC_DEBUG */
+                        /*
+                         * Report VDS_NO_DIAGS so bring-up skips the very
+                         * slow destructive IO4/map-RAM diagnostics.
+                         */
+                        static const uint8_t info[] = { '0', '0', '1', '0' };
+                        for (unsigned i = 0; i < sizeof(info); i++) {
+                            ip19_cc_uart_push(s, info[i]);
+                        }
+                    } else if (type == 0x53) {       /* SC_SERIAL */
+                        const char *serial = s->sysctlr_serial;
+                        size_t len = MIN(strlen(serial), (size_t)10);
+
+                        for (unsigned i = 0; i < len; i++) {
+                            ip19_cc_uart_push(s, serial[i]);
+                        }
+                    } else if (type == 0x43) {       /* SC_CHECK */
+                        ip19_cc_uart_push(s, 'N');    /* no length mode */
                     }
-                    for (i = 0; i < len; i++) {
-                        s->sysctlr_serial[i] = s->cc_cmd[3 + i];
+                    ip19_cc_uart_push(s, 0);
+                } else if (s->cc_cmd_len >= 4 && s->cc_cmd[1] == 0x53) {
+                    switch (s->cc_cmd[2]) {
+                    case 0x53: {                     /* SC_SERIAL */
+                        unsigned len = s->cc_cmd_len - 4;
+                        unsigned i;
+
+                        if (len > sizeof(s->sysctlr_serial) - 1) {
+                            len = sizeof(s->sysctlr_serial) - 1;
+                        }
+                        for (i = 0; i < len; i++) {
+                            s->sysctlr_serial[i] = s->cc_cmd[3 + i];
+                        }
+                        s->sysctlr_serial[i] = '\0';
+                        break;
                     }
-                    s->sysctlr_serial[i] = '\0';
+                    case 0x4d:                       /* SC_MESSAGE */
+                    case 0x5a:                       /* SC_SNOOZE */
+                    case 0x43:                       /* SC_CHECK */
+                        break;
+                    default:
+                        break;
+                    }
                 }
                 s->cc_cmd_len = 0;
             }
         }
+        ip19_cc_uart_irq(s, cpu);
         break;
     }
     default:
@@ -2456,6 +2471,7 @@ static void ip19_preload_io4_segments(const char *filename)
 }
 
 extern uint64_t sgi_idle_pc;
+extern uint64_t sgi_idle_pc_alt;
 extern int sgi_idle_on;
 extern int sgi_idle_sleep;
 
@@ -2533,13 +2549,19 @@ static void sgi_ip19_init(MachineState *machine)
      * default in target/mips remains the Indy IP24 address for other
      * machines.
      */
-    sgi_idle_pc = 0xa8000000000ea174ULL;
+    sgi_idle_pc = 0xa8000000000ef4d0ULL;
+    sgi_idle_pc_alt = 0xa8000000000ea174ULL;
     /*
-     * The IP19 local_idle halt/sleep path can lose the CC scheduler
-     * clock on both CPUs.  Leave it disabled by default; IP19_IDLE=1
-     * enables the old experimental path for testing.
+     * IRIX's IP19 local_idle loop can be halted until the next timer or
+     * device interrupt.  The CC timer underflow fix keeps lbolt advancing;
+     * IP19_IDLE=0 is an escape hatch for bisection.
      */
-    sgi_idle_on = g_getenv("IP19_IDLE") != NULL;
+    {
+        const char *idle = g_getenv("IP19_IDLE");
+
+        sgi_idle_on = !idle ||
+                      (idle[0] != '0' && idle[0] != 'n' && idle[0] != 'N');
+    }
     {
         const char *idle_sleep = g_getenv("SGI_IDLE_SLEEP");
 
@@ -2877,6 +2899,7 @@ static void sgi_ip19_reset(MachineState *machine, ResetType type)
             timer_del(s->cmp_timer[i]);
         }
         s->cmpint[i] = false;
+        s->uartint[i] = false;
         s->cmpreg[i] = 0;
         s->cpu_held[i] = ip19_hold_secondaries() &&
                          i != 0 && i < machine->smp.cpus;

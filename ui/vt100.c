@@ -250,6 +250,7 @@ static void vt100_put_lf(QemuVT100 *vt)
     TextCell *c;
     int x, y1;
 
+    vt->wrap_pending = false;
     vt->y++;
     if (vt->y >= vt->height) {
         vt->y = vt->height - 1;
@@ -472,17 +473,34 @@ static void vt100_put_one(QemuVT100 *vt, uint8_t ch)
 {
     TextCell *c;
     int y1;
-    if (vt->x >= vt->width) {
-        /* line wrap */
+
+    /*
+     * VT100 terminals defer the wrap until the next printable character.
+     * This matters for full-screen programs such as osview, which position
+     * the cursor with relative C/D moves and assume the cursor remains in
+     * the last column after writing the final cell.
+     */
+    if (vt->wrap_pending) {
+        vt->wrap_pending = false;
+        vt->x = 0;
+        vt100_put_lf(vt);
+    } else if (vt->x >= vt->width) {
+        /* Defensive fallback for an invalid cursor position. */
         vt->x = 0;
         vt100_put_lf(vt);
     }
+
     y1 = (vt->y_base + vt->y) % vt->total_height;
     c = &vt->cells[y1 * vt->width + vt->x];
     c->ch = ch;
     c->t_attrib = vt->t_attrib;
     vt100_update_xy(vt, vt->x, vt->y);
-    vt->x++;
+    if (vt->x + 1 >= vt->width) {
+        vt->x = vt->width - 1;
+        vt->wrap_pending = true;
+    } else {
+        vt->x++;
+    }
 }
 
 /* set cursor, checking bounds */
@@ -503,6 +521,7 @@ static void vt100_set_cursor(QemuVT100 *vt, int x, int y)
 
     vt->x = x;
     vt->y = y;
+    vt->wrap_pending = false;
 }
 
 /**
@@ -520,6 +539,7 @@ static void vt100_csi_P(QemuVT100 *vt, unsigned int nr)
     if (!nr) {
         nr = 1;
     }
+    vt->wrap_pending = false;
     if (nr > vt->width - vt->x) {
         nr = vt->width - vt->x;
         if (!nr) {
@@ -560,6 +580,7 @@ static void vt100_csi_at(QemuVT100 *vt, unsigned int nr)
     if (!nr) {
         nr = 1;
     }
+    vt->wrap_pending = false;
     if (nr > vt->width - vt->x) {
         nr = vt->width - vt->x;
         if (!nr) {
@@ -631,16 +652,20 @@ static void vt100_putchar(QemuVT100 *vt, uint8_t ch)
         switch (ch) {
         case '\r':  /* carriage return */
             vt->x = 0;
+            vt->wrap_pending = false;
             break;
         case '\n':  /* newline */
             vt100_put_lf(vt);
             break;
         case '\b':  /* backspace */
-            if (vt->x > 0) {
+            if (vt->wrap_pending) {
+                vt->wrap_pending = false;
+            } else if (vt->x > 0) {
                 vt->x--;
             }
             break;
         case '\t':  /* tabspace */
+            vt->wrap_pending = false;
             if (vt->x + (8 - (vt->x % 8)) > vt->width) {
                 vt->x = 0;
                 vt100_put_lf(vt);
@@ -910,7 +935,27 @@ void vt100_keysym(QemuVT100 *vt, int keysym)
     default:
         /* convert the QEMU keysym to VT100 key string */
         q = buf;
-        if (keysym >= 0xe100 && keysym <= 0xe11f) {
+        /*
+         * A VT100 in application-cursor mode sends SS3 (ESC O) for the
+         * arrow keys.  IRIX's vt100 terminfo uses those sequences for
+         * kcuu1/kcud1/kcuf1/kcub1, so vi can decode the arrows while the
+         * rest of the terminal remains normal VT100.
+         */
+        switch (keysym) {
+        case QEMU_KEY_UP:
+            *q++ = '\033'; *q++ = 'O'; *q++ = 'A';
+            break;
+        case QEMU_KEY_DOWN:
+            *q++ = '\033'; *q++ = 'O'; *q++ = 'B';
+            break;
+        case QEMU_KEY_RIGHT:
+            *q++ = '\033'; *q++ = 'O'; *q++ = 'C';
+            break;
+        case QEMU_KEY_LEFT:
+            *q++ = '\033'; *q++ = 'O'; *q++ = 'D';
+            break;
+        default:
+            if (keysym >= 0xe100 && keysym <= 0xe11f) {
             *q++ = '\033';
             *q++ = '[';
             c = keysym - 0xe100;
@@ -926,8 +971,10 @@ void vt100_keysym(QemuVT100 *vt, int keysym)
         } else if (vt->echo && (keysym == '\r' || keysym == '\n')) {
             vt100_input(vt, (uint8_t *)"\r", 1);
             *q++ = '\n';
-        } else {
-            *q++ = keysym;
+            } else {
+                *q++ = keysym;
+            }
+            break;
         }
         if (vt->echo) {
             vt100_input(vt, buf, q - buf);

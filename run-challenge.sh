@@ -71,9 +71,13 @@ if [ -n "$DISK" ]; then
   set -- "$@" -drive \
     "file=$DISK,format=$DISK_FORMAT,if=none,id=ip19disk"
 fi
+# Keep a CD-ROM drive present without media so the GTK removable-media
+# menu can insert an ISO later.
 if [ -n "$CD" ]; then
   set -- "$@" -drive \
-    "file=$CD,format=${IRIX_CD_FORMAT:-raw},if=none,id=ip19cdrom,readonly=on"
+    "file=$CD,format=${IRIX_CD_FORMAT:-raw},if=none,id=ip19cdrom,media=cdrom,readonly=on"
+else
+  set -- "$@" -drive "if=none,id=ip19cdrom,media=cdrom"
 fi
 if [ -n "$CD2" ]; then
   set -- "$@" -drive \
