@@ -600,6 +600,34 @@ const mips_def_t mips_defs[] =
         .mmu_type = MMU_TYPE_R4000,
     },
     {
+        .name = "R4400SC",
+        .CP0_PRid = 0x00000450,
+        /*
+         * R4400 revision above the IRIX primary-cache writeback workaround
+         * cutoff.  IRIX only takes its normal cache path for major
+         * revisions above 4; older identities run a 32-bit-only fallback
+         * that is invalid in the 64-bit IP19 kernel.
+         */
+        .CP0_Config0 = (2 << CP0C0_Impl) | (2 << CP0C0_IC) | (2 << CP0C0_DC) |
+                       (1 << CP0C0_IB) | (1 << CP0C0_DB) |
+                       (2 << CP0C0_K0) | 0x00628000,
+        .CP0_Config1 = (1 << CP0C1_FP) | (1 << CP0C1_WR) |
+                       (47 << CP0C1_MMU),
+        .CP0_LLAddr_rw_bitmask = 0xFFFFFFFF,
+        .CP0_LLAddr_shift = 4,
+        .SYNCI_Step = 16,
+        .CCRes = 2,
+        .CP0_Status_rw_bitmask = 0x3678FFFF,
+        /* R4400 keeps the R4000 integrated FPU identity used by IP19. */
+        .CP1_fcr0 = (0x5 << FCR0_PRID) | (0x0 << FCR0_REV),
+        .CP1_fcr31 = 0,
+        .CP1_fcr31_rw_bitmask = 0x0183FFFF,
+        .SEGBITS = 40,
+        .PABITS = 36,
+        .insn_flags = CPU_MIPS3,
+        .mmu_type = MMU_TYPE_R4000,
+    },
+    {
         .name = "VR5432",
         .CP0_PRid = 0x00005400,
         /* No L2 cache, icache size 8k, dcache size 8k, uncached coherency. */

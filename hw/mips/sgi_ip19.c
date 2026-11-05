@@ -155,15 +155,6 @@ static bool ip19_debug_enabled(void)
 #define IP19_RTC_HZ         47619048ULL
 #define IP19_CPU_HZ         500000000ULL
 
-/*
- * IP19 uses R4000SC parts at revision 3.0 or later.  The IP19 kernel is
- * built without JUMP_WAR (see kern/kcommondefs), so coproc_find() panics
- * when CP0 PRId reports a pre-3.0 R4000 (major <= 2, minor <= 2).  QEMU's
- * R4000SC model reports revision 0.0; publish the minimum supported IP19
- * revision instead.
- */
-#define IP19_CPU_PRID       0x00000430
-
 /* CC local resources, IP19.h */
 #define CC_SPNUM            0x008
 #define CC_KZRESET          0x010
@@ -2600,7 +2591,6 @@ static void sgi_ip19_init(MachineState *machine)
          * ordinary RAM on 512 MiB machines.
          */
         cpu->ip19_io4_window = true;
-        cpu->env.CP0_PRid = IP19_CPU_PRID;
         CPU(cpu)->cpu_index = i;
         /*
          * Hold the secondary slices out of reset until the bootmaster
@@ -2901,14 +2891,9 @@ static void sgi_ip19_reset(MachineState *machine, ResetType type)
                          i != 0 && i < machine->smp.cpus;
     }
 
-    /*
-     * mips_cpu_reset_hold() restores CP0 PRId from the CPU model.  Keep
-     * the IP19 revision visible after every machine reset as well.
-     */
     CPU_FOREACH(cs) {
         unsigned cpu = cs->cpu_index;
 
-        MIPS_CPU(cs)->env.CP0_PRid = IP19_CPU_PRID;
         if (cpu != 0 && cpu < IP19_MAX_CPUS && s->cpu_held[cpu]) {
             cs->halted = 1;
         }
@@ -2927,7 +2912,7 @@ static void sgi_ip19_class_init(ObjectClass *oc, const void *data)
     mc->reset = sgi_ip19_reset;
     mc->max_cpus = IP19_MAX_CPUS;
     mc->default_cpus = 1;
-    mc->default_cpu_type = MIPS_CPU_TYPE_NAME("R4000SC");
+    mc->default_cpu_type = MIPS_CPU_TYPE_NAME("R4400SC");
     mc->default_ram_size = 512 * MiB;
     mc->default_ram_id = "sgi_ip19.ram";
 }
