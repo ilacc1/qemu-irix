@@ -320,7 +320,7 @@ Test commands and results (patched PROM, installed `ip19-installed.chd`,
 
 ```
 qemu-system-mips64 -M ip19 -smp 1 -m 512M -bios sgi/challenge/ip19prom.bin \
-  -L sgi/challenge -snapshot -drive file=.../ip19-installed.chd,format=chd,if=none,id=ip19disk
+  -L sgi/challenge -snapshot -drive file=.../ip19-installed.chd,format=chd,if=none,id=ip19disk -device scsi-hd,drive=ip19disk,bus=main-system-bus/sgi-s1/scsi.0,scsi-id=1
 ```
 
 Result: PROM, IO4 menu, IRIX banner, SCSI, `IRIS console login:` — no
@@ -328,7 +328,7 @@ regression.
 
 ```
 qemu-system-mips64 -M ip19 -smp 2 -m 512M -bios sgi/challenge/ip19prom.bin \
-  -L sgi/challenge -snapshot -drive file=.../ip19-installed.chd,format=chd,if=none,id=ip19disk
+  -L sgi/challenge -snapshot -drive file=.../ip19-installed.chd,format=chd,if=none,id=ip19disk -device scsi-hd,drive=ip19disk,bus=main-system-bus/sgi-s1/scsi.0,scsi-id=1
 ```
 
 Result: “CPU 01/00 is bootmaster”, “Enabled 2 processors”, IO4 “Starting

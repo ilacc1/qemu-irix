@@ -78,15 +78,10 @@ if not exist "%DISK%" (
 
 rem Keep one CD-ROM drive present even with no media, so the GTK
 rem removable-media menu can be used to insert an ISO later.
-set "CDROM_ARGS=-drive "if=none,id=ip19cdrom,media=cdrom""
+set "CDROM_ARGS=-drive "if=none,id=ip19cdrom,media=cdrom" -device "scsi-cd,drive=ip19cdrom,bus=main-system-bus/sgi-s1/scsi.0,scsi-id=5,logical_block_size=512,physical_block_size=512""
 if not "%IRIX_CD%"=="" if exist "%IRIX_CD%" (
-    set "CDROM_ARGS=-drive "file=%IRIX_CD%,format=raw,if=none,id=ip19cdrom,media=cdrom,readonly=on""
+    set "CDROM_ARGS=-drive "file=%IRIX_CD%,format=raw,if=none,id=ip19cdrom,media=cdrom,readonly=on" -device "scsi-cd,drive=ip19cdrom,bus=main-system-bus/sgi-s1/scsi.0,scsi-id=5,logical_block_size=512,physical_block_size=512""
 )
-set "CDROM2_ARGS="
-if not "%IRIX_CD2%"=="" if exist "%IRIX_CD2%" (
-    set "CDROM2_ARGS=-drive "file=%IRIX_CD2%,format=raw,if=none,id=ip19cdrom2,readonly=on""
-)
-
 rem Console selection:
 rem   window = dedicated console window (default)
 rem   gtk    = GTK window with serial VC/View menu
@@ -132,12 +127,12 @@ echo   Console:      %IRIX_CONSOLE%
 echo.
 
 if /I "%IRIX_CONSOLE%"=="window" (
-    start "SGI Challenge" "%QEMU%" -M ip19 -smp %SMP% -m %RAM% %MTTCG_ARGS% -bios "%BIOS%" -L "%BIOS_DIR%" %SNAP_ARGS% -drive "file=%DISK%,format=%DISK_FORMAT%,if=none,id=ip19disk" %CDROM_ARGS% %CDROM2_ARGS% %NET_ARGS% -parallel none -display gtk,zoom-to-fit=on -serial vc -monitor "%IRIX_MONITOR%" %*
+    start "SGI Challenge" "%QEMU%" -M ip19 -smp %SMP% -m %RAM% %MTTCG_ARGS% -bios "%BIOS%" -L "%BIOS_DIR%" %SNAP_ARGS% -drive "file=%DISK%,format=%DISK_FORMAT%,if=none,id=ip19disk" -device "scsi-hd,drive=ip19disk,bus=main-system-bus/sgi-s1/scsi.0,scsi-id=1" %CDROM_ARGS% %NET_ARGS% -parallel none -display gtk,zoom-to-fit=on -serial vc -monitor "%IRIX_MONITOR%" %*
     set "RC=0"
     goto end
 )
 
-"%QEMU%" -M ip19 -smp %SMP% -m %RAM% %MTTCG_ARGS% -bios "%BIOS%" -L "%BIOS_DIR%" %SNAP_ARGS% -drive "file=%DISK%,format=%DISK_FORMAT%,if=none,id=ip19disk" %CDROM_ARGS% %CDROM2_ARGS% %NET_ARGS% -parallel none -display "%DISPLAY_MODE%" -serial "%SERIAL_SPEC%" -monitor "%IRIX_MONITOR%" %*
+"%QEMU%" -M ip19 -smp %SMP% -m %RAM% %MTTCG_ARGS% -bios "%BIOS%" -L "%BIOS_DIR%" %SNAP_ARGS% -drive "file=%DISK%,format=%DISK_FORMAT%,if=none,id=ip19disk" -device "scsi-hd,drive=ip19disk,bus=main-system-bus/sgi-s1/scsi.0,scsi-id=1" %CDROM_ARGS% %NET_ARGS% -parallel none -display "%DISPLAY_MODE%" -serial "%SERIAL_SPEC%" -monitor "%IRIX_MONITOR%" %*
 
 set "RC=%ERRORLEVEL%"
 echo.

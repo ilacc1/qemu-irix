@@ -31,7 +31,6 @@
 #include "hw/core/qdev.h"
 #include "accel/tcg/cpu-loop.h"
 #include "system/address-spaces.h"
-#include "system/block-backend.h"
 #include "system/cpus.h"
 #include "system/reset.h"
 #include "system/runstate.h"
@@ -530,7 +529,11 @@ static void ip19_cmp_rearm(SGI_IP19State *s, unsigned cpu)
     delta = s->cmpreg[cpu] - now;
     now_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
 
-    if (!delta) {
+    /*
+     * If the comparator has already passed, fire immediately instead of
+     * letting the unsigned subtraction wrap to a full 32-bit RTC period.
+     */
+    if (!delta || (int32_t)delta < 0) {
         delta = 1;
     }
     fire_ns = now_ns + muldiv64(delta, 1000000000ULL, IP19_RTC_HZ);
@@ -2785,8 +2788,7 @@ static void sgi_ip19_init(MachineState *machine)
     }
     memory_region_add_subregion(sysmem, IP19_IO4_REGION_BASE, &s->io4);
 
-    s->s1 = sgi_s1_attach(sysmem, IP19_S1_BASE, blk_by_name("ip19disk"),
-                          blk_by_name("ip19cdrom"), blk_by_name("ip19cdrom2"));
+    s->s1 = sgi_s1_attach(sysmem, IP19_S1_BASE);
     {
         qemu_irq irq = qemu_allocate_irq(ip19_s1_irq, s, 0);
 
@@ -2885,15 +2887,9 @@ static void sgi_ip19_reset(MachineState *machine, ResetType type)
     s->rtc_yield_armed = false;
     s->rtc_yield_until_ns = 0;
     /*
-     * Rebase the PROM's 2-second arbitration barrier at reset.  QEMU
-     * sets the initial epoch in sgi_ip19_init, but machine construction
-     * can take a while before the vCPUs start.  Starting the epoch here
-     * guarantees CPU 0 reaches the barrier before it expires; the held
-     * secondary slices are released after the barrier and take the
-     * late-start slave path.
+     * The real CC RTC is free-running across a system reset.  Keeping the
+     * original epoch avoids moving time backwards under a booted kernel.
      */
-    s->rtc_epoch_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
-
     for (i = 0; i < IP19_MAX_CPUS; i++) {
         if (s->cmp_timer[i]) {
             timer_del(s->cmp_timer[i]);

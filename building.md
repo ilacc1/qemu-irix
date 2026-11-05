@@ -225,7 +225,13 @@ This launches QEMU with the Indy machine, the PROM, the CHD disk on SCSI ID 1,
 the CD drive on ID 4 (empty unless `IRIX_CDROM` names a file that
 exists; use Machine → Removable drive to insert/eject images at runtime), a GTK
 window, a Telnet-able PIO console on port 4444,
-and a QEMU monitor socket at `run/mon.sock`. Useful environment overrides:
+and a QEMU monitor socket at `run/mon.sock`.
+
+Both launchers use ordinary command-line attachments: the Indy disk is an
+`-device scsi-hd,bus=scsi.0,scsi-id=1` and the CD is an
+`-device scsi-cd,bus=scsi.0,scsi-id=4`. You can add more drives or CDs with
+additional `-drive`/`-device` arguments; no drive is hardcoded in the machine.
+Useful environment overrides:
 
 | Variable | Effect |
 |----------|--------|

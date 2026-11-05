@@ -10,7 +10,6 @@
 #include "hw/scsi/scsi.h"
 #include "scsi/constants.h"
 #include "system/address-spaces.h"
-#include "system/block-backend.h"
 #include "system/memory.h"
 #include "migration/vmstate.h"
 #include "qapi/error.h"
@@ -127,9 +126,6 @@ struct SGI_S1State {
     SysBusDevice parent_obj;
     MemoryRegion mmio;
     SCSIBus bus[S1_NUM_CHANNELS];
-    BlockBackend *drive;
-    BlockBackend *cdrom;
-    BlockBackend *cdrom2;
     S1Channel chan[S1_NUM_CHANNELS];
     uint32_t status_cmd;
     uint32_t interrupt;
@@ -1153,6 +1149,10 @@ static void s1_reset(DeviceState *dev)
     s1_update_irq(s);
 }
 
+static const char *const s1_scsi_bus_names[S1_NUM_CHANNELS] = {
+    "scsi.0", "scsi.1", "scsi.2",
+};
+
 static void s1_realize(DeviceState *dev, Error **errp)
 {
     SGI_S1State *s = SGI_S1(dev);
@@ -1168,94 +1168,11 @@ static void s1_realize(DeviceState *dev, Error **errp)
     }
     s->bh = qemu_bh_new(s1_data_bh, s);
     for (i = 0; i < S1_NUM_CHANNELS; i++) {
-        scsi_bus_init(&s->bus[i], sizeof(s->bus[i]), dev,
-                      &sgi_s1_scsi_info);
+        scsi_bus_init_named(&s->bus[i], sizeof(s->bus[i]), dev,
+                            &sgi_s1_scsi_info, s1_scsi_bus_names[i]);
     }
-
-    if (s->drive) {
-        BlockBackend *blk = s->drive;
-        DeviceState *disk = qdev_new("scsi-hd");
-
-        /*
-         * The S1 drive property is only a carrier from the machine to
-         * this child device.  Move the backend attachment to scsi-hd so
-         * the BlockBackend is not claimed twice.
-         */
-        blk_ref(blk);
-        blk_detach_dev(blk, dev);
-        s->drive = NULL;
-
-        object_property_add_child(OBJECT(&s->bus[0]), "ip19disk",
-                                  OBJECT(disk));
-        qdev_prop_set_uint32(disk, "scsi-id", 1);
-        qdev_prop_set_uint32(disk, "lun", 0);
-        if (!qdev_prop_set_drive_err(disk, "drive", blk, errp)) {
-            object_unparent(OBJECT(disk));
-            blk_unref(blk);
-            return;
-        }
-        if (!qdev_realize_and_unref(disk, &s->bus[0].qbus, errp)) {
-            object_unparent(OBJECT(disk));
-            blk_unref(blk);
-            return;
-        }
-        blk_unref(blk);
-    } else {
-        /* Keep older -drive if=scsi,bus=0,unit=N launch lines working. */
-        scsi_bus_legacy_handle_cmdline(&s->bus[0]);
-    }
-
-    if (s->cdrom) {
-        BlockBackend *blk = s->cdrom;
-        DeviceState *cd = qdev_new("scsi-cd");
-
-        blk_ref(blk);
-        blk_detach_dev(blk, dev);
-        s->cdrom = NULL;
-        object_property_add_child(OBJECT(&s->bus[0]), "ip19cdrom",
-                                  OBJECT(cd));
-        qdev_prop_set_uint32(cd, "scsi-id", 5);
-        qdev_prop_set_uint32(cd, "lun", 0);
-        /* IRIX CD access in this path is 512-byte block oriented. */
-        qdev_prop_set_uint32(cd, "logical_block_size", 512);
-        qdev_prop_set_uint32(cd, "physical_block_size", 512);
-        if (!qdev_prop_set_drive_err(cd, "drive", blk, errp)) {
-            object_unparent(OBJECT(cd));
-            blk_unref(blk);
-            return;
-        }
-        if (!qdev_realize_and_unref(cd, &s->bus[0].qbus, errp)) {
-            object_unparent(OBJECT(cd));
-            blk_unref(blk);
-            return;
-        }
-        blk_unref(blk);
-    }
-
-    if (s->cdrom2) {
-        BlockBackend *blk = s->cdrom2;
-        DeviceState *cd = qdev_new("scsi-cd");
-
-        blk_ref(blk);
-        blk_detach_dev(blk, dev);
-        s->cdrom2 = NULL;
-        object_property_add_child(OBJECT(&s->bus[0]), "ip19cdrom2",
-                                  OBJECT(cd));
-        qdev_prop_set_uint32(cd, "scsi-id", 6);
-        qdev_prop_set_uint32(cd, "lun", 0);
-        qdev_prop_set_uint32(cd, "logical_block_size", 512);
-        qdev_prop_set_uint32(cd, "physical_block_size", 512);
-        if (!qdev_prop_set_drive_err(cd, "drive", blk, errp)) {
-            object_unparent(OBJECT(cd));
-            blk_unref(blk);
-            return;
-        }
-        if (!qdev_realize_and_unref(cd, &s->bus[0].qbus, errp)) {
-            object_unparent(OBJECT(cd));
-            blk_unref(blk);
-            return;
-        }
-        blk_unref(blk);
+    for (i = 0; i < S1_NUM_CHANNELS; i++) {
+        scsi_bus_legacy_handle_cmdline(&s->bus[i]);
     }
 }
 
@@ -1283,18 +1200,11 @@ static const VMStateDescription vmstate_sgi_s1 = {
     },
 };
 
-static const Property s1_properties[] = {
-    DEFINE_PROP_DRIVE("drive", SGI_S1State, drive),
-    DEFINE_PROP_DRIVE("cdrom", SGI_S1State, cdrom),
-    DEFINE_PROP_DRIVE("cdrom2", SGI_S1State, cdrom2),
-};
-
 static void s1_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = s1_realize;
-    device_class_set_props(dc, s1_properties);
     device_class_set_legacy_reset(dc, s1_reset);
     dc->vmsd = &vmstate_sgi_s1;
     set_bit(DEVICE_CATEGORY_STORAGE, dc->categories);
@@ -1315,24 +1225,14 @@ static void s1_register_types(void)
 
 type_init(s1_register_types)
 
-SGI_S1State *sgi_s1_attach(MemoryRegion *sysmem, hwaddr base,
-                            BlockBackend *drive, BlockBackend *cdrom,
-                            BlockBackend *cdrom2)
+SGI_S1State *sgi_s1_attach(MemoryRegion *sysmem, hwaddr base)
 {
     DeviceState *dev = qdev_new(TYPE_SGI_S1);
     SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
     MemoryRegion *mr;
     SGI_S1State *s = SGI_S1(dev);
 
-    if (drive) {
-        qdev_prop_set_drive(dev, "drive", drive);
-    }
-    if (cdrom) {
-        qdev_prop_set_drive(dev, "cdrom", cdrom);
-    }
-    if (cdrom2) {
-        qdev_prop_set_drive(dev, "cdrom2", cdrom2);
-    }
+    object_property_add_child(OBJECT(qdev_get_machine()), "s1", OBJECT(dev));
     sysbus_realize_and_unref(sbd, &error_fatal);
     mr = sysbus_mmio_get_region(sbd, 0);
     memory_region_add_subregion_overlap(sysmem, base, mr, 2);

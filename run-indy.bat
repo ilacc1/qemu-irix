@@ -101,7 +101,7 @@ if /I "%IRIX_CONSOLE%"=="telnet" (
 )
 
 if /I "%IRIX_CONSOLE%"=="window" (
-    start "SGI Indy" "%QEMU%" -M indy,audiodev=sgiaudio -audiodev "%IRIX_AUDIO%,id=sgiaudio" -global sgi-mc.simms=0x0eee -global sgi-mc.mc-rev=3 -m 512M -bios "%BIOS%" -drive "file=%DISK%,format=chd,if=scsi,bus=0,unit=1,media=disk,cache=writethrough" %CDROM_ARGS% %NET_ARGS% -parallel none -display gtk,zoom-to-fit=on -serial null -serial null -serial vc -monitor none %*
+    start "SGI Indy" "%QEMU%" -M indy,audiodev=sgiaudio -audiodev "%IRIX_AUDIO%,id=sgiaudio" -global sgi-mc.simms=0x0eee -global sgi-mc.mc-rev=3 -m 512M -bios "%BIOS%" -drive "file=%DISK%,format=chd,if=none,id=disk0,media=disk,cache=writethrough" -device "scsi-hd,bus=scsi.0,scsi-id=1,drive=disk0" %CDROM_ARGS% %NET_ARGS% -parallel none -display gtk,zoom-to-fit=on -serial null -serial null -serial vc -monitor none %*
     set "RC=0"
     goto end
 )
@@ -111,7 +111,7 @@ echo   Disk:         %DISK%
 echo   Console:      %IRIX_CONSOLE%
 echo.
 
-"%QEMU%" -M indy,audiodev=sgiaudio -audiodev "%IRIX_AUDIO%,id=sgiaudio" -global sgi-mc.simms=0x0eee -global sgi-mc.mc-rev=3 -m 512M -bios "%BIOS%" -drive "file=%DISK%,format=chd,if=scsi,bus=0,unit=1,media=disk,cache=writethrough" %CDROM_ARGS% %NET_ARGS% -parallel none -display "%DISPLAY_MODE%" %SERIAL_ARGS% -monitor none %*
+"%QEMU%" -M indy,audiodev=sgiaudio -audiodev "%IRIX_AUDIO%,id=sgiaudio" -global sgi-mc.simms=0x0eee -global sgi-mc.mc-rev=3 -m 512M -bios "%BIOS%" -drive "file=%DISK%,format=chd,if=none,id=disk0,media=disk,cache=writethrough" -device "scsi-hd,bus=scsi.0,scsi-id=1,drive=disk0" %CDROM_ARGS% %NET_ARGS% -parallel none -display "%DISPLAY_MODE%" %SERIAL_ARGS% -monitor none %*
 
 set "RC=%ERRORLEVEL%"
 echo.

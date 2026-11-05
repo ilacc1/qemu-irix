@@ -64,8 +64,13 @@ def main():
         last_err = None
         for _ in range(50):
             try:
-                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                sock.connect(args.sock)
+                if args.sock.startswith("tcp:"):
+                    host, port = args.sock[4:].rsplit(":", 1)
+                    sock = socket.create_connection((host, int(port)),
+                                                    timeout=5)
+                else:
+                    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    sock.connect(args.sock)
                 break
             except OSError as err:
                 last_err = err

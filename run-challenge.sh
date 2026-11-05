@@ -11,7 +11,6 @@
 # Disks/CDs:
 #   IRIX_DISK=...       target 1, format IRIX_DISK_FORMAT (default chd)
 #   IRIX_CD=...         target 5, format IRIX_CD_FORMAT (default raw)
-#   IRIX_CD2=...        target 6
 #
 # Network (EPC et0):
 #   IRIX_NET=tap        attach to host bridge via IRIX_TAP_IF (default)
@@ -24,7 +23,6 @@ QEMU="$DIR/build/qemu-system-mips64"
 PROM="$DIR/sgi/challenge/ip19prom.bin"
 DISK="$IRIX_DISK"
 CD="$IRIX_CD"
-CD2="$IRIX_CD2"
 DISK_FORMAT="${IRIX_DISK_FORMAT:-chd}"
 SMP="${IRIX_SMP:-2}"
 RAM="${IRIX_RAM:-2G}"
@@ -69,7 +67,8 @@ fi
 
 if [ -n "$DISK" ]; then
   set -- "$@" -drive \
-    "file=$DISK,format=$DISK_FORMAT,if=none,id=ip19disk"
+    "file=$DISK,format=$DISK_FORMAT,if=none,id=ip19disk" \
+    -device "scsi-hd,drive=ip19disk,bus=main-system-bus/sgi-s1/scsi.0,scsi-id=1"
 fi
 # Keep a CD-ROM drive present without media so the GTK removable-media
 # menu can insert an ISO later.
@@ -79,11 +78,8 @@ if [ -n "$CD" ]; then
 else
   set -- "$@" -drive "if=none,id=ip19cdrom,media=cdrom"
 fi
-if [ -n "$CD2" ]; then
-  set -- "$@" -drive \
-    "file=$CD2,format=${IRIX_CD2_FORMAT:-raw},if=none,id=ip19cdrom2,readonly=on"
-fi
-
+set -- "$@" -device \
+  "scsi-cd,drive=ip19cdrom,bus=main-system-bus/sgi-s1/scsi.0,scsi-id=5,logical_block_size=512,physical_block_size=512"
 case "$NET" in
   off|none|"")
     ;;

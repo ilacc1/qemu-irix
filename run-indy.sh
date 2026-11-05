@@ -241,16 +241,17 @@ overlay)
         echo "Creating copy-on-write overlay $OVERLAY"
         "$ROOT_DIR/run/mkoverlay.py" --disk "$DISK" --overlay "$OVERLAY"
     fi
-    DISK_ARGS=("file=$OVERLAY,format=qcow2,if=scsi,bus=0,unit=1,media=disk,cache=writethrough")
+    DISK_ARGS=("file=$OVERLAY,format=qcow2,if=none,id=disk0,media=disk,cache=writethrough")
     ;;
 off)
-    DISK_ARGS=("file=$DISK,format=chd,if=scsi,bus=0,unit=1,media=disk,cache=writethrough")
+    DISK_ARGS=("file=$DISK,format=chd,if=none,id=disk0,media=disk,cache=writethrough")
     ;;
 *)
     echo "IRIX_DISK_COW must be 'overlay' or 'off' (got '$COW')" >&2
     exit 1
     ;;
 esac
+DISK_DEVICE=(-device "scsi-hd,bus=scsi.0,scsi-id=1,drive=disk0")
 
 echo "GTK window shows the PROM menu. Type there (window focused)."
 echo "PIO console (early boot only): telnet 127.0.0.1 $PIO_TELNET_PORT"
@@ -269,6 +270,7 @@ exec env -u GTK_PATH -u GTK_EXE_PREFIX -u GTK_IM_MODULE_FILE \
     -m "$GUEST_RAM" \
     -bios "$ROOT_DIR/sgi/indy/$BIOS_IMAGE" \
     -drive "${DISK_ARGS[@]}" \
+    "${DISK_DEVICE[@]}" \
     "${CDROM_ARGS[@]}" \
     ${NET_ARGS[@]} \
     -display "$DISPLAY_MODE" \

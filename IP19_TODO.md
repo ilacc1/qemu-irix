@@ -64,6 +64,7 @@ Validated with the installed 6.5.22 root on `ip19-installed.chd`, one CPU,
 qemu-system-mips64 -M ip19 -smp 1 -m 512M \
   -bios sgi/challenge/ip19prom.bin -L sgi/challenge -snapshot \
   -drive file=.../ip19-installed.chd,format=chd,if=none,id=ip19disk \
+  -device scsi-hd,drive=ip19disk,bus=main-system-bus/sgi-s1/scsi.0,scsi-id=1 \
   -display none -serial unix:...,server=on,wait=off
 ```
 
@@ -327,15 +328,15 @@ Verified in QEMU with the rebuilt PROM and `-smp 1 -m 512M`:
   fully usable (`hinv`, `help`, `version`, `boot`).
 - **Milestone 1 complete:** `hw/mips/sgi_s1.c` now models the IO4 S1/WD95
   controller and DMA path. IO4 reports `SCSI` in `IODEV1`, the PROM probes
-  all three WD95 channels, and a `-drive if=none,id=ip19disk` disk appears
-  as `scsi(0)disk(1)`.
+  all three WD95 channels, and an `-device scsi-hd` disk attached to
+  `main-system-bus/sgi-s1/scsi.0` appears as `scsi(0)disk(1)`.
 - **Milestone 2 complete:** with the real IRIX CHD attached, `ls` reads the
   volume header and `boot` loads `sash` (`Standalone Shell SGI Version 6.5
   ARCS`). The 6.5.30 `/unix` kernel panics with a UTLB miss, consistent
   with IP19 support ending at 6.5.22m.
-- S1 now exposes two SCSI CD-ROM targets (5 and 6) with 512-byte logical
-  blocks. The install-tools CD boots the IRIX installer; Foundation1 is
-  available as the second CD.
+- S1 exposes one SCSI CD-ROM target (5) with 512-byte logical blocks.
+  The install-tools CD boots the IRIX installer; other CDs are swapped
+  through the single drive.
 - A disposable writable CHD copy is the install target. The installer
   proceeds, but currently floods `WARNING: excessive R4000 badvaddr(1)
   occurrances for K2 addresses - may be affecting performance!`.
@@ -544,9 +545,10 @@ IO4 padap 4/window 1 = `0x100C0000`, size `0x8000`:
   the offset from `S1_DMA_READ/WRITE`, resolved with
   `address_space_read/write` (matching `dma_map` in
   `stand/arcs/lib/libsk/ml/s1chip.c`).
-- The machine passes `blk_by_name("ip19disk")` to the S1 `drive` property;
-  `sgi_s1.c` attaches it as an async narrow `scsi-hd` at target 1, bus 0.
-  Legacy `-drive if=scsi` still works when no `ip19disk` is named.
+- S1 exposes its three SCSI buses as `main-system-bus/sgi-s1/scsi.0` through
+  `main-system-bus/sgi-s1/scsi.2`; the machine no longer accepts hardcoded drive or
+  CD properties. Disks and CDs are attached with ordinary `-device
+  scsi-hd`/`scsi-cd` options. Legacy `-drive if=scsi` also still works.
 
 Exact command line used (headless, serial on a Unix socket):
 
@@ -556,7 +558,8 @@ qemu-img create -f raw /tmp/ip19disk.raw 64M
   -bios sgi/challenge/ip19prom.bin -L sgi/challenge \
   -display none -monitor none \
   -serial unix:/tmp/ip19.sock,server=on,wait=off \
-  -drive if=none,id=ip19disk,file=/tmp/ip19disk.raw,format=raw
+  -drive if=none,id=ip19disk,file=/tmp/ip19disk.raw,format=raw \
+  -device scsi-hd,drive=ip19disk,bus=main-system-bus/sgi-s1/scsi.0,scsi-id=1
 ```
 
 At the menu, selecting option 5 and running `hinv -v` gives:

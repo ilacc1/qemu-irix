@@ -3,15 +3,12 @@
 
 #include "hw/core/irq.h"
 #include "hw/core/sysbus.h"
-#include "system/block-backend.h"
 #include "system/memory.h"
 
 #define TYPE_SGI_S1 "sgi-s1"
 OBJECT_DECLARE_SIMPLE_TYPE(SGI_S1State, SGI_S1)
 
-SGI_S1State *sgi_s1_attach(MemoryRegion *sysmem, hwaddr base,
-                           BlockBackend *drive, BlockBackend *cdrom,
-                           BlockBackend *cdrom2);
+SGI_S1State *sgi_s1_attach(MemoryRegion *sysmem, hwaddr base);
 
 /*
  * The S1 asserts this level whenever any per-channel interrupt bit is
