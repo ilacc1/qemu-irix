@@ -2431,42 +2431,6 @@ static void ip19_earom_defaults(SGI_IP19State *s)
     /* Checksum bytes stay zero so the PROM skips checksum validation. */
 }
 
-static void ip19_preload_io4_segments(const char *filename)
-{
-    g_autofree gchar *data = NULL;
-    gsize len = 0;
-
-    if (!filename || !g_file_get_contents(filename, &data, &len, NULL) ||
-        len < 0x20 || memcmp(data, "JKSW", 4) != 0 ||
-        memcmp(data + 0x18, "SEG2", 4) != 0) {
-        return;
-    }
-
-    uint32_t nseg = ldl_be_p(data + 0x1c);
-    for (uint32_t i = 0; i < nseg; i++) {
-        const uint8_t *seg = (const uint8_t *)data + 0x20 + i * 48;
-        uint32_t type, off, length;
-        uint64_t start;
-
-        if (0x20 + (i + 1) * 48 > len) {
-            break;
-        }
-        type = ldl_be_p(seg);
-        off = ldl_be_p(seg + 4);
-        start = ldq_be_p(seg + 16);
-        length = ldl_be_p(seg + 24);
-        if (off + length > len || length > 8 * MiB) {
-            continue;
-        }
-        /* Load MASTER and R4000 (not TFP/R10k) segments. */
-        if (type == 0xff01 || (type & 0xff00) == 0x0100) {
-            address_space_write(&address_space_memory,
-                                start & 0x1fffffff, MEMTXATTRS_UNSPECIFIED,
-                                (const uint8_t *)data + off, length);
-        }
-    }
-}
-
 /*
  * The stock IP19 PROM has two emulator-visible quirks: its large-window
  * helpers truncate an XKPHYS address with 32-bit add, and its cache tests
