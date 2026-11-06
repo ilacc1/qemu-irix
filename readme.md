@@ -6,6 +6,13 @@ emulated **Silicon Graphics Indy (IP24)** hardware.
 All the new code is agent generated. Author makes no claim as to accuracy 
 or suitability for any use. 
 
+## What does it do?
+
+Currently emulates:
+
+- SGI Indy (1xR4000CPU, 384Mb RAM). Supports Irix 5.3 and up to 6.5.30m. 
+- SGI Challenge Desk-side IP19 (2x R4400 with 2Gb RAM). Supports Irix 5.3 to 6.5.22m.
+
 ## What's new in 0.1.2
 
 - Windows audio goes through SDL2/WASAPI instead of DirectSound; the HAL2
@@ -21,7 +28,7 @@ or suitability for any use.
 - Fixes for HAL2 absence on IRIX 5.3, PBUS DMA control writes, and stalled
   WD33C93 transfers.
 
-## Just get it running
+## Quick start (Indy)
 
 From a source checkout:
 
@@ -33,6 +40,52 @@ From a source checkout:
 
 Release archives: run `install.sh`/`install.bat` first, then the same
 launchers. Challenge/Onyx (IP19) uses `run-challenge.sh`/`.bat`.
+
+### Disk images
+
+I don't currently plan to share disk images but this will likely change. 
+I understand Indy R4000 images are relatively easy to find, but Challenge
+images are not. You can however get the 6.5.22m CDs and install Irix
+on Challenge without issues. I wouldn't recommend earlier versions of 6.5. 
+
+See also - **[usage.md](usage.md)** for detailed cli / env options.
+
+### What's new in 0.1.3
+
+- Support for Challenge Deskside based on IP19. This is the same board as 
+  Onyx. Note however there is no graphics support here and no current
+  plans to implement it. Main reason is to get as much performance as possible.  
+  As an illustration, consider that the same 
+  emulation code emulates Indy (reports ~200MHz on a modern host with
+  graphics) and Challenge (reports ~500Mhz on a modern host without 
+  graphics). 
+- New qemu "terminal" mode (view - serial0) is used for IP19 GUI - it's essentially a 
+  serial terminal than enables you to access the machine, configure
+  network and do basic maintenance as you would on a VT100 connected
+  to serial on a real headless machine.
+- Gui menu option to manage cdrom - select image, eject etc. 
+- Idle loop detection for R4000 and R4600. IRIX doesn't issue WAIT for 
+  these CPUS so idle loop actually burns a real cpu. To achieve design 
+  goal of keeping host cpus idle when guest idles, we detect memory
+  locations of the idle loop (kernel specific) at runtime.
+- R4600 - experimental for now.
+- Many other fixes.
+
+### What's new in 0.1.2
+
+- Windows audio goes through SDL2/WASAPI instead of DirectSound; the HAL2
+  boot chime plays at the correct speed.
+- Windows networking detects a bridged TAP adapter correctly.
+- Machine → Removable drive inserts and ejects CD images at runtime. The CD
+  drive is always present with an empty tray.
+- The disk defaults to direct read-write access; set
+  `IRIX_DISK_COW=overlay` for the old copy-on-write mode.
+- `build.sh` / `build.bat` reproduce the documented build options, and the
+  Windows build documents and enables SDL2.
+- Firmware seeds now live under `sgi/indy/`.
+- Fixes for HAL2 absence on IRIX 5.3, PBUS DMA control writes, and stalled
+  WD33C93 transfers.
+
 
 ## Why another IRIX emulator
 
@@ -79,8 +132,6 @@ So you can just use your existing CHD and get all the performance benefits.
 
 There are a few. Occasional shearing here and there, background refresh and 
 colour maps in some demos are wrong. 
-
-Several fixes are in 0.1.1 - powerflip works perfectly now.
 
 ### ec3 sometimes reports error on boot
 
@@ -131,7 +182,7 @@ values in the startup script.
 
 ## Credits
 
-This work stands entirely on the shoulders of two projects and would not exist
+This work stands entirely on the shoulders of three projects and would not exist
 without them. Sincere and heartfelt thanks to both:
 
 - **[MAME](https://github.com/mamedev/mame)** — the SGI device models in this

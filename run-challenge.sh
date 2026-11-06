@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # IP19/Challenge (Everest) launcher.
 #
 # Headless console/monitor harness:
@@ -35,6 +35,7 @@ NET_PORT="${IRIX_NET_PORT:-2323}"
 TAP_IF="${IRIX_TAP_IF:-tap-iris}"
 MTTCG="${IRIX_MTTCG:-1}"
 CONSOLE="${IRIX_CONSOLE:-window}"
+USER_ARGS=("$@")
 
 if [ -z "$DISK" ]; then
   for candidate in "$DIR/sgi/ip19-main.chd" "$DIR/ip19-main.chd" "$DIR/../ip19-main.chd"; do
@@ -122,4 +123,4 @@ else
   esac
 fi
 
-exec "$QEMU" "$@"
+exec "$QEMU" "$@" "${USER_ARGS[@]}"
