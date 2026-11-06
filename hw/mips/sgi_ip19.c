@@ -1013,7 +1013,10 @@ static MemTxResult ip19_cc_write(void *opaque, hwaddr off, uint64_t val,
                 s->cc_cmd_len = 0;
             }
         }
-        ip19_cc_uart_irq(s, cpu);
+        /* Interrupt only when a sysctlr reply is queued, not on every write. */
+        if (s->cc_uart_head != s->cc_uart_tail) {
+            ip19_cc_uart_irq(s, cpu);
+        }
         break;
     }
     default:
@@ -2464,11 +2467,6 @@ static void ip19_preload_io4_segments(const char *filename)
     }
 }
 
-extern uint64_t sgi_idle_pc;
-extern uint64_t sgi_idle_pc_alt;
-extern int sgi_idle_on;
-extern int sgi_idle_sleep;
-
 /*
  * The stock IP19 PROM has two emulator-visible quirks: its large-window
  * helpers truncate an XKPHYS address with 32-bit add, and its cache tests
@@ -2537,33 +2535,8 @@ static void sgi_ip19_init(MachineState *machine)
     Clock *cpuclk;
     int i, j;
 
-    /*
-     * IRIX 6.5 IP19 idles by polling local_idle rather than using WAIT.
-     * Reuse the existing idle-spin halt hook with the IP19 address; the
-     * default in target/mips remains the Indy IP24 address for other
-     * machines.
-     */
-    sgi_idle_pc = 0xa8000000000ef4d0ULL;
-    sgi_idle_pc_alt = 0xa8000000000ea174ULL;
-    /*
-     * IRIX's IP19 local_idle loop can be halted until the next timer or
-     * device interrupt.  The CC timer underflow fix keeps lbolt advancing;
-     * IP19_IDLE=0 is an escape hatch for bisection.
-     */
-    {
-        const char *idle = g_getenv("IP19_IDLE");
-
-        sgi_idle_on = !idle ||
-                      (idle[0] != '0' && idle[0] != 'n' && idle[0] != 'N');
-    }
-    {
-        const char *idle_sleep = g_getenv("SGI_IDLE_SLEEP");
-
-        sgi_idle_sleep = idle_sleep &&
-                         !(idle_sleep[0] == '0' ||
-                           idle_sleep[0] == 'n' ||
-                           idle_sleep[0] == 'N');
-    }
+    /* Idle-loop PC is learned at run time; see target/mips/tcg/exception.c. */
+    sgi_idle_detect_enable();
 
     cpuclk = clock_new(OBJECT(machine), "cpu-refclk");
     clock_set_hz(cpuclk, IP19_CPU_HZ);

@@ -1408,6 +1408,7 @@ void mips_cpu_do_interrupt(CPUState *cs)
         set_hflags_for_handler(env);
         break;
     case EXCP_EXT_INTERRUPT:
+        sgi_idle_sample(env);
         cause = 0;
         if (env->CP0_Cause & (1 << CP0Ca_IV)) {
             uint32_t spacing = (env->CP0_IntCtl >> CP0IntCtl_VS) & 0x1f;

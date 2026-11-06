@@ -1399,6 +1399,8 @@ static inline bool cpu_type_is_64bit(const char *cpu_type)
 }
 
 void cpu_set_exception_base(int vp_index, target_ulong address);
+/* Start learning the guest idle-loop PC (IP19, Indy); see tcg/exception.c. */
+void sgi_idle_detect_enable(void);
 
 /* addr.c */
 uint64_t cpu_mips_kseg0_to_phys(void *opaque, uint64_t addr);

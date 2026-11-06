@@ -1573,6 +1573,8 @@ static void mips_sgi_indy_init(MachineState *machine)
     env = &cpu->env;
     qemu_register_reset(main_cpu_reset, cpu);
     qemu_register_reset(sgi_indy_board_reset, NULL);
+    /* Idle-loop PC is learned at run time; see target/mips/tcg/exception.c. */
+    sgi_idle_detect_enable();
     qemu_add_vm_change_state_handler(sgi_hal2_vm_state, NULL);
 
     mcc = MIPS_CPU_GET_CLASS(cpu);

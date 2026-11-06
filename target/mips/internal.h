@@ -162,6 +162,8 @@ struct CPUMIPSTLBContext {
 };
 
 void sync_c0_status(CPUMIPSState *env, CPUMIPSState *cpu, int tc);
+/* Record the interrupted PC while idle-loop detection is running. */
+void sgi_idle_sample(CPUMIPSState *env);
 void cpu_mips_store_status(CPUMIPSState *env, target_ulong val);
 void cpu_mips_store_cause(CPUMIPSState *env, target_ulong val);
 
