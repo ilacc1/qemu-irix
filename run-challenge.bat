@@ -13,11 +13,10 @@ set "MSYS2="
 if defined MSYS2_ROOT if exist "%MSYS2_ROOT%\mingw64\bin\libgtk-3-0.dll" set "MSYS2=%MSYS2_ROOT%"
 if not defined MSYS2 if exist "%BASE%msys64\mingw64\bin\libgtk-3-0.dll" set "MSYS2=%BASE%msys64"
 if not defined MSYS2 if exist "%BASE%..\msys64\mingw64\bin\libgtk-3-0.dll" set "MSYS2=%BASE%..\msys64"
-if not defined MSYS2 if exist "%BASE%qemu\msys64\mingw64\bin\libgtk-3-0.dll" set "MSYS2=%BASE%qemu\msys64"
 if not defined MSYS2 if exist "C:\msys64\mingw64\bin\libgtk-3-0.dll" set "MSYS2=C:\msys64"
 if not defined MSYS2 (
     echo ERROR: MSYS2 MinGW64 runtime not found.
-    echo Looked for msys64 beside the script, one level up, under qemu\, and at C:\msys64.
+    echo Looked for msys64 beside the script, one level up, and at C:\msys64.
     echo Set MSYS2_ROOT to your MSYS2 install directory.
     goto end
 )
@@ -34,8 +33,7 @@ if not defined QEMU (
 )
 
 set "BIOS="
-if exist "%BASE%qemu\sgi\challenge\ip19prom.bin" set "BIOS=%BASE%qemu\sgi\challenge\ip19prom.bin"
-if not defined BIOS if exist "%BASE%sgi\challenge\ip19prom.bin" set "BIOS=%BASE%sgi\challenge\ip19prom.bin"
+if exist "%BASE%sgi\challenge\ip19prom.bin" set "BIOS=%BASE%sgi\challenge\ip19prom.bin"
 if not defined BIOS if exist "%BASE%..\sgi\challenge\ip19prom.bin" set "BIOS=%BASE%..\sgi\challenge\ip19prom.bin"
 if not defined BIOS (
     echo ERROR: Challenge PROM ip19prom.bin not found.
