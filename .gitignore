@@ -11,6 +11,10 @@
 /run/__pycache__/
 /run/analyze/__pycache__/
 
+# Local-only notes and planning documents (not published)
+/AGENTS.md
+/IP*
+
 # Reference/working data kept outside the published tree
 /archive/
 /datasheets/
