@@ -4,12 +4,9 @@
 /dist/
 /qemu/dist/
 
-# Workspace scratch
+# Workspace scratch and local helper scripts
 /tmp/
-/run/mon.sock
-/run/escc/
-/run/__pycache__/
-/run/analyze/__pycache__/
+/run/
 
 # Local-only notes and planning documents (not published)
 /AGENTS.md
