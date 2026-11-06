@@ -2431,40 +2431,33 @@ static void ip19_earom_defaults(SGI_IP19State *s)
     /* Checksum bytes stay zero so the PROM skips checksum validation. */
 }
 
-static void ip19_preload_io4_segments(const char *filename)
+/*
+ * Use the newer IO4 R4000 monitor extracted from the 6.5 installation
+ * CD's JKSW IO4 PROM.  The main PROM's copy_prom path only understands
+ * the old JFK4 image, so skip that copy and enter the preloaded segment.
+ */
+static bool ip19_load_io4_r4k(SGI_IP19State *s)
 {
-    g_autofree gchar *data = NULL;
+    g_autofree char *filename =
+        qemu_find_file(QEMU_FILE_TYPE_BIOS, "io4r4k.bin");
+    g_autofree gchar *buf = NULL;
     gsize len = 0;
+    uint8_t *prom;
 
-    if (!filename || !g_file_get_contents(filename, &data, &len, NULL) ||
-        len < 0x20 || memcmp(data, "JKSW", 4) != 0 ||
-        memcmp(data + 0x18, "SEG2", 4) != 0) {
-        return;
+    if (!filename || !g_file_get_contents(filename, &buf, &len, NULL) ||
+        len < 0x22918) {
+        return false;
     }
-
-    uint32_t nseg = ldl_be_p(data + 0x1c);
-    for (uint32_t i = 0; i < nseg; i++) {
-        const uint8_t *seg = (const uint8_t *)data + 0x20 + i * 48;
-        uint32_t type, off, length;
-        uint64_t start;
-
-        if (0x20 + (i + 1) * 48 > len) {
-            break;
-        }
-        type = ldl_be_p(seg);
-        off = ldl_be_p(seg + 4);
-        start = ldq_be_p(seg + 16);
-        length = ldl_be_p(seg + 24);
-        if (off + length > len || length > 8 * MiB) {
-            continue;
-        }
-        /* Load MASTER and R4000 (not TFP/R10k) segments. */
-        if (type == 0xff01 || (type & 0xff00) == 0x0100) {
-            address_space_write(&address_space_memory,
-                                start & 0x1fffffff, MEMTXATTRS_UNSPECIFIED,
-                                (const uint8_t *)data + off, length);
-        }
+    address_space_write(&address_space_memory, 0x1800000,
+                        MEMTXATTRS_UNSPECIFIED, (const uint8_t *)buf,
+                        MIN(len, (gsize)IP19_FLASH_SIZE));
+    prom = memory_region_get_ram_ptr(&s->prom);
+    if (ldl_be_p(prom + 0xe1ec) == 0x0ff037fc) {
+        stl_be_p(prom + 0xe1ec, 0);
     }
+    stl_be_p(s->flash_data + 0x0c, 0x0007a5b0);
+    stl_be_p(s->flash_data + 0x10, 0x81800180);
+    return true;
 }
 
 /*
@@ -2704,6 +2697,7 @@ static void sgi_ip19_init(MachineState *machine)
             }
         }
     }
+    ip19_load_io4_r4k(s);
 
     memory_region_init_io(&s->cc, NULL, &ip19_cc_ops, s, "ip19.cc",
                           IP19_CC_SIZE);
