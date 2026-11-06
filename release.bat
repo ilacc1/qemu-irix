@@ -73,9 +73,10 @@ mkdir "%STAGE%\msys64\mingw64\share"
 xcopy /e /i /y "%MSYS2%\mingw64\lib\gdk-pixbuf-2.0" "%STAGE%\msys64\mingw64\lib\gdk-pixbuf-2.0\" >nul
 xcopy /e /i /y "%MSYS2%\mingw64\share\glib-2.0\schemas" "%STAGE%\msys64\mingw64\share\glib-2.0\schemas\" >nul
 
-xcopy /e /i /y "%SRC%\sgi" "%STAGE%\sgi\" >nul
-for %%F in (run-indy.bat run-challenge.bat install.bat readme.md building.md networking.md) do (
-    copy /y "%SRC%\%%F" "%STAGE%\%%F" >nul
+xcopy /e /i /y "sgi\indy" "%STAGE%\sgi\indy\" >nul
+xcopy /e /i /y "sgi\challenge" "%STAGE%\sgi\challenge\" >nul
+for %%F in (run-irix.bat run-irix53.bat run-challenge.bat install.bat readme.md building.md networking.md usage.md) do (
+    if exist "%%F" copy /y "%%F" "%STAGE%\%%F" >nul
 )
 
 powershell -NoProfile -Command "Compress-Archive -Path '%STAGE%' -DestinationPath '%CD%\dist\qemu-irix-%VER%-windows.zip' -Force"

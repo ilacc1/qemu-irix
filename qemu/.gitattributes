@@ -1,0 +1,14 @@
+*.c.inc         diff=c
+*.h.inc         diff=c
+*.m             diff=objc
+*.py            diff=python
+*.rs            diff=rust
+*.rs.inc        diff=rust
+Cargo.lock      diff=toml merge=binary
+
+*.patch         -text -whitespace
+
+# Line endings: cmd.exe needs CRLF batch files, shells need LF scripts.
+# Enforced at checkout so release packaging is reproducible anywhere.
+*.bat text eol=crlf
+*.sh text eol=lf

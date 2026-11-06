@@ -60,7 +60,7 @@
 # "wav"/"none"/"off", see above), IRIX_AUDIO_WAV (default run/chime.wav).
 # IRIX_ESCC_LOG: set to a directory to capture the two ESCC serial
 # ports (kernel serial console) to files there, e.g.
-#   IRIX_ESCC_LOG=run/escc ./run-indy.sh
+#   IRIX_ESCC_LOG=run/escc ./run-irix.sh
 # then in the PROM Command Monitor: `setenv console d`, then `boot`.
 # IRIX_ESCC_SOCK: path of a unix socket for the second ESCC port, so the
 # guest's serial console can be driven from the host.
@@ -75,7 +75,7 @@
 #                    shutdown can leave the overlay inconsistent.  Delete
 #                    the overlay to start over; IRIX_DISK_OVERLAY names
 #                    it.
-# Extra QEMU args may be appended: ./run-indy.sh -d guest_errors
+# Extra QEMU args may be appended: ./run-irix.sh -d guest_errors
 #
 # Tuning switches (value-based; 0 and unset both mean "offload enabled"):
 # The launcher pins all three to 0 (async worker threads) unless already
@@ -104,15 +104,15 @@ MACHINE=${IRIX_MACHINE:-indy}
 # bios set b10 = index 0 = MAME indy_4020's default BIOS.
 BIOS_IMAGE=${IRIX_BIOS:-ip24prom.070-9101-011.bin}
 # Optional CD image (SCSI ID 4). Leave IRIX_CDROM unset for no CD, e.g.:
-#   IRIX_DISK=~/irix65_4020.chd IRIX_CDROM=~/overlay.iso ./run-indy.sh
+#   IRIX_DISK=~/irix65_4020.chd IRIX_CDROM=~/overlay.iso ./run-irix.sh
 CDROM_ISO=${IRIX_CDROM:-}
 PIO_TELNET_PORT=${IRIX_TELNET_PORT:-4444}
 MON_SOCK=${IRIX_MONITOR:-$ROOT_DIR/run/mon.sock}
 # The disk image is supplied by the user (not distributed with this
 # repository): point IRIX_DISK at your IRIX 6.5 CHD for the Indy, e.g.
-#   IRIX_DISK=~/irix65_4020.chd ./run-indy.sh
-# A file named irix65_4020.chd next to this script is used by default.
-DISK=${IRIX_DISK:-$ROOT_DIR/irix65_4020.chd}
+#   IRIX_DISK=~/irix65_4020.chd ./run-irix.sh
+# sgi/irix65_4020.chd is used by default when present.
+DISK=${IRIX_DISK:-$ROOT_DIR/sgi/irix65_4020.chd}
 
 # Guest RAM. The PROM sizes memory from the MC SIMM registers, not from
 # -m; -m only bounds the backing store (see header).
@@ -123,7 +123,7 @@ MC_ARGS=(-global "sgi-mc.simms=$MC_SIMMS" -global "sgi-mc.mc-rev=$MC_REV")
 
 if [ ! -f "$DISK" ]; then
     echo "Disk image not found: $DISK" >&2
-    echo "Put irix65_4020.chd next to this script or export IRIX_DISK=/path/to/irix65.chd and retry." >&2
+    echo "Put irix65_4020.chd in sgi/ or export IRIX_DISK=/path/to/irix65.chd and retry." >&2
     exit 1
 fi
 
@@ -138,9 +138,9 @@ if [ -n "$CDROM_ISO" ] && [ ! -f "$CDROM_ISO" ]; then
     CDROM_ISO=
 fi
 
-if [ ! -x "$ROOT_DIR/build/qemu-system-mips64" ]; then
+if [ ! -x "$ROOT_DIR/qemu/build/qemu-system-mips64" ]; then
     echo "QEMU binary not found. Build it first:" >&2
-    echo "  ninja -C build qemu-system-mips64   (from the repository root)" >&2
+    echo "  ./build.sh   (or ninja -C qemu/build qemu-system-mips64)" >&2
     exit 1
 fi
 
@@ -154,7 +154,7 @@ rm -f "$MON_SOCK"
 # build/nvram/ to force a fresh PROM env.
 # QEMU resolves NVRAM beside its own binary (see sgi_hpc3_open_nvram), so
 # the working-copy location below must stay in sync with build/nvram/.
-NVRAM_DIR="$ROOT_DIR/build/nvram/indy_4020"
+NVRAM_DIR="$ROOT_DIR/qemu/build/nvram/indy_4020"
 if [ ! -f "$NVRAM_DIR/rtc" ]; then
     mkdir -p "$NVRAM_DIR"
     cp "$ROOT_DIR/sgi/indy/nvram/eeprom" \
@@ -263,7 +263,7 @@ else
 fi
 exec env -u GTK_PATH -u GTK_EXE_PREFIX -u GTK_IM_MODULE_FILE \
     -u LD_PRELOAD \
-    "$ROOT_DIR/build/qemu-system-mips64" \
+    "$ROOT_DIR/qemu/build/qemu-system-mips64" \
     "${MACHINE_ARG[@]}" \
     "${AUDIO_ARGS[@]}" \
     "${MC_ARGS[@]}" \

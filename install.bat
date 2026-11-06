@@ -6,7 +6,7 @@ rem  The GTK runtime DLLs ship inside this distribution (msys64\mingw64\...),
 rem  so on a complete extraction there is nothing to download. If they are
 rem  missing, this script falls back to a real MSYS2: it finds yours
 rem  (MSYS2_ROOT) or downloads and installs MSYS2, plus the GTK3 runtime
-rem  with pacman, then points run-indy.bat at it via MSYS2_ROOT.
+rem  with pacman, then points run-irix.bat at it via MSYS2_ROOT.
 rem
 rem  What it cannot do for you is the TAP network adapter (needs a driver
 rem  install + admin rights); it reports whether the expected 'my-tap'
@@ -134,5 +134,5 @@ if "%IRIX_DISK%"=="" (
 )
 
 echo.
-echo Done. Start the machine with run-indy.bat
+echo Done. Start the machine with run-irix.bat
 exit /b 0

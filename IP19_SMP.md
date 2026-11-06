@@ -247,7 +247,7 @@ post-failure memory dump can show `pdaindr[1].CpuId == 1` even though CPU0
 made the wrong decision.
 
 Captured failure state with symbol-matched installed kernel
-(`ip19extract/unix`, base `0xa800000000000000`):
+(the installed `/unix`, base `0xa800000000000000`):
 
 - CPU1 PC was in `splx()` (`a800...22810`) called from
   `mutex_spinlock_spl()` (`a800...1b0634`), with `s0 = putbuflck`.

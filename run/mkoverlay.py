@@ -23,7 +23,7 @@ import tempfile
 import time
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-QEMU = os.path.join(ROOT_DIR, "build", "qemu-system-mips64")
+QEMU = os.path.join(ROOT_DIR, "qemu", "build", "qemu-system-mips64")
 CHD_MAGIC = b"MComprHD"
 
 
@@ -89,7 +89,7 @@ class Qmp:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--disk", default=os.path.join(ROOT_DIR, "irix65_4020.chd"))
+    ap.add_argument("--disk", default=os.path.join(ROOT_DIR, "sgi", "irix65_4020.chd"))
     ap.add_argument("--overlay")
     ap.add_argument("--force", action="store_true")
     args = ap.parse_args()

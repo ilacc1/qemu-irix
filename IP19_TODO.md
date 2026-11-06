@@ -18,7 +18,7 @@
 - Host TAP is `tap-iris` on `br0`; no SLIRP is used by default.
 - Verified: host `ping 10.6.2.1` succeeds, `telnet 10.6.2.1` logs in as
   `root` (no password), and `hostname` returns `yoda`.
-- Launchers are explicit: `run-indy.sh/.bat`, `run-indy53.sh`, and
+- Launchers are explicit: `run-irix.sh/.bat`, `run-irix53.sh`, and
   `run-challenge.sh/.bat`.
 - MTTCG is forced for Challenge with `-accel tcg,thread=multi`
   (`IRIX_MTTCG=1`; default in `run-challenge.sh/.bat`). Verified with two
@@ -197,8 +197,8 @@ Evidence collected on a qcow2 overlay (base image never written):
   `xfs_db` refuses the installed V1-directory filesystem; a locally built
   xfsprogs 3.1.11 (`/tmp/xfsvers/xfsprogs-dev-v3.1.11/`) can read it.
   `xfs_db -r -c 'blockget -n' -c 'ncheck' <partition>` lists the tree.
-- Extracted files: `/tmp/unixIP19.elf`, and
-  `ip19extract/{sbin_init,etc_inittab,lib32_libc.so.1,lib32_rld}`.
+- Extracted files: `/tmp/unixIP19.elf`, and the installed
+  `{sbin_init,etc_inittab,lib32_libc.so.1,lib32_rld}`.
   `/sbin/init` is `ELF N32 MSB`, interpreter `/lib32/libc.so.1`, RPATH
   `/lib32`.  `/lib32/rld` is the N32 runtime loader, linked at `0x0fb60000`.
 - `qemu-system-mips64 -d int` shows the fatal user faults are inside
@@ -223,7 +223,8 @@ Evidence collected on a qcow2 overlay (base image never written):
 ### Follow-up trace (2026-11-01, later)
 
 A fresh `-d int` run was captured on a clean qcow2 overlay
-(`/tmp/ip19int6.log`, `ip19boot/ip19-int6.log`).  The first event chain is:
+(`/tmp/ip19int6.log`; older copies are not kept in the tree).  The first
+event chain is:
 
 - The kernel enters `/lib32/rld` at `newmain` (`0xfb604ec`) normally.  The
   user stack and auxv are correct:
@@ -254,7 +255,7 @@ A fresh `-d int` run was captured on a clean qcow2 overlay
   `0xe046d78` as an unaligned-`strcpy` variant, while the on-disk file has
   `_vfprintf` at that link address (`strcpy` is at `0xfa334a4`).  Extracted
   disk files were re-read from the raw image through a read-only loop and
-  match `ip19extract/` byte-for-byte, so the disk image is intact.  This
+  match the extracted files byte-for-byte, so the disk image is intact.  This
   points at the kernel/rld page mapping (page-cache vs. user PTE
   assignment), not at the on-disk rld/libc version.
 
@@ -280,7 +281,7 @@ Preserved state:
   ip19-installed.raw over.qcow2`, then
   `IRIX_HEADLESS=1 IRIX_DISK=.../over.qcow2 IRIX_DISK_FORMAT=qcow2
   ./run-challenge.sh`; select menu 1 (or 5 and `boot -f dksc(0,1,0)/unix`).
-  Console logs/traces are in `ip19boot/con*.log`, `ip19boot/sig*.log`.
+  Historical console logs and traces are not kept in the tree.
 
 Next concrete steps:
 1. Capture `rld` diagnostics: `setenv _RLD_ARGS -trace` is passed through

@@ -1,8 +1,8 @@
 @echo off
 rem ============================================================================
-rem  SGI Indy (IP24) - IRIX 6.5 startup script for Windows (MSYS2 build).
+rem  SGI Indy (IP24) - IRIX 5.3 startup script for Windows (MSYS2 build).
 rem
-rem  Mirrors run-indy.sh: indy machine, PROM sgi\indy\ip24prom.070-9101-011.bin,
+rem  Mirrors run-irix53.sh: indy machine, PROM sgi\indy\ip24prom.070-9101-011.bin,
 rem  NVRAM seeded from sgi\indy\nvram beside first run, CHD disk supplied by
 rem  the user via IRIX_DISK (not distributed with this repository).
 rem ============================================================================
@@ -20,23 +20,20 @@ if not exist "%MSYS2%\mingw64\bin\libgtk-3-0.dll" (
 set "PATH=%MSYS2%\mingw64\bin;%PATH%"
 
 rem --- async offload paths (worker threads). =1 forces synchronous inline
-rem --- execution for A/B comparison; override any of these beforehand, e.g.
-rem ---   set SGI_GFX_SYNC=1
-rem --- GFX: 0 = surface draws go to the GIO64 worker thread (default).
+rem --- execution for A/B comparison; override any of these beforehand.
 if not defined SGI_GFX_SYNC set "SGI_GFX_SYNC=0"
-rem --- WD33C93: 0 = batched run-DMA fast path (default).
 if not defined SGI_WD_SYNC set "SGI_WD_SYNC=0"
-rem --- CHD: 0 = inflate hunks in the block thread pool (default).
 if not defined SGI_CHD_SYNC set "SGI_CHD_SYNC=0"
+rem --- IRIX 5.3's HAL2 driver spins when the modelled chip is incomplete.
+if not defined SGI_HAL2_ABSENT set "SGI_HAL2_ABSENT=1"
 rem --- Audio: SDL2 through WASAPI on Windows (not DirectSound).
 if not defined IRIX_AUDIO set "IRIX_AUDIO=sdl"
 if /i "%IRIX_AUDIO%"=="sdl" if not defined SDL_AUDIODRIVER set "SDL_AUDIODRIVER=wasapi"
 set "QEMU=qemu\build\qemu-system-mips64.exe"
 set "BIOS=sgi\indy\ip24prom.070-9101-011.bin"
 if not "%IRIX_DISK%"=="" set "DISK=%IRIX_DISK%"
-if "%DISK%"=="" set "DISK=irix65_4020.chd"
-rem Optional CD image (SCSI ID 4); leave IRIX_CDROM unset for no CD, e.g.:
-rem   set IRIX_CDROM=C:\isos\overlay.iso
+if "%DISK%"=="" set "DISK=sgi\irix53.chd"
+rem Optional CD image (SCSI ID 4); leave IRIX_CDROM unset for no CD.
 if not "%IRIX_CDROM%"=="" set "CDROM=%IRIX_CDROM%"
 
 if not exist "%QEMU%" (
@@ -48,7 +45,7 @@ if not exist "%BIOS%" (
     goto end
 )
 if not exist "%DISK%" (
-    echo ERROR: disk image %DISK% not found - set IRIX_DISK to your IRIX 6.5 CHD.
+    echo ERROR: disk image %DISK% not found - set IRIX_DISK to your IRIX 5.3 CHD.
     goto end
 )
 
@@ -70,8 +67,6 @@ if defined CDROM (
 )
 
 rem --- Tolerate a missing TAP adapter: warn and run without networking ----
-rem --- A bridged TAP adapter has no IP address of its own, so ipconfig ----
-rem --- never lists it; ask the interface table instead. ----------------
 netsh interface show interface name="my-tap" >nul 2>&1
 if errorlevel 1 (
     echo WARNING: no my-tap TAP adapter found - guest will have no network.
@@ -101,17 +96,17 @@ if /I "%IRIX_CONSOLE%"=="telnet" (
 )
 
 if /I "%IRIX_CONSOLE%"=="window" (
-    start "SGI Indy" "%QEMU%" -M indy,audiodev=sgiaudio -audiodev "%IRIX_AUDIO%,id=sgiaudio" -global sgi-mc.simms=0x0eee -global sgi-mc.mc-rev=3 -m 512M -bios "%BIOS%" -drive "file=%DISK%,format=chd,if=none,id=disk0,media=disk,cache=writethrough" -device "scsi-hd,bus=scsi.0,scsi-id=1,drive=disk0" %CDROM_ARGS% %NET_ARGS% -parallel none -display gtk,zoom-to-fit=on -serial null -serial null -serial vc -monitor none %*
+    start "SGI Indy (IRIX 5.3)" "%QEMU%" -M indy,audiodev=sgiaudio -audiodev "%IRIX_AUDIO%,id=sgiaudio" -global sgi-mc.simms=0x0eee -global sgi-mc.mc-rev=3 -m 512M -bios "%BIOS%" -drive "file=%DISK%,format=chd,if=scsi,bus=0,unit=1,media=disk,cache=writethrough" %CDROM_ARGS% %NET_ARGS% -parallel none -display gtk,zoom-to-fit=on -serial null -serial null -serial vc -monitor none %*
     set "RC=0"
     goto end
 )
 
-echo Starting SGI Indy (IRIX 6.5) ...
+echo Starting SGI Indy (IRIX 5.3) ...
 echo   Disk:         %DISK%
 echo   Console:      %IRIX_CONSOLE%
 echo.
 
-"%QEMU%" -M indy,audiodev=sgiaudio -audiodev "%IRIX_AUDIO%,id=sgiaudio" -global sgi-mc.simms=0x0eee -global sgi-mc.mc-rev=3 -m 512M -bios "%BIOS%" -drive "file=%DISK%,format=chd,if=none,id=disk0,media=disk,cache=writethrough" -device "scsi-hd,bus=scsi.0,scsi-id=1,drive=disk0" %CDROM_ARGS% %NET_ARGS% -parallel none -display "%DISPLAY_MODE%" %SERIAL_ARGS% -monitor none %*
+"%QEMU%" -M indy,audiodev=sgiaudio -audiodev "%IRIX_AUDIO%,id=sgiaudio" -global sgi-mc.simms=0x0eee -global sgi-mc.mc-rev=3 -m 512M -bios "%BIOS%" -drive "file=%DISK%,format=chd,if=scsi,bus=0,unit=1,media=disk,cache=writethrough" %CDROM_ARGS% %NET_ARGS% -parallel none -display "%DISPLAY_MODE%" %SERIAL_ARGS% -monitor none %*
 
 set "RC=%ERRORLEVEL%"
 echo.

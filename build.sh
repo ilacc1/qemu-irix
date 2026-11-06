@@ -2,7 +2,8 @@
 # Configure and build qemu-irix for the Indy on Linux.
 set -euo pipefail
 
-cd "$(dirname "${BASH_SOURCE[0]}")"
+ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+cd "$ROOT_DIR/qemu"
 
 ./configure \
     --target-list=mips64-softmmu \

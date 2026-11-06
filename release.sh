@@ -25,7 +25,7 @@ WITH_WINDOWS=0
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 DIST="$ROOT_DIR/dist"
-BUILD_DIR="${BUILD_DIR:-$ROOT_DIR/build}"
+BUILD_DIR="${BUILD_DIR:-$ROOT_DIR/qemu/build}"
 WIN_SSH_TARGET="${WIN_SSH_TARGET:-}"
 WIN_SRC_DIR="${WIN_SRC_DIR:-/c/apps/0irix/qemu-irix}"
 # msys root (parent of mingw64/); / resolves via the /mingw64 mount.
@@ -36,14 +36,14 @@ mkdir -p "$DIST"
 # --- Ubuntu package -------------------------------------------------------
 UBUNTU_STAGE="$DIST/stage-ubuntu/qemu-irix-$VER"
 rm -rf "$DIST/stage-ubuntu"
-mkdir -p "$UBUNTU_STAGE/build" "$UBUNTU_STAGE/lib"
+mkdir -p "$UBUNTU_STAGE/qemu/build" "$UBUNTU_STAGE/lib"
 
 EXE="$BUILD_DIR/qemu-system-mips64"
 if [ ! -x "$EXE" ]; then
     echo "Linux emulator not found: $EXE (set BUILD_DIR or build it first)" >&2
     exit 1
 fi
-cp "$EXE" "$UBUNTU_STAGE/build/"
+cp "$EXE" "$UBUNTU_STAGE/qemu/build/"
 
 # Bundle the shared-library closure, minus libc/loader (always host-side).
 ldd "$EXE" | awk '/=> \//{print $1 "=" $3}' | while IFS='=' read -r soname path; do
@@ -53,19 +53,23 @@ ldd "$EXE" | awk '/=> \//{print $1 "=" $3}' | while IFS='=' read -r soname path;
     cp -L "$path" "$UBUNTU_STAGE/lib/$soname"
 done
 
-cp -r "$ROOT_DIR/sgi" "$UBUNTU_STAGE/"
-cp "$ROOT_DIR/run-indy.sh" "$ROOT_DIR/run-challenge.sh" "$ROOT_DIR/install.sh" \
+mkdir -p "$UBUNTU_STAGE/sgi"
+rsync -a --exclude '*.chd' --exclude '*.qcow2' --exclude '*.raw' \
+      --exclude '*.img' --exclude '*.iso' --exclude '*.tar' \
+      "$ROOT_DIR/sgi/" "$UBUNTU_STAGE/sgi/"
+cp "$ROOT_DIR/run-irix.sh" "$ROOT_DIR/run-irix53.sh" \
+   "$ROOT_DIR/run-challenge.sh" "$ROOT_DIR/install.sh" \
    "$ROOT_DIR/readme.md" "$ROOT_DIR/building.md" "$ROOT_DIR/networking.md" \
-   "$UBUNTU_STAGE/"
-chmod +x "$UBUNTU_STAGE/build/qemu-system-mips64" \
-         "$UBUNTU_STAGE/run-indy.sh" "$UBUNTU_STAGE/run-challenge.sh" \
-         "$UBUNTU_STAGE/install.sh"
+   "$ROOT_DIR/usage.md" "$UBUNTU_STAGE/"
+chmod +x "$UBUNTU_STAGE/qemu/build/qemu-system-mips64" \
+         "$UBUNTU_STAGE/run-irix.sh" "$UBUNTU_STAGE/run-irix53.sh" \
+         "$UBUNTU_STAGE/run-challenge.sh" "$UBUNTU_STAGE/install.sh"
 
 # Sanity: everything must resolve through the bundle.
-if LD_LIBRARY_PATH="$UBUNTU_STAGE/lib" ldd "$UBUNTU_STAGE/build/qemu-system-mips64" \
+if LD_LIBRARY_PATH="$UBUNTU_STAGE/lib" ldd "$UBUNTU_STAGE/qemu/build/qemu-system-mips64" \
     | grep -q "not found"; then
     echo "ERROR: bundled lib/ does not close the linkage:" >&2
-    LD_LIBRARY_PATH="$UBUNTU_STAGE/lib" ldd "$UBUNTU_STAGE/build/qemu-system-mips64" \
+    LD_LIBRARY_PATH="$UBUNTU_STAGE/lib" ldd "$UBUNTU_STAGE/qemu/build/qemu-system-mips64" \
         | grep "not found" >&2
     exit 1
 fi
@@ -103,14 +107,17 @@ if [ "$WITH_WINDOWS" -eq 1 ]; then
     mv "$DIST/win-remote"/mingw64/bin/*.dll "$WIN_STAGE/msys64/mingw64/bin/"
     mv "$DIST/win-remote"/mingw64/{lib,share} "$WIN_STAGE/msys64/mingw64/"
 
-    cp -r "$ROOT_DIR/sgi" "$WIN_STAGE/"
+    mkdir -p "$WIN_STAGE/sgi"
+    rsync -a --exclude '*.chd' --exclude '*.qcow2' --exclude '*.raw' \
+          --exclude '*.img' --exclude '*.iso' --exclude '*.tar' \
+          "$ROOT_DIR/sgi/" "$WIN_STAGE/sgi/"
     # CRLF for everything cmd.exe parses (normalize first: repo copies
     # may be LF or CRLF depending on checkout settings).
-    for f in run-indy.bat install.bat; do
+    for f in run-irix.bat run-irix53.bat run-challenge.bat install.bat; do
         sed 's/\r$//' "$ROOT_DIR/$f" | sed 's/$/\r/' > "$WIN_STAGE/$f"
     done
     cp "$ROOT_DIR/readme.md" "$ROOT_DIR/building.md" "$ROOT_DIR/networking.md" \
-       "$WIN_STAGE/"
+       "$ROOT_DIR/usage.md" "$WIN_STAGE/"
 
     rm -f "$DIST/qemu-irix-$VER-windows.zip"
     python3 -c "import shutil; shutil.make_archive('$DIST/qemu-irix-$VER-windows','zip',root_dir='$DIST/stage-windows',base_dir='qemu-irix-$VER')"

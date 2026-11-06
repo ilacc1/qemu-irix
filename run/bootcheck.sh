@@ -58,7 +58,7 @@ if [ -n "$LOGFILE" ]; then
     QEMU_ARGS=(-d int,mmu -D "$LOGFILE")
 fi
 
-setsid ./run-indy.sh "${QEMU_ARGS[@]}" >/tmp/irix-run.log 2>/tmp/irix-store.log </dev/null &
+setsid ./run-irix.sh "${QEMU_ARGS[@]}" >/tmp/irix-run.log 2>/tmp/irix-store.log </dev/null &
 disown || true
 
 # Wait for the monitor socket to show up.

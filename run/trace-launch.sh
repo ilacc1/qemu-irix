@@ -6,7 +6,7 @@
 # (first stores per mode). Log goes to /tmp/irix-trace.log, startup to
 # /tmp/irix-run.log.
 #
-# Usage: run/trace-launch.sh [extra run-indy.sh args]
+# Usage: run/trace-launch.sh [extra run-irix.sh args]
 set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "$0")/.." && pwd)
@@ -25,7 +25,7 @@ echo "trace -> $LOG"
 echo "run   -> $RUNLOG"
 
 setsid env \
-    "$ROOT_DIR/run-indy.sh" "$@" >"$RUNLOG" 2>>"$LOG" </dev/null &
+    "$ROOT_DIR/run-irix.sh" "$@" >"$RUNLOG" 2>>"$LOG" </dev/null &
 disown
 
 sleep 2

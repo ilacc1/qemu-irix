@@ -27,10 +27,9 @@ set "QEMU="
 if exist "%BASE%qemu\build\qemu-system-mips64.exe" set "QEMU=%BASE%qemu\build\qemu-system-mips64.exe"
 if not defined QEMU if exist "%BASE%build\qemu-system-mips64.exe" set "QEMU=%BASE%build\qemu-system-mips64.exe"
 if not defined QEMU if exist "%BASE%..\qemu\build\qemu-system-mips64.exe" set "QEMU=%BASE%..\qemu\build\qemu-system-mips64.exe"
-if not defined QEMU if exist "%BASE%..\qemu-irix-pub\build\qemu-system-mips64.exe" set "QEMU=%BASE%..\qemu-irix-pub\build\qemu-system-mips64.exe"
 if not defined QEMU (
     echo ERROR: qemu-system-mips64.exe not found.
-    echo Looked under qemu\build, build, ..\qemu\build, and ..\qemu-irix-pub\build.
+    echo Looked under qemu\build, build, and ..\qemu\build.
     goto end
 )
 
@@ -38,7 +37,6 @@ set "BIOS="
 if exist "%BASE%qemu\sgi\challenge\ip19prom.bin" set "BIOS=%BASE%qemu\sgi\challenge\ip19prom.bin"
 if not defined BIOS if exist "%BASE%sgi\challenge\ip19prom.bin" set "BIOS=%BASE%sgi\challenge\ip19prom.bin"
 if not defined BIOS if exist "%BASE%..\sgi\challenge\ip19prom.bin" set "BIOS=%BASE%..\sgi\challenge\ip19prom.bin"
-if not defined BIOS if exist "%BASE%..\qemu-irix-pub\sgi\challenge\ip19prom.bin" set "BIOS=%BASE%..\qemu-irix-pub\sgi\challenge\ip19prom.bin"
 if not defined BIOS (
     echo ERROR: Challenge PROM ip19prom.bin not found.
     goto end
@@ -47,6 +45,7 @@ for %%F in ("%BIOS%") do set "BIOS_DIR=%%~dpF"
 if "%BIOS_DIR:~-1%"=="\" set "BIOS_DIR=%BIOS_DIR:~0,-1%"
 
 if not "%IRIX_DISK%"=="" set "DISK=%IRIX_DISK%"
+if "%DISK%"=="" if exist "%BASE%sgi\ip19-main.chd" set "DISK=%BASE%sgi\ip19-main.chd"
 if "%DISK%"=="" if exist "%BASE%ip19-main.chd" set "DISK=%BASE%ip19-main.chd"
 if "%DISK%"=="" if exist "%BASE%..\ip19-main.chd" set "DISK=%BASE%..\ip19-main.chd"
 if "%DISK%"=="" set "DISK=%BASE%ip19-main.chd"

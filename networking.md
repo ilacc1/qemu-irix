@@ -1,6 +1,6 @@
 # Networking (TAP bridging for the Indy guest)
 
-The launchers (`run-indy.sh`, `run-indy.bat`) attach the guest's ec0
+The launchers (`run-irix.sh`, `run-irix.bat`) attach the guest's ec0
 NIC to a host TAP interface in bridged mode, which makes the guest a
 full peer on your LAN. If the TAP interface is not there, the scripts
 say so and boot the guest **without networking** — everything else
@@ -25,7 +25,7 @@ these unless you override them (`IRIX_TAP_IF` on Linux).
    back on the network. (Bridging a *Wi-Fi* adapter rarely works on
    Windows — use wired Ethernet for the bridge.)
 4. Re-run `install.bat` — it should now report `TAP adapter 'my-tap'
-   found` — then start the guest with `run-indy.bat`.
+   found` — then start the guest with `run-irix.bat`.
 
 ## Linux
 
@@ -53,12 +53,12 @@ the guest side expects `tap-iris` by default.
    ```
    To survive reboots, configure `br0` in your distro's network manager
    (netplan, NetworkManager, systemd-networkd) — see its documentation.
-4. Start the guest with `./run-indy.sh` and give IRIX an address on
+4. Start the guest with `./run-irix.sh` and give IRIX an address on
    your LAN.
 
 ## Alternatives (no TAP needed)
 
-- `IRIX_NETMODE=user ./run-indy.sh` (Linux) — SLIRP user-mode
+- `IRIX_NETMODE=user ./run-irix.sh` (Linux) — SLIRP user-mode
   networking, if the build includes it. No host setup at all, but the
   guest is behind NAT (inbound connections don't reach it).
 - `IRIX_NONET=1` (Linux) — drop the NIC entirely. Useful to isolate

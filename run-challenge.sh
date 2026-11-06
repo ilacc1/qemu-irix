@@ -17,9 +17,9 @@
 #   IRIX_NET=user       attach QEMU user-mode networking (slirp)
 #   IRIX_NET=off        leave the NIC disconnected
 #   IRIX_NET=<spec>     pass any other -nic specification through
-# The default TAP interface is tap-iris, matching run-indy.sh.
+# The default TAP interface is tap-iris, matching run-irix.sh.
 DIR=$(dirname "$0")
-QEMU="$DIR/build/qemu-system-mips64"
+QEMU="$DIR/qemu/build/qemu-system-mips64"
 PROM="$DIR/sgi/challenge/ip19prom.bin"
 DISK="$IRIX_DISK"
 CD="$IRIX_CD"
@@ -37,7 +37,7 @@ MTTCG="${IRIX_MTTCG:-1}"
 CONSOLE="${IRIX_CONSOLE:-window}"
 
 if [ -z "$DISK" ]; then
-  for candidate in "$DIR/ip19-main.chd" "$DIR/../ip19-main.chd"; do
+  for candidate in "$DIR/sgi/ip19-main.chd" "$DIR/ip19-main.chd" "$DIR/../ip19-main.chd"; do
     if [ -f "$candidate" ]; then
       DISK="$candidate"
       DISK_FORMAT=chd

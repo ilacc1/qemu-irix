@@ -23,9 +23,16 @@ or suitability for any use.
 
 ## Just get it running
 
-1. Get the release zip / tar.gz for your OS and run either install.bat or install.sh
-2. Get the indy_40xx compatible CHD from any source (mame presumably) and update run-indy.sh/bat DISK variable to point to your CHD image
-3. See [networking.md](networking.md) if you want to have access to the network. Of course, these are ancient systems and highly insecure so beware.
+From a source checkout:
+
+1. `./build.sh` (Linux) or `build.bat` (Windows) to produce `qemu/build/qemu-system-mips64[.exe]`.
+2. Put your Indy IRIX 6.5 CHD at `sgi/irix65_4020.chd` (or set `IRIX_DISK`).
+3. Run `./run-irix.sh` (Linux) or `run-irix.bat` (Windows).
+4. See [usage.md](usage.md) for every launcher option and environment
+   variable, and [networking.md](networking.md) for TAP setup.
+
+Release archives: run `install.sh`/`install.bat` first, then the same
+launchers. Challenge/Onyx (IP19) uses `run-challenge.sh`/`.bat`.
 
 ## Why another IRIX emulator
 
@@ -147,3 +154,5 @@ would not have been possible. Thank you.
 
 - **[building.md](building.md)** — how to install the toolchain and build
   this fork on Linux and Windows, in full detail.
+- **[usage.md](usage.md)** — launchers, command-line options, environment
+  variables and examples.
