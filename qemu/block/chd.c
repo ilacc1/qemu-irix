@@ -204,6 +204,17 @@ static int chd_load_map(BlockDriverState *bs, BDRVChdState *s,
         return -EIO;
     }
 
+    /*
+     * New hunks are appended after everything already in the container.
+     * Round to a hunk boundary: v5 map entries store the offset in hunk
+     * units, and entry 0 means "unallocated", so a blank image must start
+     * appending at least one hunk past the header.
+     */
+    s->append_offset = DIV_ROUND_UP(file_size, s->hunk_bytes) * s->hunk_bytes;
+    if (s->append_offset < s->hunk_bytes) {
+        s->append_offset = s->hunk_bytes;
+    }
+
     s->map_entry_bytes = s->version <= 2 ? 8 : s->version <= 4 ? 16 : 4;
     map_bytes = (uint64_t)s->hunk_count * s->map_entry_bytes;
 
