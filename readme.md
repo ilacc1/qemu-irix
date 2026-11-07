@@ -43,10 +43,19 @@ launchers. Challenge/Onyx (IP19) uses `run-challenge.sh`/`.bat`.
 
 ## Disk images
 
-I don't currently plan to share disk images but this will likely change. 
 I understand Indy R4000 images are relatively easy to find, but Challenge
-images are not. You can however get the 6.5.22m CDs and install Irix
+images are not. 
+
+So in release 0.1.4 I've included a minimal IP19 image. Decompress it
+and place it in sgi/ subfolder to align with the expected location in
+run-challenge.sh
+
+You can, of course, install Irix youself using 6.5.22 images
 on Challenge without issues. I wouldn't recommend earlier versions of 6.5. 
+In case you want to start with original io4prom, remove the flash file -
+sgi/challenge/io4prom.flash - this is essentially flashed as part of 
+6.5.22 installation.
+
 
 See also - **[usage.md](usage.md)** for detailed cli / env options.
 
