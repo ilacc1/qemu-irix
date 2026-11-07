@@ -2440,12 +2440,9 @@ static int32_t scsi_disk_dma_command(SCSIRequest *req, uint8_t *buf)
     }
 }
 
-static void scsi_disk_reset(DeviceState *dev)
+static void scsi_disk_update_max_lba(SCSIDiskState *s)
 {
-    SCSIDiskState *s = DO_UPCAST(SCSIDiskState, qdev.qdev, dev);
     uint64_t nb_sectors;
-
-    scsi_device_purge_requests(&s->qdev, SENSE_CODE(RESET));
 
     blk_get_geometry(s->qdev.conf.blk, &nb_sectors);
 
@@ -2454,6 +2451,20 @@ static void scsi_disk_reset(DeviceState *dev)
         nb_sectors--;
     }
     s->qdev.max_lba = nb_sectors;
+}
+
+static void scsi_disk_reset(DeviceState *dev)
+{
+    SCSIDiskState *s = DO_UPCAST(SCSIDiskState, qdev.qdev, dev);
+
+    scsi_device_purge_requests(&s->qdev, SENSE_CODE(RESET));
+
+    /*
+     * Removable media can appear after reset, and some guests (the IP19
+     * PROM) do not reissue READ CAPACITY after a media change.  Keep the
+     * LBA gate in sync with the current backend geometry.
+     */
+    scsi_disk_update_max_lba(s);
     /* reset tray statuses */
     s->tray_locked = 0;
     s->tray_open = 0;
@@ -2479,6 +2490,7 @@ static void scsi_disk_resize_cb(void *opaque)
 {
     SCSIDiskState *s = opaque;
 
+    scsi_disk_update_max_lba(s);
     /* SPC lists this sense code as available only for
      * direct-access devices.
      */
@@ -2506,6 +2518,7 @@ static void scsi_cd_change_media_cb(void *opaque, bool load, Error **errp)
     scsi_device_set_ua(&s->qdev, SENSE_CODE(UNIT_ATTENTION_NO_MEDIUM));
     s->media_event = true;
     s->eject_request = false;
+    scsi_disk_update_max_lba(s);
 }
 
 static void scsi_cd_eject_request_cb(void *opaque, bool force)
