@@ -40,6 +40,7 @@
 #include "qapi/error.h"
 #include "qemu/datadir.h"
 #include "qemu/error-report.h"
+#include "qemu/notify.h"
 #include "qemu/mem-reentrancy.h"
 #include "qemu/host-utils.h"
 #include "qemu/timer.h"
@@ -61,7 +62,13 @@ static bool ip19_hold_secondaries(void)
     if (hold < 0) {
         const char *e = g_getenv("IP19_HOLD_CPUS");
 
-        hold = e && (e[0] == '1' || e[0] == 'y' || e[0] == 'Y');
+        /*
+         * Hold by default: otherwise CPU 1 can claim the master group
+         * and enter the IO4 PROM while CPU 0 is still in the main PROM,
+         * producing the cache-test hang and TLB-miss panic.  The hold
+         * is released after CPU 0's bootmaster broadcast.
+         */
+        hold = !e || !(e[0] == '0' || e[0] == 'n' || e[0] == 'N');
     }
     return hold;
 }
@@ -276,8 +283,11 @@ struct SGI_IP19State {
     MemoryRegion flash_alias;
     MemoryRegion flash_alias_hi;
     uint8_t *flash_data;
+    char *flash_path;
+    bool flash_dirty;
     bool flash_program_setup;
     bool flash_erase_setup;
+    Notifier flash_exit;
     MemoryRegion cc;
     MemoryRegion cfg;
     MemoryRegion bustag;
@@ -1246,6 +1256,52 @@ static const MemoryRegionOps ip19_rtc_ops = {
     },
 };
 
+static void ip19_flash_save(SGI_IP19State *s)
+{
+    GError *err = NULL;
+
+    if (!s->flash_dirty || !s->flash_path) {
+        return;
+    }
+
+    if (!g_file_set_contents(s->flash_path, (const gchar *)s->flash_data,
+                             IP19_FLASH_SIZE, &err)) {
+        error_report("ip19: cannot save IO4 flash '%s': %s",
+                     s->flash_path, err->message);
+        g_clear_error(&err);
+        return;
+    }
+    s->flash_dirty = false;
+}
+
+static void ip19_flash_load(SGI_IP19State *s)
+{
+    g_autofree char *seed =
+        qemu_find_file(QEMU_FILE_TYPE_BIOS, "io4prom.bin");
+    g_autofree gchar *buf = NULL;
+    gsize len = 0;
+
+    if (seed) {
+        g_autofree char *dir = g_path_get_dirname(seed);
+
+        s->flash_path = g_build_filename(dir, "io4prom.flash", NULL);
+    } else {
+        s->flash_path = g_strdup("io4prom.flash");
+    }
+
+    if (g_file_get_contents(s->flash_path, &buf, &len, NULL)) {
+        memcpy(s->flash_data, buf, MIN(len, (gsize)IP19_FLASH_SIZE));
+        s->flash_dirty = false;
+    }
+}
+
+static void ip19_flash_exit(Notifier *notifier, void *data)
+{
+    SGI_IP19State *s = container_of(notifier, SGI_IP19State, flash_exit);
+
+    ip19_flash_save(s);
+}
+
 /*
  * The IO4 flash is two ganged Intel 8-bit parts, accessed as 16-bit
  * halfwords.  The IRIX flashio utility (irix/cmd/flashio) issues the
@@ -1292,13 +1348,16 @@ static void ip19_flash_write(void *opaque, hwaddr off, uint64_t val,
 
         if (s->flash_program_setup) {
             stw_be_p(s->flash_data + off, v);
+            s->flash_dirty = true;
             s->flash_program_setup = false;
             return;
         }
 
         switch (v) {
         case 0xffff:                    /* RESET */
+            s->flash_program_setup = false;
             s->flash_erase_setup = false;
+            ip19_flash_save(s);
             return;
         case 0x4040:                    /* SETUP_PROGRAM */
             s->flash_program_setup = true;
@@ -1307,6 +1366,7 @@ static void ip19_flash_write(void *opaque, hwaddr off, uint64_t val,
         case 0x2020:                    /* SETUP_ERASE / ERASE */
             if (s->flash_erase_setup) {
                 memset(s->flash_data, 0xff, IP19_FLASH_SIZE);
+                s->flash_dirty = true;
                 s->flash_erase_setup = false;
             } else {
                 s->flash_erase_setup = true;
@@ -1318,6 +1378,7 @@ static void ip19_flash_write(void *opaque, hwaddr off, uint64_t val,
             return;
         default:
             stw_be_p(s->flash_data + off, v);
+            s->flash_dirty = true;
             return;
         }
     }
@@ -1335,6 +1396,7 @@ static void ip19_flash_write(void *opaque, hwaddr off, uint64_t val,
     default:
         break;
     }
+    s->flash_dirty = true;
     s->flash_program_setup = false;
     s->flash_erase_setup = false;
 }
@@ -2431,6 +2493,42 @@ static void ip19_earom_defaults(SGI_IP19State *s)
     /* Checksum bytes stay zero so the PROM skips checksum validation. */
 }
 
+static void ip19_preload_io4_segments(const char *filename)
+{
+    g_autofree gchar *data = NULL;
+    gsize len = 0;
+
+    if (!filename || !g_file_get_contents(filename, &data, &len, NULL) ||
+        len < 0x20 || memcmp(data, "JKSW", 4) != 0 ||
+        memcmp(data + 0x18, "SEG2", 4) != 0) {
+        return;
+    }
+
+    uint32_t nseg = ldl_be_p(data + 0x1c);
+    for (uint32_t i = 0; i < nseg; i++) {
+        const uint8_t *seg = (const uint8_t *)data + 0x20 + i * 48;
+        uint32_t type, off, length;
+        uint64_t start;
+
+        if (0x20 + (i + 1) * 48 > len) {
+            break;
+        }
+        type = ldl_be_p(seg);
+        off = ldl_be_p(seg + 4);
+        start = ldq_be_p(seg + 16);
+        length = ldl_be_p(seg + 24);
+        if (off + length > len || length > 8 * MiB) {
+            continue;
+        }
+        /* Load MASTER and R4000 (not TFP/R10k) segments. */
+        if (type == 0xff01 || (type & 0xff00) == 0x0100) {
+            address_space_write(&address_space_memory,
+                                start & 0x1fffffff, MEMTXATTRS_UNSPECIFIED,
+                                (const uint8_t *)data + off, length);
+        }
+    }
+}
+
 /*
  * The stock IP19 PROM has two emulator-visible quirks: its large-window
  * helpers truncate an XKPHYS address with 32-bit add, and its cache tests
@@ -2668,6 +2766,9 @@ static void sgi_ip19_init(MachineState *machine)
             }
         }
     }
+    ip19_flash_load(s);
+    s->flash_exit.notify = ip19_flash_exit;
+    qemu_add_exit_notifier(&s->flash_exit);
 
     memory_region_init_io(&s->cc, NULL, &ip19_cc_ops, s, "ip19.cc",
                           IP19_CC_SIZE);
@@ -2765,6 +2866,8 @@ static void sgi_ip19_reset(MachineState *machine, ResetType type)
     SGI_IP19State *s = SGI_IP19_MACHINE(machine);
     CPUState *cs;
     int i;
+
+    ip19_flash_save(s);
 
     if (ip19_debug_enabled()) {
         uint8_t buf[8];

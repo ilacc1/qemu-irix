@@ -41,7 +41,7 @@ From a source checkout:
 Release archives: run `install.sh`/`install.bat` first, then the same
 launchers. Challenge/Onyx (IP19) uses `run-challenge.sh`/`.bat`.
 
-### Disk images
+## Disk images
 
 I don't currently plan to share disk images but this will likely change. 
 I understand Indy R4000 images are relatively easy to find, but Challenge
@@ -49,6 +49,14 @@ images are not. You can however get the 6.5.22m CDs and install Irix
 on Challenge without issues. I wouldn't recommend earlier versions of 6.5. 
 
 See also - **[usage.md](usage.md)** for detailed cli / env options.
+
+## What's new
+
+### What's new in 0.1.4
+
+ - Fixed cdrom/scsi bug affecting install on challenge
+ - Fixed prom upgrade / reflashing allowing 6.5.22 installer to update io4 prom
+   on Challenge
 
 ### What's new in 0.1.3
 
