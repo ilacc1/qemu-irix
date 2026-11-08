@@ -1854,7 +1854,12 @@ static void ip19_epc_nvram_defaults(SGI_IP19State *s)
                ip19_nv_defaults[i].value, len);
     }
 
-    s->epc_nvram[EPC_NV_REVISION] = 9; /* PROM-reported NV_BROKEN_REV */
+    /*
+     * NV_CURRENT_REV: the CPU-side PROM only accepts the NVRAM when the
+     * revision matches, and the kernel only uses the current checksum
+     * algorithm above NV_BROKEN_REV, so both agree on this value.
+     */
+    s->epc_nvram[EPC_NV_REVISION] = 10;
 
     /* Valid system-controller/NVRAM serial number. */
     s->epc_nvram[EPC_NV_SNUMVALID] = EPC_NV_SERIAL_MAGIC;
@@ -2864,6 +2869,14 @@ static void sgi_ip19_init(MachineState *machine)
      * on every boot.
      */
     s->epc_nvram[EPC_NV_INVENT_VALID] = 0;
+    /*
+     * The firmware's setenv writes the variable but leaves the stored
+     * checksum stale, and the next boot then finds the NVRAM invalid and
+     * resets the whole environment to its defaults - AutoLoad included,
+     * which drops the system into the maintenance menu.  Keep the image
+     * self-consistent so the stored environment survives.
+     */
+    s->epc_nvram[EPC_NV_NEW_CHECKSUM] = ip19_nv_new_checksum(s);
     ip19_nvram_gather(s, s->nvram_saved);
     s->nvram_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, ip19_nvram_tick, s);
     timer_mod(s->nvram_timer,
