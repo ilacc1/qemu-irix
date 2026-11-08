@@ -51,10 +51,6 @@ if not "%IRIX_SMP%"=="" set "SMP=%IRIX_SMP%"
 if "%SMP%"=="" set "SMP=4"
 if not "%IRIX_RAM%"=="" set "RAM=%IRIX_RAM%"
 if "%RAM%"=="" set "RAM=2G"
-if not "%IRIX_MTTCG%"=="" set "MTTCG=%IRIX_MTTCG%"
-if "%MTTCG%"=="" set "MTTCG=1"
-set "MTTCG_ARGS="
-if "%MTTCG%"=="1" set "MTTCG_ARGS=-accel tcg,thread=multi"
 rem Temporary default while debugging PROM boot failures.
 if "%IRIX_MONITOR%"=="" set "IRIX_MONITOR=tcp:127.0.0.1:4445,server=on,wait=off"
 set "DISK_FORMAT=chd"
@@ -124,12 +120,12 @@ echo   Console:      %IRIX_CONSOLE%
 echo.
 
 if /I "%IRIX_CONSOLE%"=="window" (
-    start "SGI Challenge" "%QEMU%" -M ip19 -smp %SMP% -m %RAM% %MTTCG_ARGS% -bios "%BIOS%" -L "%BIOS_DIR%" %SNAP_ARGS% -drive "file=%DISK%,format=%DISK_FORMAT%,if=none,id=ip19disk" -device "scsi-hd,drive=ip19disk,bus=main-system-bus/sgi-s1/scsi.0,scsi-id=1" %CDROM_ARGS% %NET_ARGS% -parallel none -display gtk,zoom-to-fit=on -serial vc -monitor "%IRIX_MONITOR%" %*
+    start "SGI Challenge" "%QEMU%" -M ip19 -smp %SMP% -m %RAM% -bios "%BIOS%" -L "%BIOS_DIR%" %SNAP_ARGS% -drive "file=%DISK%,format=%DISK_FORMAT%,if=none,id=ip19disk" -device "scsi-hd,drive=ip19disk,bus=main-system-bus/sgi-s1/scsi.0,scsi-id=1" %CDROM_ARGS% %NET_ARGS% -parallel none -display gtk,zoom-to-fit=on -serial vc -monitor "%IRIX_MONITOR%" %*
     set "RC=0"
     goto end
 )
 
-"%QEMU%" -M ip19 -smp %SMP% -m %RAM% %MTTCG_ARGS% -bios "%BIOS%" -L "%BIOS_DIR%" %SNAP_ARGS% -drive "file=%DISK%,format=%DISK_FORMAT%,if=none,id=ip19disk" -device "scsi-hd,drive=ip19disk,bus=main-system-bus/sgi-s1/scsi.0,scsi-id=1" %CDROM_ARGS% %NET_ARGS% -parallel none -display "%DISPLAY_MODE%" -serial "%SERIAL_SPEC%" -monitor "%IRIX_MONITOR%" %*
+"%QEMU%" -M ip19 -smp %SMP% -m %RAM% -bios "%BIOS%" -L "%BIOS_DIR%" %SNAP_ARGS% -drive "file=%DISK%,format=%DISK_FORMAT%,if=none,id=ip19disk" -device "scsi-hd,drive=ip19disk,bus=main-system-bus/sgi-s1/scsi.0,scsi-id=1" %CDROM_ARGS% %NET_ARGS% -parallel none -display "%DISPLAY_MODE%" -serial "%SERIAL_SPEC%" -monitor "%IRIX_MONITOR%" %*
 
 set "RC=%ERRORLEVEL%"
 echo.

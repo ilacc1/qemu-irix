@@ -33,7 +33,6 @@ SNAPSHOT="${IRIX_SNAPSHOT:-0}"
 NET="${IRIX_NET:-tap}"
 NET_PORT="${IRIX_NET_PORT:-2323}"
 TAP_IF="${IRIX_TAP_IF:-tap-iris}"
-MTTCG="${IRIX_MTTCG:-1}"
 CONSOLE="${IRIX_CONSOLE:-window}"
 USER_ARGS=("$@")
 
@@ -57,10 +56,6 @@ fi
 
 set -- -M ip19 -smp "$SMP" -m "$RAM" -parallel none \
   -bios "$PROM" -L "$DIR/sgi/challenge"
-
-if [ "$MTTCG" = 1 ]; then
-  set -- "$@" -accel tcg,thread=multi
-fi
 
 if [ "$SNAPSHOT" = 1 ]; then
   set -- "$@" -snapshot
