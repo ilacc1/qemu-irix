@@ -53,6 +53,7 @@ if not "%IRIX_RAM%"=="" set "RAM=%IRIX_RAM%"
 if "%RAM%"=="" set "RAM=2G"
 rem Temporary default while debugging PROM boot failures.
 if "%IRIX_MONITOR%"=="" set "IRIX_MONITOR=tcp:127.0.0.1:4445,server=on,wait=off"
+if not defined IP19_NVRAM_READONLY set "IP19_NVRAM_READONLY=1"
 set "DISK_FORMAT=chd"
 if not "%IRIX_DISK_FORMAT%"=="" set "DISK_FORMAT=%IRIX_DISK_FORMAT%"
 

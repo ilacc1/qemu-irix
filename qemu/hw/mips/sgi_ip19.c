@@ -1312,12 +1312,18 @@ static void ip19_nvram_scatter(SGI_IP19State *s, const uint8_t *buf)
  * and IRIX update NVRAM with many small stores, so a per-store write
  * would be wasteful.
  */
+/* Set IP19_NVRAM_READONLY to keep the guest NVRAM image from being written. */
+static bool ip19_nvram_readonly(void)
+{
+    return g_getenv("IP19_NVRAM_READONLY") != NULL;
+}
+
 static void ip19_nvram_save(SGI_IP19State *s)
 {
     uint8_t cur[IP19_NVRAM_FILE_SIZE];
     g_autoptr(GError) err = NULL;
 
-    if (!s->nvram_path) {
+    if (!s->nvram_path || ip19_nvram_readonly()) {
         return;
     }
     ip19_nvram_gather(s, cur);
