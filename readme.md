@@ -50,6 +50,7 @@ See also - **[usage.md](usage.md)** for detailed cli / env options.
 ### What's new in 0.1.5
  - Defaults to 4 CPUs on IP19
  - TCG now fully capable of supporting multi-threaded 64-bit MIPS
+   so 4 guest CPUs run on 4 host cores
  - nvram is saved on ip19, with a workaround for checksum zap
  - Many minor improvements.
 
