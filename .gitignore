@@ -18,7 +18,6 @@
 
 # User-supplied media
 /iso/
-/sgi/challenge/ip19-nvram.bin
 /sgi/*.chd
 /sgi/*.raw
 /sgi/*.img
