@@ -2855,6 +2855,15 @@ static void sgi_ip19_init(MachineState *machine)
             ip19_nvram_scatter(s, (const uint8_t *)buf);
         }
     }
+    /*
+     * The IO4 PROM rescans the hardware and rewrites the NVRAM inventory
+     * at every power-on, and this model does not run it.  The CPU-side
+     * PROM only rebuilds the inventory when the stored copy is marked
+     * invalid, so invalidate it here: the PROM then stores what it finds
+     * in the hardware instead of asking the operator to confirm a change
+     * on every boot.
+     */
+    s->epc_nvram[EPC_NV_INVENT_VALID] = 0;
     ip19_nvram_gather(s, s->nvram_saved);
     s->nvram_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, ip19_nvram_tick, s);
     timer_mod(s->nvram_timer,
