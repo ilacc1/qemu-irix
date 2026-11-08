@@ -13,20 +13,6 @@ Currently emulates:
 - SGI Indy (1xR4000CPU, 384Mb RAM). Supports Irix 5.3 and up to 6.5.30m. 
 - SGI Challenge Desk-side IP19 (2x R4400 with 2Gb RAM). Supports Irix 5.3 to 6.5.22m.
 
-## What's new in 0.1.2
-
-- Windows audio goes through SDL2/WASAPI instead of DirectSound; the HAL2
-  boot chime plays at the correct speed.
-- Windows networking detects a bridged TAP adapter correctly.
-- Machine → Removable drive inserts and ejects CD images at runtime. The CD
-  drive is always present with an empty tray.
-- The disk defaults to direct read-write access; set
-  `IRIX_DISK_COW=overlay` for the old copy-on-write mode.
-- `build.sh` / `build.bat` reproduce the documented build options, and the
-  Windows build documents and enables SDL2.
-- Firmware seeds now live under `sgi/indy/`.
-- Fixes for HAL2 absence on IRIX 5.3, PBUS DMA control writes, and stalled
-  WD33C93 transfers.
 
 ## Quick start (Indy)
 
@@ -60,6 +46,12 @@ sgi/challenge/io4prom.flash - this is essentially flashed as part of
 See also - **[usage.md](usage.md)** for detailed cli / env options.
 
 ## What's new
+
+### What's new in 0.1.5
+ - Defaults to 4 CPUs on IP19
+ - TCG now fully capable of supporting multi-threaded 64-bit MIPS
+ - nvram is saved on ip19, with a workaround for checksum zap
+ - Many minor improvements.
 
 ### What's new in 0.1.4
 
