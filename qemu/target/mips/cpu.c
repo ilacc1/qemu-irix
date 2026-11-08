@@ -102,7 +102,7 @@ static void mips_cpu_dump_state(CPUState *cs, FILE *f, int flags)
 
     qemu_fprintf(f, "CP0 Status  0x%08x Cause   0x%08x EPC    0x"
                  TARGET_FMT_lx "\n",
-                 env->CP0_Status, env->CP0_Cause, env->CP0_EPC);
+                 env->CP0_Status, mips_get_cause(env), env->CP0_EPC);
     qemu_fprintf(f, "    Config0 0x%08x Config1 0x%08x LLAddr 0x%016"
                  PRIx64 "\n",
                  env->CP0_Config0, env->CP0_Config1, env->CP0_LLAddr);
@@ -708,7 +708,7 @@ static vaddr mips_pointer_wrap(CPUState *cs, int mmu_idx,
 #endif
 
 static const TCGCPUOps mips_tcg_ops = {
-    .mttcg_supported = TARGET_LONG_BITS == 32,
+    .mttcg_supported = true,
     .guest_default_memory_order = 0,
 
     .initialize = mips_tcg_init,

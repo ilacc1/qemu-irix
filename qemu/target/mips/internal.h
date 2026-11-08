@@ -190,7 +190,7 @@ static inline bool cpu_mips_hw_interrupts_pending(const CPUMIPSState *env)
     int32_t status;
     bool r;
 
-    pending = env->CP0_Cause & CP0Ca_IP_mask;
+    pending = qatomic_read((int32_t *)&env->CP0_Cause) & CP0Ca_IP_mask;
     status = env->CP0_Status & CP0Ca_IP_mask;
 
     if (env->CP0_Config3 & (1 << CP0C3_VEIC)) {

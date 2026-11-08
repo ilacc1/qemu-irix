@@ -387,7 +387,7 @@ target_ulong helper_mftc0_cause(CPUMIPSState *env)
     int other_tc = env->CP0_VPEControl & (0xff << CP0VPECo_TargTC);
     CPUMIPSState *other = mips_cpu_map_tc(env, &other_tc);
 
-    return other->CP0_Cause;
+    return mips_get_cause(other);
 }
 
 target_ulong helper_mftc0_status(CPUMIPSState *env)
@@ -730,7 +730,7 @@ void helper_mtc0_tcrestart(CPUMIPSState *env, target_ulong arg1)
     env->active_tc.PC = arg1;
     env->active_tc.CP0_TCStatus &= ~(1 << CP0TCSt_TDS);
     env->CP0_LLAddr = 0;
-    env->lladdr = 0;
+    qatomic_set(&env->lladdr, 0);
     /* MIPS16 not implemented. */
 }
 
@@ -743,13 +743,13 @@ void helper_mttc0_tcrestart(CPUMIPSState *env, target_ulong arg1)
         other->active_tc.PC = arg1;
         other->active_tc.CP0_TCStatus &= ~(1 << CP0TCSt_TDS);
         other->CP0_LLAddr = 0;
-        other->lladdr = 0;
+        qatomic_set(&other->lladdr, 0);
         /* MIPS16 not implemented. */
     } else {
         other->tcs[other_tc].PC = arg1;
         other->tcs[other_tc].CP0_TCStatus &= ~(1 << CP0TCSt_TDS);
         other->CP0_LLAddr = 0;
-        other->lladdr = 0;
+        qatomic_set(&other->lladdr, 0);
         /* MIPS16 not implemented. */
     }
 }
@@ -1144,10 +1144,12 @@ void helper_mtc0_status(CPUMIPSState *env, target_ulong arg1)
     val = env->CP0_Status;
 
     if (qemu_loglevel_mask(CPU_LOG_EXEC)) {
+        int32_t cause = mips_get_cause(env);
+
         qemu_log("Status %08x (%08x) => %08x (%08x) Cause %08x",
-                old, old & env->CP0_Cause & CP0Ca_IP_mask,
-                val, val & env->CP0_Cause & CP0Ca_IP_mask,
-                env->CP0_Cause);
+                old, old & cause & CP0Ca_IP_mask,
+                val, val & cause & CP0Ca_IP_mask,
+                cause);
         switch (mips_env_mmu_index(env)) {
         case 3:
             qemu_log(", ERL\n");

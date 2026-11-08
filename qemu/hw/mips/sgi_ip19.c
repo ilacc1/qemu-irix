@@ -55,24 +55,6 @@ static time_t ip19_timegm(struct tm *tm)
 #endif
 }
 
-static bool ip19_hold_secondaries(void)
-{
-    static int hold = -1;
-
-    if (hold < 0) {
-        const char *e = g_getenv("IP19_HOLD_CPUS");
-
-        /*
-         * Hold by default: otherwise CPU 1 can claim the master group
-         * and enter the IO4 PROM while CPU 0 is still in the main PROM,
-         * producing the cache-test hang and TLB-miss panic.  The hold
-         * is released after CPU 0's bootmaster broadcast.
-         */
-        hold = !e || !(e[0] == '0' || e[0] == 'n' || e[0] == 'N');
-    }
-    return hold;
-}
-
 static bool ip19_debug_enabled(void)
 {
     static int enabled = -1;
@@ -114,6 +96,14 @@ static bool ip19_debug_enabled(void)
 #define IP19_RTC_SIZE       0x01000
 #define IP19_EAROM_BASE     0x19000000
 #define IP19_EAROM_SIZE     0x04000
+/*
+ * Guest NVRAM is saved as one image: the 4 KiB EPC NVRAM followed by the
+ * EAROM.  Changes are flushed on a virtual-time timer, like the Indy
+ * HPC3 NVRAM, so a guest's NVRAM edits survive a QEMU restart.
+ */
+#define IP19_EPC_NVRAM_SIZE 4096
+#define IP19_NVRAM_FILE_SIZE (IP19_EPC_NVRAM_SIZE + IP19_EAROM_SIZE)
+#define IP19_NVRAM_FLUSH_NS (5ULL * 1000000000ULL)
 #define IP19_LED_BASE       0x19004000
 #define IP19_LED_SIZE       0x01000
 #define IP19_SYNC_BASE      0x1a000100
@@ -189,6 +179,10 @@ static bool ip19_debug_enabled(void)
 #define EV_PROCNUM_MASK     0x03
 #define EV_SLOTNUM_MASK     0x3c
 #define EV_SPNUM_MASK       0x3f
+
+/* System controller protocol, kern/sys/EVEREST/sysctlr.h */
+#define SC_BMREQ            0x40    /* '@' bootmaster arbitration request */
+#define IGR_MASTER          0x01    /* boot master interrupt group */
 
 /* Configuration register numbers, IP19.h / mc3.h / io4.h */
 #define CFG_BOARD_ENABLE    0x00
@@ -288,6 +282,10 @@ struct SGI_IP19State {
     bool flash_program_setup;
     bool flash_erase_setup;
     Notifier flash_exit;
+    char *nvram_path;
+    uint8_t nvram_saved[IP19_NVRAM_FILE_SIZE];
+    QEMUTimer *nvram_timer;
+    Notifier nvram_exit;
     MemoryRegion cc;
     MemoryRegion cfg;
     MemoryRegion bustag;
@@ -307,20 +305,12 @@ struct SGI_IP19State {
     uint64_t cfg_regs[IP19_MAX_SLOTS][IP19_CFG_REGS];
 
     uint64_t ip[IP19_MAX_CPUS][2];
+    bool bm_claimed;
     bool rtc_yield;
     bool rtc_yield_armed;
     int64_t rtc_yield_until_ns;
     uint64_t grp_pending[64][2];
     uint64_t grp_delivered[64][IP19_MAX_CPUS][2];
-    /*
-     * Reset hold for the secondary slices.  The IP19 PROM arbitration
-     * is based on the host RTC and the per-CPU SPNUM timeout, so with
-     * more than one runnable vCPU the winner depended on host timing.
-     * Keep every non-bootmaster slice halted until CPU 0 has claimed
-     * the master group.  A late slice then takes the PROM's slave path.
-     */
-    bool cpu_held[IP19_MAX_CPUS];
-    bool bootmaster_claimed;
     uint64_t ile[IP19_MAX_CPUS];
     uint64_t igrmask[IP19_MAX_CPUS];
     uint64_t cel[IP19_MAX_CPUS];
@@ -329,8 +319,8 @@ struct SGI_IP19State {
     bool uartint[IP19_MAX_CPUS];
     QEMUTimer *cmp_timer[IP19_MAX_CPUS];
     IP19CmpTimer cmp_ctx[IP19_MAX_CPUS];
-    uint64_t wgdst;
-    uint64_t wgcntrl;
+    uint64_t wgdst[IP19_MAX_CPUS];
+    uint64_t wgcntrl[IP19_MAX_CPUS];
     uint64_t cc_ertoip;
     uint64_t cc_eccsb_dis;
     uint64_t pgbren;
@@ -363,9 +353,13 @@ struct SGI_IP19State {
     Chardev *cc_uart_chr;
     uint8_t cc_uart_rx;
     bool cc_uart_rx_ready;
-    uint8_t cc_uart_fifo[64];
-    unsigned cc_uart_head;
-    unsigned cc_uart_tail;
+    /*
+     * The system controller addresses one processor at a time over the
+     * CC UART, so a character is only visible to the processor it names.
+     */
+    uint8_t cc_uart_rxq[IP19_MAX_CPUS][64];
+    unsigned cc_uart_rxq_head[IP19_MAX_CPUS];
+    unsigned cc_uart_rxq_tail[IP19_MAX_CPUS];
     uint8_t cc_cmd[32];
     unsigned cc_cmd_len;
 };
@@ -380,10 +374,14 @@ static void ip19_s1_irq(void *opaque, int n, int level)
 {
     SGI_IP19State *s = opaque;
 
+    /*
+     * The CC keeps one latched pending bit per interrupt level and
+     * software clears it through EV_CIPL0.  Mirroring the source line
+     * here would drop the pending bit before the CPU has serviced the
+     * interrupt, and the kernel would then dispatch with HPIL == 0.
+     */
     if (level) {
         ip19_set_pending(s, 0, 0x4f);
-    } else {
-        ip19_clear_pending(s, 0, 0x4f);
     }
 }
 
@@ -543,6 +541,15 @@ static void ip19_cmp_rearm(SGI_IP19State *s, unsigned cpu)
 
 static void ip19_set_pending(SGI_IP19State *s, unsigned cpu, unsigned level)
 {
+    /*
+     * Level 0 is not an interrupt level: EVINTR_LEVEL_BASE is 1, and the
+     * PROM's clock-sync vector (SYNC_DEST) decodes as level 0.  Latching
+     * it would leave a pending bit the guest can never clear, which also
+     * breaks the PROM's read-back test of EV_IP0.
+     */
+    if (level == 0) {
+        return;
+    }
     s->ip[cpu][level >> 6] |= 1ULL << (level & 63);
     ip19_update_irq(s, cpu);
 }
@@ -551,23 +558,6 @@ static void ip19_clear_pending(SGI_IP19State *s, unsigned cpu, unsigned level)
 {
     s->ip[cpu][level >> 6] &= ~(1ULL << (level & 63));
     ip19_update_irq(s, cpu);
-}
-
-static void ip19_release_secondary_cpus(SGI_IP19State *s)
-{
-    CPUState *cs;
-
-    CPU_FOREACH(cs) {
-        unsigned cpu = cs->cpu_index;
-
-        if (cpu == 0 || cpu >= IP19_MAX_CPUS || !s->cpu_held[cpu]) {
-            continue;
-        }
-        s->cpu_held[cpu] = false;
-        cs->halted = 0;
-        qemu_cpu_kick(cs);
-        IP19_DPRINT("release cpu %u\n", cpu);
-    }
 }
 
 static void ip19_group_deliver_one(SGI_IP19State *s, unsigned cpu,
@@ -595,6 +585,15 @@ static void ip19_deliver_vector(SGI_IP19State *s, uint64_t vector)
     unsigned dest = vector & 0x7f;
     unsigned level = (vector >> 8) & 0x7f;
     unsigned i;
+
+    /*
+     * Level 0 is not an interrupt level (EVINTR_LEVEL_BASE is 1).  The
+     * PROM's clock-sync vector decodes as level 0, and latching it would
+     * leave a pending bit the guest cannot clear.
+     */
+    if (level == 0) {
+        return;
+    }
 
     if (dest == 0x7f) {
         for (i = 0; i < IP19_MAX_CPUS; i++) {
@@ -661,13 +660,18 @@ static void ip19_clear_vector(SGI_IP19State *s, uint64_t vector)
     }
 }
 
-static void ip19_cc_uart_push(SGI_IP19State *s, uint8_t ch)
+/* Queue a character for one specific processor. */
+static void ip19_cc_uart_push_cpu(SGI_IP19State *s, unsigned cpu, uint8_t ch)
 {
-    unsigned next = (s->cc_uart_head + 1) % sizeof(s->cc_uart_fifo);
+    unsigned next;
 
-    if (next != s->cc_uart_tail) {
-        s->cc_uart_fifo[s->cc_uart_head] = ch;
-        s->cc_uart_head = next;
+    if (cpu >= IP19_MAX_CPUS) {
+        return;
+    }
+    next = (s->cc_uart_rxq_head[cpu] + 1) % sizeof(s->cc_uart_rxq[0]);
+    if (next != s->cc_uart_rxq_tail[cpu]) {
+        s->cc_uart_rxq[cpu][s->cc_uart_rxq_head[cpu]] = ch;
+        s->cc_uart_rxq_head[cpu] = next;
     }
 }
 
@@ -703,7 +707,6 @@ static MemTxResult ip19_cc_read(void *opaque, hwaddr off, uint64_t *data,
         /* slot/proc as encoded by IP19 PROM/kernel */
         ret = ((uint64_t)IP19_SLOT_CPU << EV_SLOTNUM_SHFT) |
               ((uint64_t)cpu & EV_PROCNUM_MASK);
-        IP19_DPRINT("SPNUM read cpu %u -> 0x%02" PRIx64 "\n", cpu, ret);
         break;
     case CC_SYSCONFIG:
         /*
@@ -735,13 +738,14 @@ static MemTxResult ip19_cc_read(void *opaque, hwaddr off, uint64_t *data,
         break;
     case CC_UART_CMD:
         /* i8251 status: TX ready/empty; RX only when a byte is queued. */
-        ret = 0x05 | (s->cc_uart_head != s->cc_uart_tail ? 0x02 : 0);
+        ret = 0x05 | (s->cc_uart_rxq_head[cpu] != s->cc_uart_rxq_tail[cpu]
+                      ? 0x02 : 0);
         break;
     case CC_UART_DATA:
-        if (s->cc_uart_head != s->cc_uart_tail) {
-            ret = s->cc_uart_fifo[s->cc_uart_tail];
-            s->cc_uart_tail = (s->cc_uart_tail + 1) %
-                              sizeof(s->cc_uart_fifo);
+        if (s->cc_uart_rxq_head[cpu] != s->cc_uart_rxq_tail[cpu]) {
+            ret = s->cc_uart_rxq[cpu][s->cc_uart_rxq_tail[cpu]];
+            s->cc_uart_rxq_tail[cpu] = (s->cc_uart_rxq_tail[cpu] + 1) %
+                                       sizeof(s->cc_uart_rxq[0]);
         } else {
             ret = 0;
         }
@@ -787,11 +791,11 @@ static MemTxResult ip19_cc_read_with_attrs(void *opaque, hwaddr off, uint64_t *d
         return MEMTX_OK;
     }
     if (off == CC_WGDST) {
-        *data = s->wgdst;
+        *data = s->wgdst[cpu];
         return MEMTX_OK;
     }
     if (off == CC_WGCNTRL) {
-        *data = s->wgcntrl;
+        *data = s->wgcntrl[cpu];
         return MEMTX_OK;
     }
     if (off == CC_WGCLEAR) {
@@ -820,7 +824,7 @@ static MemTxResult ip19_cc_write(void *opaque, hwaddr off, uint64_t val,
                 IP19_DPRINT("KZRESET cpu %u pc %016" PRIx64
                             " sr %08x cause %08x epc %016" PRIx64 "\n",
                             cs->cpu_index, (uint64_t)mc->env.active_tc.PC,
-                            mc->env.CP0_Status, mc->env.CP0_Cause,
+                            mc->env.CP0_Status, mips_get_cause(&mc->env),
                             (uint64_t)mc->env.CP0_EPC);
             }
             if (address_space_read(&address_space_memory, 0x3f1dcc,
@@ -851,10 +855,10 @@ static MemTxResult ip19_cc_write(void *opaque, hwaddr off, uint64_t val,
         }
         break;
     case CC_WGDST:
-        s->wgdst = val;
+        s->wgdst[cpu] = val;
         break;
     case CC_WGCNTRL:
-        s->wgcntrl = val;
+        s->wgcntrl[cpu] = val;
         break;
     case CC_WGCLEAR:
         break;
@@ -866,16 +870,6 @@ static MemTxResult ip19_cc_write(void *opaque, hwaddr off, uint64_t val,
          * (slot << 2) | cpu.
          */
         ip19_deliver_vector(s, val);
-        /*
-         * The bootmaster follows IGRMASK=IGR_MASTER with a level-6
-         * broadcast.  Release the held slices only after that edge has
-         * been delivered, so the broadcast cannot arrive after a late
-         * slice has reached the slave loop (where level 6 means POD).
-         */
-        if (s->bootmaster_claimed && (val & 0x7f) == 0x7f &&
-            ((val >> 8) & 0x7f) == 0x6) {
-            ip19_release_secondary_cpus(s);
-        }
         break;
     case CC_IP0:
         s->ip[cpu][0] = val;
@@ -921,28 +915,20 @@ static MemTxResult ip19_cc_write(void *opaque, hwaddr off, uint64_t val,
             memset(s->grp_delivered, 0, sizeof(s->grp_delivered));
         }
         s->igrmask[cpu] = val;
-        /*
-         * Joining the master group is the bootmaster's claim.  Only
-         * CPU 0 can reach this point before the other slices are
-         * released, so the election is deterministic.
-         */
-        IP19_DPRINT("IGRMASK write cpu %u val 0x%02" PRIx64
-                    " claimed %d\n", cpu, val, s->bootmaster_claimed);
-        /*
-         * The CC self-test also writes 0xffff/0xaaaa/0x5555/0 to
-         * IGRMASK, so only the exact IGR_MASTER value 1 is a claim.
-         * Do not release the held slices here: the bootmaster's next
-         * CC write is the BOOT_LEVEL broadcast, and a slice that is
-         * released before that broadcast can reach the PROM slave loop
-         * first, where BOOT_LEVEL and POD_LEVEL are both 6.
-         */
-        if (!s->bootmaster_claimed && val == 0x1) {
-            s->bootmaster_claimed = true;
-        }
         for (unsigned group = 0; group < 64; group++) {
             if (val & (1ULL << group)) {
                 ip19_group_deliver_one(s, cpu, group);
             }
+        }
+        /*
+         * Joining the master group is the boot master claim.  The
+         * system controller addresses the claiming processor over the
+         * CC UART and the PROM answers it, so the claim has to be
+         * acknowledged before the claiming CPU waits for the SysCtrlr.
+         */
+        if ((val & IGR_MASTER) && !s->bm_claimed) {
+            s->bm_claimed = true;
+            ip19_cc_uart_push_cpu(s, cpu, SC_BMREQ + (cpu & EV_PROCNUM_MASK));
         }
         break;
     case CC_ILE:
@@ -973,9 +959,9 @@ static MemTxResult ip19_cc_write(void *opaque, hwaddr off, uint64_t val,
                     uint8_t seq = s->cc_cmd[2];
                     uint8_t type = s->cc_cmd[3];
 
-                    ip19_cc_uart_push(s, 0x52);      /* SC_RESP */
-                    ip19_cc_uart_push(s, seq);
-                    ip19_cc_uart_push(s, type);
+                    ip19_cc_uart_push_cpu(s, cpu, 0x52);    /* SC_RESP */
+                    ip19_cc_uart_push_cpu(s, cpu, seq);
+                    ip19_cc_uart_push_cpu(s, cpu, type);
 
                     if (type == 0x44) {              /* SC_DEBUG */
                         /*
@@ -984,19 +970,19 @@ static MemTxResult ip19_cc_write(void *opaque, hwaddr off, uint64_t val,
                          */
                         static const uint8_t info[] = { '0', '0', '1', '0' };
                         for (unsigned i = 0; i < sizeof(info); i++) {
-                            ip19_cc_uart_push(s, info[i]);
+                            ip19_cc_uart_push_cpu(s, cpu, info[i]);
                         }
                     } else if (type == 0x53) {       /* SC_SERIAL */
                         const char *serial = s->sysctlr_serial;
                         size_t len = MIN(strlen(serial), (size_t)10);
 
                         for (unsigned i = 0; i < len; i++) {
-                            ip19_cc_uart_push(s, serial[i]);
+                            ip19_cc_uart_push_cpu(s, cpu, serial[i]);
                         }
                     } else if (type == 0x43) {       /* SC_CHECK */
-                        ip19_cc_uart_push(s, 'N');    /* no length mode */
+                        ip19_cc_uart_push_cpu(s, cpu, 'N');  /* no length */
                     }
-                    ip19_cc_uart_push(s, 0);
+                    ip19_cc_uart_push_cpu(s, cpu, 0);
                 } else if (s->cc_cmd_len >= 4 && s->cc_cmd[1] == 0x53) {
                     switch (s->cc_cmd[2]) {
                     case 0x53: {                     /* SC_SERIAL */
@@ -1024,7 +1010,7 @@ static MemTxResult ip19_cc_write(void *opaque, hwaddr off, uint64_t val,
             }
         }
         /* Interrupt only when a sysctlr reply is queued, not on every write. */
-        if (s->cc_uart_head != s->cc_uart_tail) {
+        if (s->cc_uart_rxq_head[cpu] != s->cc_uart_rxq_tail[cpu]) {
             ip19_cc_uart_irq(s, cpu);
         }
         break;
@@ -1293,6 +1279,74 @@ static void ip19_flash_load(SGI_IP19State *s)
         memcpy(s->flash_data, buf, MIN(len, (gsize)IP19_FLASH_SIZE));
         s->flash_dirty = false;
     }
+}
+
+/* Lives beside io4prom.bin, like the IO4 flash image. */
+static char *ip19_nvram_path(void)
+{
+    g_autofree char *seed =
+        qemu_find_file(QEMU_FILE_TYPE_BIOS, "io4prom.bin");
+
+    if (seed) {
+        g_autofree char *dir = g_path_get_dirname(seed);
+
+        return g_build_filename(dir, "ip19-nvram.bin", NULL);
+    }
+    return g_strdup("ip19-nvram.bin");
+}
+
+static void ip19_nvram_gather(SGI_IP19State *s, uint8_t *buf)
+{
+    memcpy(buf, s->epc_nvram, IP19_EPC_NVRAM_SIZE);
+    memcpy(buf + IP19_EPC_NVRAM_SIZE, s->earom_data, IP19_EAROM_SIZE);
+}
+
+static void ip19_nvram_scatter(SGI_IP19State *s, const uint8_t *buf)
+{
+    memcpy(s->epc_nvram, buf, IP19_EPC_NVRAM_SIZE);
+    memcpy(s->earom_data, buf + IP19_EPC_NVRAM_SIZE, IP19_EAROM_SIZE);
+}
+
+/*
+ * Write only when the image differs from the last saved copy: the PROM
+ * and IRIX update NVRAM with many small stores, so a per-store write
+ * would be wasteful.
+ */
+static void ip19_nvram_save(SGI_IP19State *s)
+{
+    uint8_t cur[IP19_NVRAM_FILE_SIZE];
+    g_autoptr(GError) err = NULL;
+
+    if (!s->nvram_path) {
+        return;
+    }
+    ip19_nvram_gather(s, cur);
+    if (memcmp(cur, s->nvram_saved, sizeof(cur)) == 0) {
+        return;
+    }
+    if (!g_file_set_contents(s->nvram_path, (const gchar *)cur,
+                             sizeof(cur), &err)) {
+        error_report("ip19: cannot save NVRAM '%s': %s",
+                     s->nvram_path, err->message);
+        return;
+    }
+    memcpy(s->nvram_saved, cur, sizeof(cur));
+}
+
+static void ip19_nvram_tick(void *opaque)
+{
+    SGI_IP19State *s = opaque;
+
+    ip19_nvram_save(s);
+    timer_mod(s->nvram_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + IP19_NVRAM_FLUSH_NS);
+}
+
+static void ip19_nvram_exit(Notifier *notifier, void *data)
+{
+    SGI_IP19State *s = container_of(notifier, SGI_IP19State, nvram_exit);
+
+    ip19_nvram_save(s);
 }
 
 static void ip19_flash_exit(Notifier *notifier, void *data)
@@ -1779,7 +1833,12 @@ static uint8_t ip19_nv_new_checksum(SGI_IP19State *s)
 
 static void ip19_epc_nvram_defaults(SGI_IP19State *s)
 {
-    static const char serial[] = "S1234567";
+    /*
+     * The serial format is 'S' plus five digits: the PROM's
+     * valid_serial() rejects anything longer, and the guest's amsysinfo
+     * requires exactly six characters for IP19.
+     */
+    static const char serial[] = "S12345";
     struct tm tm;
     unsigned i, tod_cycle;
     time_t now;
@@ -2627,16 +2686,7 @@ static void sgi_ip19_init(MachineState *machine)
          */
         cpu->ip19_io4_window = true;
         CPU(cpu)->cpu_index = i;
-        /*
-         * Hold the secondary slices out of reset until the bootmaster
-         * claims the master group.  start_powered_off makes the generic
-         * CPU reset keep them halted on machine reset as well.
-         */
-        CPU(cpu)->start_powered_off = ip19_hold_secondaries() && (i != 0);
-        CPU(cpu)->halted = ip19_hold_secondaries() && (i != 0);
-        s->cpu_held[i] = ip19_hold_secondaries() && (i != 0);
-        IP19_DPRINT("init cpu %d index %u held %d\n", i,
-                    CPU(cpu)->cpu_index, s->cpu_held[i]);
+        IP19_DPRINT("init cpu %d index %u\n", i, CPU(cpu)->cpu_index);
         cpu->env.CP0_Config0 &= ~(1U << 17);
         cpu_mips_irq_init_cpu(cpu);
         cpu_mips_clock_init(cpu);
@@ -2681,7 +2731,7 @@ static void sgi_ip19_init(MachineState *machine)
     s->epc_rtc_regs[NVR_RTCA] = NVR_OSC_ON;
     s->epc_rtc_regs[NVR_RTCB] = NVR_DM | NVR_MILTIME;
     s->epc_rtc_regs[NVR_RTCD] = NVR_VRT;
-    g_strlcpy(s->sysctlr_serial, "S1234567", sizeof(s->sysctlr_serial));
+    g_strlcpy(s->sysctlr_serial, "S12345", sizeof(s->sysctlr_serial));
     ip19_epc_nvram_defaults(s);
     /* SGI OUI; replaced by an explicit -nic mac= if one is supplied. */
     s->epc_mac[0] = 0x08;
@@ -2794,6 +2844,23 @@ static void sgi_ip19_init(MachineState *machine)
     memory_region_add_subregion(sysmem, IP19_LOCAL_ALIAS(IP19_RTC_BASE), &s->rtc);
 
     ip19_earom_defaults(s);
+    /* Restore the saved NVRAM/EAROM over the defaults, if a save exists. */
+    s->nvram_path = ip19_nvram_path();
+    {
+        g_autofree gchar *buf = NULL;
+        gsize len = 0;
+
+        if (g_file_get_contents(s->nvram_path, &buf, &len, NULL) &&
+            len == IP19_NVRAM_FILE_SIZE) {
+            ip19_nvram_scatter(s, (const uint8_t *)buf);
+        }
+    }
+    ip19_nvram_gather(s, s->nvram_saved);
+    s->nvram_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, ip19_nvram_tick, s);
+    timer_mod(s->nvram_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + IP19_NVRAM_FLUSH_NS);
+    s->nvram_exit.notify = ip19_nvram_exit;
+    qemu_add_exit_notifier(&s->nvram_exit);
     memory_region_init_io(&s->earom, NULL, &ip19_earom_ops, s, "ip19.earom",
                           IP19_EAROM_SIZE);
     memory_region_add_subregion(sysmem, IP19_LOCAL_ALIAS(IP19_EAROM_BASE), &s->earom);
@@ -2868,6 +2935,7 @@ static void sgi_ip19_reset(MachineState *machine, ResetType type)
     int i;
 
     ip19_flash_save(s);
+    ip19_nvram_save(s);
 
     if (ip19_debug_enabled()) {
         uint8_t buf[8];
@@ -2878,7 +2946,7 @@ static void sgi_ip19_reset(MachineState *machine, ResetType type)
             IP19_DPRINT("reset-in cpu %u pc %016" PRIx64
                         " sr %08x cause %08x epc %016" PRIx64 "\n",
                         cs->cpu_index, (uint64_t)mc->env.active_tc.PC,
-                        mc->env.CP0_Status, mc->env.CP0_Cause,
+                        mc->env.CP0_Status, mips_get_cause(&mc->env),
                         (uint64_t)mc->env.CP0_EPC);
         }
         if (address_space_read(&address_space_memory, 0x3f1dcc,
@@ -2913,7 +2981,6 @@ static void sgi_ip19_reset(MachineState *machine, ResetType type)
     s->epc_imask = 0;
     s->epc_ipend = 0;
     s->epc_prst = 0;
-    s->bootmaster_claimed = false;
     s->rtc_yield_armed = false;
     s->rtc_yield_until_ns = 0;
     /*
@@ -2927,19 +2994,10 @@ static void sgi_ip19_reset(MachineState *machine, ResetType type)
         s->cmpint[i] = false;
         s->uartint[i] = false;
         s->cmpreg[i] = 0;
-        s->cpu_held[i] = ip19_hold_secondaries() &&
-                         i != 0 && i < machine->smp.cpus;
     }
 
     CPU_FOREACH(cs) {
-        unsigned cpu = cs->cpu_index;
-
-        if (cpu != 0 && cpu < IP19_MAX_CPUS && s->cpu_held[cpu]) {
-            cs->halted = 1;
-        }
-        IP19_DPRINT("reset cpu %u held %d halted %d\n", cpu,
-                    cpu < IP19_MAX_CPUS ? s->cpu_held[cpu] : 0,
-                    cs->halted);
+        IP19_DPRINT("reset cpu %u\n", cs->cpu_index);
     }
 }
 
@@ -2951,7 +3009,7 @@ static void sgi_ip19_class_init(ObjectClass *oc, const void *data)
     mc->init = sgi_ip19_init;
     mc->reset = sgi_ip19_reset;
     mc->max_cpus = IP19_MAX_CPUS;
-    mc->default_cpus = 1;
+    mc->default_cpus = 4;
     mc->default_cpu_type = MIPS_CPU_TYPE_NAME("R4400SC");
     mc->default_ram_size = 512 * MiB;
     mc->default_ram_id = "sgi_ip19.ram";

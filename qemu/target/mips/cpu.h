@@ -859,6 +859,7 @@ typedef struct CPUArchState {
 #define CP0Ca_IP    8
 #define CP0Ca_IP_mask 0x0000FF00
 #define CP0Ca_EC    2
+
 /*
  * CP0 Register 14
  */
@@ -1034,10 +1035,21 @@ typedef struct CPUArchState {
  */
     target_ulong lladdr; /* LL virtual address compared against SC */
     target_ulong llval;
+    /*
+     * The reservation is read and written by the owning vCPU, but the
+     * MT ASE helpers can clear another CPU's reservation, so the fields
+     * are accessed atomically.
+     */
     uint64_t llval_wp;
     uint32_t llnewval_wp;
     uint64_t CP0_LLAddr_rw_bitmask;
     int CP0_LLAddr_shift;
+    /*
+     * Per-vCPU hit counters for the SGI idle-spin and PROM-poll hooks.
+     * Each vCPU counts its own hits, so they must not be shared.
+     */
+    uint32_t sgi_idle_count;
+    uint32_t sgi_prom_count;
 /*
  * CP0 Register 18
  */
@@ -1237,6 +1249,47 @@ typedef struct CPUArchState {
     QEMUTimer *timer; /* Internal timer */
     target_ulong exception_base; /* ExceptionBase input to the core */
 } CPUMIPSState;
+
+/*
+ * CP0 Cause is read-modify-written by the vCPU (exception entry), by
+ * device interrupt lines and by the timer, so under MTTCG every access
+ * has to be atomic or the update loses bits set by another thread.
+ */
+static inline int32_t mips_get_cause(CPUMIPSState *env)
+{
+    return qatomic_read(&env->CP0_Cause);
+}
+
+/*
+ * Replace the bits selected by mask with value, leaving every other bit
+ * alone.  Done as a compare-and-swap loop so a concurrent update from
+ * another thread is not lost.  Returns the value that was stored.
+ */
+static inline int32_t mips_set_cause_bits(CPUMIPSState *env, int32_t mask,
+                                          int32_t value)
+{
+    int32_t old = mips_get_cause(env);
+
+    for (;;) {
+        int32_t new = (old & ~mask) | (value & mask);
+        int32_t cmp = qatomic_cmpxchg(&env->CP0_Cause, old, new);
+
+        if (cmp == old) {
+            return new;
+        }
+        old = cmp;
+    }
+}
+
+static inline void mips_or_cause(CPUMIPSState *env, int32_t bits)
+{
+    qatomic_fetch_or(&env->CP0_Cause, bits);
+}
+
+static inline void mips_and_cause(CPUMIPSState *env, int32_t bits)
+{
+    qatomic_fetch_and(&env->CP0_Cause, bits);
+}
 
 /**
  * MIPSCPU:

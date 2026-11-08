@@ -38,12 +38,12 @@ static void cpu_mips_irq_request(void *opaque, int irq, int level)
     BQL_LOCK_GUARD();
 
     if (level) {
-        env->CP0_Cause |= 1 << (irq + CP0Ca_IP);
+        mips_or_cause(env, 1 << (irq + CP0Ca_IP));
     } else {
-        env->CP0_Cause &= ~(1 << (irq + CP0Ca_IP));
+        mips_and_cause(env, ~(1 << (irq + CP0Ca_IP)));
     }
 
-    if (env->CP0_Cause & CP0Ca_IP_mask) {
+    if (mips_get_cause(env) & CP0Ca_IP_mask) {
         cpu_interrupt(cs, CPU_INTERRUPT_HARD);
     } else {
         cpu_reset_interrupt(cs, CPU_INTERRUPT_HARD);

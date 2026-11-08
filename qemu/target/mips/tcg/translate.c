@@ -1175,7 +1175,7 @@ TCGv_i64 cpu_gpr_hi[32];
 TCGv cpu_HI[MIPS_DSP_ACC], cpu_LO[MIPS_DSP_ACC];
 static TCGv cpu_dspctrl, btarget;
 TCGv bcond;
-static TCGv cpu_lladdr, cpu_llval;
+static TCGv cpu_llval;
 static TCGv_i32 hflags;
 TCGv_i32 fpu_fcr0, fpu_fcr31;
 TCGv_i64 fpu_f64[32];
@@ -2250,7 +2250,19 @@ static void gen_st_cond(DisasContext *ctx, int rt, int base, int offset,
     addr = tcg_temp_new();
     /* compare the address against that of the preceding LL */
     gen_base_offset_addr(ctx, addr, base, offset);
-    tcg_gen_brcond_tl(TCG_COND_EQ, addr, cpu_lladdr, l1);
+    /*
+     * The reservation lives in CPU state and can be cleared by another
+     * CPU (MT ASE), so claim it with a compare-and-swap: the address
+     * check and the clearing of the reservation are one step, and the
+     * cmpxchg below then uses the SC's own address, which the claim has
+     * just established to be the reserved one.
+     */
+    {
+        TCGv res = tcg_temp_new();
+
+        gen_helper_mips_ll_reservation(res, tcg_env, addr);
+        tcg_gen_brcond_tl(TCG_COND_EQ, addr, res, l1);
+    }
     gen_store_gpr(tcg_constant_tl(0), rt);
     tcg_gen_br(done);
 
@@ -2258,7 +2270,7 @@ static void gen_st_cond(DisasContext *ctx, int rt, int base, int offset,
     /* generate cmpxchg */
     val = tcg_temp_new();
     gen_load_gpr(val, rt);
-    tcg_gen_atomic_cmpxchg_tl(t0, cpu_lladdr, cpu_llval, val,
+    tcg_gen_atomic_cmpxchg_tl(t0, addr, cpu_llval, val,
                               eva ? MIPS_HFLAG_UM : ctx->mem_idx, tcg_mo);
     tcg_gen_setcond_tl(TCG_COND_EQ, t0, t0, cpu_llval);
     gen_store_gpr(t0, rt);
@@ -5514,7 +5526,7 @@ static void gen_mfc0(DisasContext *ctx, TCGv arg, int reg, int sel)
     case CP0_REGISTER_13:
         switch (sel) {
         case CP0_REG13__CAUSE:
-            gen_mfc0_load32(arg, offsetof(CPUMIPSState, CP0_Cause));
+            gen_helper_mips_get_cause(arg, tcg_env);
             register_name = "Cause";
             break;
         default:
@@ -6993,7 +7005,7 @@ static void gen_dmfc0(DisasContext *ctx, TCGv arg, int reg, int sel)
     case CP0_REGISTER_13:
         switch (sel) {
         case CP0_REG13__CAUSE:
-            gen_mfc0_load32(arg, offsetof(CPUMIPSState, CP0_Cause));
+            gen_helper_mips_get_cause(arg, tcg_env);
             register_name = "Cause";
             break;
         default:
@@ -15168,10 +15180,10 @@ static void mips_tr_insn_start(DisasContextBase *dcbase, CPUState *cs)
 /* SGI IP24 idle-spin quirk; configured by target/mips/tcg/exception.c
  * (helper_sgi_idle_check). One compare per translated instruction; zero
  * execution cost unless the idle PC matches. */
-extern uint64_t sgi_idle_pc;
-extern int sgi_idle_on;
-extern uint64_t sgi_prom_pc;
-extern int sgi_prom_on;
+extern uint64_t sgi_idle_get_pc(void);
+extern int sgi_idle_get_on(void);
+extern uint64_t sgi_prom_get_pc(void);
+extern int sgi_prom_get_on(void);
 
 static void mips_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
 {
@@ -15180,14 +15192,14 @@ static void mips_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
     int insn_bytes;
     int is_slot;
 
-    if (sgi_idle_on && sgi_idle_pc &&
-        ctx->base.pc_next == (target_ulong)sgi_idle_pc) {
+    if (sgi_idle_get_on() && sgi_idle_get_pc() &&
+        ctx->base.pc_next == (target_ulong)sgi_idle_get_pc()) {
         save_cpu_state(ctx, 1);
         gen_helper_sgi_idle_check(tcg_env);
     }
     /* PROM menu poll (masked interrupts, never halted): same shape, the
      * helper only yields the host after sustained hits. */
-    if (sgi_prom_on && ctx->base.pc_next == (target_ulong)sgi_prom_pc) {
+    if (sgi_prom_get_on() && ctx->base.pc_next == (target_ulong)sgi_prom_get_pc()) {
         save_cpu_state(ctx, 1);
         gen_helper_sgi_prom_check(tcg_env);
     }
@@ -15366,8 +15378,6 @@ void mips_tcg_init(void)
     fpu_fcr31 = tcg_global_mem_new_i32(tcg_env,
                                        offsetof(CPUMIPSState, active_fpu.fcr31),
                                        "fcr31");
-    cpu_lladdr = tcg_global_mem_new(tcg_env, offsetof(CPUMIPSState, lladdr),
-                                    "lladdr");
     cpu_llval = tcg_global_mem_new(tcg_env, offsetof(CPUMIPSState, llval),
                                    "llval");
 

@@ -24,7 +24,7 @@ PROM="$DIR/sgi/challenge/ip19prom.bin"
 DISK="$IRIX_DISK"
 CD="$IRIX_CD"
 DISK_FORMAT="${IRIX_DISK_FORMAT:-chd}"
-SMP="${IRIX_SMP:-2}"
+SMP="${IRIX_SMP:-4}"
 RAM="${IRIX_RAM:-2G}"
 DISPLAY_MODE="${IRIX_DISPLAY:-gtk,zoom-to-fit=on}"
 MON_SOCK="${IRIX_MONITOR:-$DIR/run/ip19-mon.sock}"
@@ -111,14 +111,17 @@ if [ "${IRIX_HEADLESS:-0}" = 1 ]; then
 else
   case "$CONSOLE" in
     shell)
-      set -- "$@" -display none -serial stdio -monitor none
+      set -- "$@" -display none -serial stdio \
+        -monitor "unix:$MON_SOCK,server,nowait"
       ;;
     telnet)
       set -- "$@" -display none \
-        -serial "telnet:127.0.0.1:4444,server=on,wait=off" -monitor none
+        -serial "telnet:127.0.0.1:4444,server=on,wait=off" \
+        -monitor "unix:$MON_SOCK,server,nowait"
       ;;
     *)
-      set -- "$@" -display "$DISPLAY_MODE" -serial vc -monitor none
+      set -- "$@" -display "$DISPLAY_MODE" -serial vc \
+        -monitor "unix:$MON_SOCK,server,nowait"
       ;;
   esac
 fi

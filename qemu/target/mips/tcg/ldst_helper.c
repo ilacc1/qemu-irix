@@ -48,7 +48,7 @@ target_ulong helper_##name(CPUMIPSState *env, target_ulong arg,               \
                               true, &host_unused, &full, ra);                 \
     assert(!(flags & TLB_INVALID_MASK));                                      \
     env->CP0_LLAddr = full->phys_addr;                                        \
-    env->lladdr = arg;                                                        \
+    qatomic_set(&env->lladdr, arg);                                           \
     return env->llval;                                                        \
 }
 HELPER_LD_ATOMIC(ll, ldl, 0x3, (target_long)(int32_t))
@@ -58,6 +58,39 @@ HELPER_LD_ATOMIC(lld, ldq, 0x7, (target_ulong))
 #undef HELPER_LD_ATOMIC
 
 #endif /* !CONFIG_USER_ONLY */
+
+/*
+ * Claim the LL reservation for @addr.  Returns the reservation address
+ * that was found: @addr if the reservation was claimed, otherwise the
+ * address of the reservation that is actually outstanding.
+ *
+ * Claiming is a compare-and-swap, so the address check and the clearing
+ * of the reservation are a single step and cannot interleave with the MT
+ * ASE helpers clearing another CPU's reservation.
+ */
+target_ulong helper_mips_ll_reservation(CPUMIPSState *env, target_ulong addr)
+{
+    /*
+     * An SC always clears the reservation, whether or not the address
+     * matches, so the failing case clears the outstanding reservation
+     * too - but only if it is still the one we found.
+     */
+    target_ulong res = qatomic_cmpxchg(&env->lladdr, addr, 0);
+
+    if (res != addr) {
+        qatomic_cmpxchg(&env->lladdr, res, 0);
+    }
+    return res;
+}
+
+/*
+ * Read CP0 Cause.  Device interrupt lines and the timer update it from
+ * their own threads, so the guest-visible read has to be atomic.
+ */
+target_ulong helper_mips_get_cause(CPUMIPSState *env)
+{
+    return mips_get_cause(env);
+}
 
 static inline target_ulong get_lmask(CPUMIPSState *env,
                                      target_ulong value, unsigned bits)

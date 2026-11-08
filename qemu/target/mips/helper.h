@@ -651,6 +651,9 @@ DEF_HELPER_FLAGS_3(dmthlip, 0, void, tl, tl, env)
 DEF_HELPER_FLAGS_3(wrdsp, 0, void, tl, tl, env)
 DEF_HELPER_FLAGS_2(rddsp, 0, tl, tl, env)
 
+DEF_HELPER_2(mips_ll_reservation, tl, env, tl)
+DEF_HELPER_1(mips_get_cause, tl, env)
+
 #ifndef CONFIG_USER_ONLY
 #include "tcg/system_helper.h.inc"
 #endif /* !CONFIG_USER_ONLY */

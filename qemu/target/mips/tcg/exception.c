@@ -101,6 +101,30 @@ int sgi_idle_on = 1;
 int sgi_idle_sleep;
 
 /*
+ * These are read by every vCPU (the translator, and the idle helper on
+ * the vCPU's own thread) and written by the detector or by the startup
+ * constructor, so all accesses go through the atomic helpers below.
+ */
+uint64_t sgi_idle_get_pc(void)
+{
+    return qatomic_read(&sgi_idle_pc);
+}
+
+uint32_t sgi_idle_get_thresh(void)
+{
+    return qatomic_read(&sgi_idle_thresh);
+}
+
+int sgi_idle_get_on(void)
+{
+    return qatomic_read(&sgi_idle_on);
+}
+
+int sgi_idle_get_sleep(void)
+{
+    return qatomic_read(&sgi_idle_sleep);
+}
+/*
  * Idle-loop detection, independent of the guest kernel.
  *
  * While sgi_idle_pc is 0, every external interrupt taken by a vCPU on a
@@ -308,7 +332,7 @@ void sgi_idle_sample(CPUMIPSState *env)
         closed = true;
     }
     if (closed && sgi_idle_decide(elapsed, &pc)) {
-        sgi_idle_pc = pc;
+        qatomic_set(&sgi_idle_pc, pc);
         qatomic_set(&sgi_idle_detecting, 0);
         decided = true;
     }
@@ -333,7 +357,7 @@ void sgi_idle_sample(CPUMIPSState *env)
  */
 void sgi_idle_detect_enable(void)
 {
-    if (!sgi_idle_on || sgi_idle_pc) {
+    if (!sgi_idle_get_on() || sgi_idle_get_pc()) {
         return;
     }
     qemu_mutex_lock(&sgi_idle_lock);
@@ -353,22 +377,23 @@ static void __attribute__((constructor)) sgi_idle_config(void)
     qemu_mutex_init(&sgi_idle_lock);
     e = getenv("SGI_IDLE_PC");
     if (e && e[0]) {
-        sgi_idle_pc = strtoull(e, NULL, 0);
+        qatomic_set(&sgi_idle_pc, strtoull(e, NULL, 0));
     }
     e = getenv("SGI_IDLE_THRESH");
     if (e && e[0]) {
-        sgi_idle_thresh = (uint32_t)strtoul(e, NULL, 0);
+        qatomic_set(&sgi_idle_thresh, (uint32_t)strtoul(e, NULL, 0));
     }
     e = getenv("SGI_IDLE_SPIN");
     if (e && (e[0] == '0' || e[0] == 'n' || e[0] == 'N')) {
-        sgi_idle_on = 0;
+        qatomic_set(&sgi_idle_on, 0);
     }
     e = getenv("SGI_IDLE_SLEEP");
     if (e && e[0]) {
-        sgi_idle_sleep = !(e[0] == '0' || e[0] == 'n' || e[0] == 'N');
+        qatomic_set(&sgi_idle_sleep,
+                    !(e[0] == '0' || e[0] == 'n' || e[0] == 'N'));
     }
-    if (!sgi_idle_thresh) {
-        sgi_idle_on = 0;
+    if (!sgi_idle_get_thresh()) {
+        qatomic_set(&sgi_idle_on, 0);
     }
 }
 /* PROM menu poll loop: spins with interrupts masked, so halting is unsafe
@@ -378,6 +403,21 @@ uint64_t sgi_prom_pc;
 uint32_t sgi_prom_thresh = 1000;
 int sgi_prom_on = 1;
 
+uint64_t sgi_prom_get_pc(void)
+{
+    return qatomic_read(&sgi_prom_pc);
+}
+
+uint32_t sgi_prom_get_thresh(void)
+{
+    return qatomic_read(&sgi_prom_thresh);
+}
+
+int sgi_prom_get_on(void)
+{
+    return qatomic_read(&sgi_prom_on);
+}
+
 /* Host-side tuning only (no guest-visible effect): parsed once at startup
  * so SGI_PROM_PC retargets work even before the default PC ever executes. */
 static void __attribute__((constructor)) sgi_prom_config(void)
@@ -386,52 +426,49 @@ static void __attribute__((constructor)) sgi_prom_config(void)
 
     e = getenv("SGI_PROM_PC");
     if (e && e[0]) {
-        sgi_prom_pc = strtoull(e, NULL, 0);
+        qatomic_set(&sgi_prom_pc, strtoull(e, NULL, 0));
     }
     e = getenv("SGI_PROM_THRESH");
     if (e && e[0]) {
-        sgi_prom_thresh = (uint32_t)strtoul(e, NULL, 0);
+        qatomic_set(&sgi_prom_thresh, (uint32_t)strtoul(e, NULL, 0));
     }
     e = getenv("SGI_PROM_SPIN");
     if (e && (e[0] == '0' || e[0] == 'n' || e[0] == 'N')) {
-        sgi_prom_on = 0;
+        qatomic_set(&sgi_prom_on, 0);
     }
-    if (!sgi_prom_pc || !sgi_prom_thresh) {
-        sgi_prom_on = 0;
+    if (!sgi_prom_get_pc() || !sgi_prom_get_thresh()) {
+        qatomic_set(&sgi_prom_on, 0);
     }
 }
 
 void helper_sgi_prom_check(CPUMIPSState *env)
 {
-    static uint32_t prom_count = 0;
     struct timespec ts = { 0, 500000 };
 
-    (void)env;
-    if (!sgi_prom_on) {
+    if (!sgi_prom_get_on()) {
         return;
     }
-    if (++prom_count < sgi_prom_thresh) {
+    if (++env->sgi_prom_count < sgi_prom_get_thresh()) {
         return;
     }
-    prom_count = 0;
+    env->sgi_prom_count = 0;
     nanosleep(&ts, NULL);
 }
 
 void helper_sgi_idle_check(CPUMIPSState *env)
 {
-    static uint32_t idle_count = 0;
     uint32_t status;
 
-    if (!sgi_idle_on) {
+    if (!sgi_idle_get_on()) {
         return;
     }
-    if (++idle_count < sgi_idle_thresh) {
+    if (++env->sgi_idle_count < sgi_idle_get_thresh()) {
         return;
     }
-    if (sgi_idle_sleep) {
+    if (sgi_idle_get_sleep()) {
         int64_t deadline = g_get_monotonic_time() + 5000;
 
-        idle_count = 0;
+        env->sgi_idle_count = 0;
         while (g_get_monotonic_time() < deadline) {
             int64_t left = deadline - g_get_monotonic_time();
             struct timespec idle_ts = {
@@ -454,7 +491,7 @@ void helper_sgi_idle_check(CPUMIPSState *env)
     if ((status & 1) && !(status & 6) && (status & 0x8000)) {
         CPUState *cs = env_cpu(env);
 
-        idle_count = 0;
+        env->sgi_idle_count = 0;
         cs->halted = 1;
         cpu_reset_interrupt(cs, CPU_INTERRUPT_WAKE);
         raise_exception(env, EXCP_HLT);

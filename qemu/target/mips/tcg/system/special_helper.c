@@ -119,7 +119,7 @@ void helper_eret(CPUMIPSState *env)
 {
     exception_return(env);
     env->CP0_LLAddr = 1;
-    env->lladdr = 1;
+    qatomic_set(&env->lladdr, 1);
 }
 
 void helper_eretnc(CPUMIPSState *env)

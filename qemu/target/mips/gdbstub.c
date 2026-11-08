@@ -57,7 +57,7 @@ int mips_cpu_gdb_read_register(CPUState *cs, GByteArray *mem_buf, int n)
     case 35:
         return gdb_get_regl(mem_buf, env->CP0_BadVAddr);
     case 36:
-        return gdb_get_regl(mem_buf, (int32_t)env->CP0_Cause);
+        return gdb_get_regl(mem_buf, mips_get_cause(env));
     case 37:
         return gdb_get_regl(mem_buf, env->active_tc.PC |
                                      !!(env->hflags & MIPS_HFLAG_M16));
