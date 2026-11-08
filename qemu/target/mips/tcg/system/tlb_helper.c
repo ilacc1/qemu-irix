@@ -1654,6 +1654,7 @@ void r4k_invalidate_tlb(CPUMIPSState *env, int idx, int use_extra)
     bool mi = !!((env->CP0_Config5 >> CP0C5_MI) & 1);
     uint32_t tlb_mmid;
     target_ulong mask;
+    target_ulong n;
 
     MMID = mi ? MMID : (uint32_t) ASID;
 
@@ -1687,9 +1688,10 @@ void r4k_invalidate_tlb(CPUMIPSState *env, int idx, int use_extra)
         }
 #endif
         end = addr | (mask >> 1);
-        while (addr < end) {
-            tlb_flush_page(cs, addr);
-            addr += TARGET_PAGE_SIZE;
+        if (addr < end) {
+            n = (end - addr + TARGET_PAGE_SIZE - 1) / TARGET_PAGE_SIZE;
+            tlb_flush_range_by_mmuidx(cs, addr, n * TARGET_PAGE_SIZE,
+                                      (1 << NB_MMU_MODES) - 1, TARGET_LONG_BITS);
         }
     }
     if (tlb->V1) {
@@ -1700,9 +1702,10 @@ void r4k_invalidate_tlb(CPUMIPSState *env, int idx, int use_extra)
         }
 #endif
         end = addr | mask;
-        while (addr - 1 < end) {
-            tlb_flush_page(cs, addr);
-            addr += TARGET_PAGE_SIZE;
+        if (addr <= end) {
+            n = (end - addr) / TARGET_PAGE_SIZE + 1;
+            tlb_flush_range_by_mmuidx(cs, addr, n * TARGET_PAGE_SIZE,
+                                      (1 << NB_MMU_MODES) - 1, TARGET_LONG_BITS);
         }
     }
 }
