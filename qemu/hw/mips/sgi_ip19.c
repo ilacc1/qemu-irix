@@ -306,15 +306,13 @@ struct SGI_IP19State {
 
     uint64_t ip[IP19_MAX_CPUS][2];
     bool bm_claimed;
-    bool rtc_yield;
-    bool rtc_yield_armed;
-    int64_t rtc_yield_until_ns;
     uint64_t grp_pending[64][2];
     uint64_t grp_delivered[64][IP19_MAX_CPUS][2];
     uint64_t ile[IP19_MAX_CPUS];
     uint64_t igrmask[IP19_MAX_CPUS];
     uint64_t cel[IP19_MAX_CPUS];
     uint32_t cmpreg[IP19_MAX_CPUS];
+    uint32_t cmp_last_period[IP19_MAX_CPUS];
     bool cmpint[IP19_MAX_CPUS];
     bool uartint[IP19_MAX_CPUS];
     QEMUTimer *cmp_timer[IP19_MAX_CPUS];
@@ -529,11 +527,21 @@ static void ip19_cmp_rearm(SGI_IP19State *s, unsigned cpu)
     now_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
 
     /*
-     * If the comparator has already passed, fire immediately instead of
-     * letting the unsigned subtraction wrap to a full 32-bit RTC period.
+     * The guest seeds basecc from an RTC read and later advances it only
+     * by nominal periods, so a scheduling round that takes long in
+     * emulation can leave the reload already in the past (seconds on
+     * several CPUs).  Firing on the next tick turns that into an
+     * interrupt storm, so reuse the last interval the guest asked for
+     * and fall back to 10 ms until one is known.
      */
     if (!delta || (int32_t)delta < 0) {
-        delta = 1;
+        delta = s->cmp_last_period[cpu];
+        if (!delta) {
+            delta = IP19_RTC_HZ / 100;      /* 10 ms in CC ticks */
+        }
+    } else if (delta <= IP19_RTC_HZ) {
+        /* Remember ordinary intervals; ignore multi-second ones. */
+        s->cmp_last_period[cpu] = delta;
     }
     fire_ns = now_ns + muldiv64(delta, 1000000000ULL, IP19_RTC_HZ);
     timer_mod(s->cmp_timer[cpu], fire_ns);
@@ -1105,12 +1113,18 @@ static MemTxResult ip19_cfg_write(void *opaque, hwaddr off, uint64_t val,
                     ((s->cfg_regs[slot][base + 2] & 0xff) << 16) |
                     ((s->cfg_regs[slot][base + 3] & 0xff) << 24);
                 /*
-                 * The kernel writes the LSB alone to disable the timeout
-                 * interrupt and writes all four bytes to re-enable it.
-                 * Re-arm on every byte so both cases follow the hardware
-                 * comparator value.
+                 * Writing CMPREG0 (the LSB) disables the comparator
+                 * interrupt; the four-byte sequence ending at CMPREG3
+                 * re-arms it with the new value.  Re-arming on the LSB
+                 * write would use stale upper bytes and fire at once.
                  */
-                ip19_cmp_rearm(s, proc);
+                if (preg == 0) {
+                    if (s->cmp_timer[proc]) {
+                        timer_del(s->cmp_timer[proc]);
+                    }
+                } else if (preg == 3) {
+                    ip19_cmp_rearm(s, proc);
+                }
                 return MEMTX_OK;
             }
         }
@@ -1184,40 +1198,6 @@ static MemTxResult ip19_rtc_read(void *opaque, hwaddr off, uint64_t *data,
     default:
         *data = 0;
         break;
-    }
-    /*
-     * Single-threaded TCG round-robin only switches vCPUs when the
-     * running one exits its current TB.  The IRIX AP bootstrap polls
-     * the CC RTC while spinning, and the master polls it in its boot
-     * timeout loop.  Forcing an exit on an RTC read gives the AP a
-     * chance to run in the window between the master servicing its
-     * cb_wait request and checking pdaindr[CpuId].
-     */
-    if (s->rtc_yield && current_cpu) {
-        uint64_t pc = (uint64_t)MIPS_CPU(current_cpu)->env.active_tc.PC;
-        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_HOST);
-        bool kernel = pc >= 0xa800000000004000ULL &&
-                      pc < 0xa800000000400000ULL;
-
-        /*
-         * Once a secondary CPU is running the kernel (its frequency
-         * calibration polls the RTC), the bootmaster's boot-timeout
-         * loop must yield between polls.  It does not otherwise leave
-         * its TB in single-threaded TCG.  Arm a single boot window:
-         * later kernel RTC traffic from another CPU must not keep
-         * forcing the bootmaster out of every us_delay() call.  The
-         * installed 6.5.22 kernel links us_delay at
-         * 0xa800000000011284.
-         */
-        if (kernel && current_cpu->cpu_index != 0 && !s->rtc_yield_armed) {
-            s->rtc_yield_armed = true;
-            s->rtc_yield_until_ns = now + 30 * 1000000000LL;
-        }
-        if (current_cpu->cpu_index == 0 && kernel &&
-            pc >= 0xa800000000011280ULL && pc < 0xa800000000011340ULL &&
-            now < s->rtc_yield_until_ns) {
-            cpu_exit(current_cpu);
-        }
     }
     return MEMTX_OK;
 }
@@ -2720,22 +2700,6 @@ static void sgi_ip19_init(MachineState *machine)
     s->cc_uart_rx = 0;
     s->cc_uart_rx_ready = false;
     s->rtc_epoch_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
-    /*
-     * MIPS64 is still single-threaded TCG, so the master and AP share
-     * one host thread.  Without an explicit yield in the bootmaster's
-     * us_delay() loop the AP can be too slow to set pdaindr[CpuId]
-     * before the kernel's boot timeout expires.  Enable the yield by
-     * default for SMP; IP19_RTC_YIELD=0 provides an escape hatch for
-     * bisection.
-     */
-    {
-        const char *yield_env = g_getenv("IP19_RTC_YIELD");
-
-        s->rtc_yield = machine->smp.cpus > 1 &&
-                       (!yield_env || atoi(yield_env) != 0);
-    }
-    s->rtc_yield_armed = false;
-    s->rtc_yield_until_ns = 0;
     s->epc_rtc_base_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
     s->epc_rtc_base_sec = (int64_t)time(NULL);
     memset(s->epc_rtc_regs, 0, sizeof(s->epc_rtc_regs));
@@ -3009,8 +2973,6 @@ static void sgi_ip19_reset(MachineState *machine, ResetType type)
     s->epc_imask = 0;
     s->epc_ipend = 0;
     s->epc_prst = 0;
-    s->rtc_yield_armed = false;
-    s->rtc_yield_until_ns = 0;
     /*
      * The real CC RTC is free-running across a system reset.  Keeping the
      * original epoch avoids moving time backwards under a booted kernel.
@@ -3022,6 +2984,7 @@ static void sgi_ip19_reset(MachineState *machine, ResetType type)
         s->cmpint[i] = false;
         s->uartint[i] = false;
         s->cmpreg[i] = 0;
+        s->cmp_last_period[i] = 0;
     }
 
     CPU_FOREACH(cs) {
