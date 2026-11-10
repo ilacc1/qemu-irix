@@ -4,7 +4,11 @@ A fork of [QEMU](https://github.com/qemu/QEMU) that boots **IRIX 6.5** on
 emulated **Silicon Graphics Indy (IP24)** hardware. 
 
 All the new code is agent generated. Author makes no claim as to accuracy 
-or suitability for any use. 
+or suitability for any use.
+
+Status is ALPHA - the emulator is likely incomplete - for each working model
+there will be caveats and missing features. Also what is working has been through
+very limited testing so it may or may not work for you.
 
 ## What does it do?
 
@@ -41,6 +45,11 @@ on Challenge without issues. I wouldn't recommend earlier versions of 6.5.
 In case you want to start with original io4prom, remove the flash file -
 sgi/challenge/io4prom.flash - this is essentially flashed as part of 
 6.5.22 installation.
+
+For a noticeably faster boot, disable the IRIX ESP service once the system
+is up. As root run `chkconfig esp off`. ESP starts a series of short-lived
+`espconfig` processes during boot, which is slow under emulation and can add
+a minute or more to the boot time.
 
 
 See also - **[usage.md](usage.md)** for detailed cli / env options.

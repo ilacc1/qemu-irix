@@ -36,7 +36,13 @@ TAP_IF="${IRIX_TAP_IF:-tap-iris}"
 CONSOLE="${IRIX_CONSOLE:-window}"
 USER_ARGS=("$@")
 export IP19_NVRAM_READONLY="${IP19_NVRAM_READONLY:-1}"
-export SGI_CHD_CACHE_MB="${SGI_CHD_CACHE_MB:-0}"
+export SGI_CHD_CACHE_MB="${SGI_CHD_CACHE_MB:-256}"
+
+export SGI_IDLE_SPIN="${SGI_IDLE_SPIN:-1}"
+export SGI_IDLE_SLEEP="${SGI_IDLE_SLEEP:-0}"
+export SGI_IDLE_THRESH="${SGI_IDLE_THRESH:-100}"
+export SGI_IDLE_PC="${SGI_IDLE_PC:-0}"
+export SGI_CHD_SYNC="${SGI_CHD_SYNC:-0}"
 
 if [ -z "$DISK" ]; then
   for candidate in "$DIR/sgi/ip19-main.chd" "$DIR/ip19-main.chd" "$DIR/../ip19-main.chd"; do

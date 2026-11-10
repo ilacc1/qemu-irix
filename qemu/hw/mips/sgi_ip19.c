@@ -312,7 +312,6 @@ struct SGI_IP19State {
     uint64_t igrmask[IP19_MAX_CPUS];
     uint64_t cel[IP19_MAX_CPUS];
     uint32_t cmpreg[IP19_MAX_CPUS];
-    uint32_t cmp_last_period[IP19_MAX_CPUS];
     bool cmpint[IP19_MAX_CPUS];
     bool uartint[IP19_MAX_CPUS];
     QEMUTimer *cmp_timer[IP19_MAX_CPUS];
@@ -337,6 +336,7 @@ struct SGI_IP19State {
     uint8_t epc_rtc_regs[16];
     int64_t epc_rtc_base_ns;
     int64_t epc_rtc_base_sec;
+    QEMUTimer *epc_rtc_pie;
     char sysctlr_serial[16];
     uint32_t io4_ebus_error;
     uint64_t io4_error_vector;
@@ -523,26 +523,17 @@ static void ip19_cmp_rearm(SGI_IP19State *s, unsigned cpu)
         return;
     }
     now = (uint32_t)ip19_rtc_value(s);
-    delta = s->cmpreg[cpu] - now;
-    now_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
 
     /*
-     * The guest seeds basecc from an RTC read and later advances it only
-     * by nominal periods, so a scheduling round that takes long in
-     * emulation can leave the reload already in the past (seconds on
-     * several CPUs).  Firing on the next tick turns that into an
-     * interrupt storm, so reuse the last interval the guest asked for
-     * and fall back to 10 ms until one is known.
+     * The comparator is a 32-bit equality match against the low word of
+     * the free-running RTC, so the distance to the target is always an
+     * unsigned value: the guest never arms a target in the past, it
+     * pokes the timeout directly instead.  Treating a distance above
+     * 2^31 as negative made every callout 45-85 s out fire after the
+     * previous short period instead of when the guest asked.
      */
-    if (!delta || (int32_t)delta < 0) {
-        delta = s->cmp_last_period[cpu];
-        if (!delta) {
-            delta = IP19_RTC_HZ / 100;      /* 10 ms in CC ticks */
-        }
-    } else if (delta <= IP19_RTC_HZ) {
-        /* Remember ordinary intervals; ignore multi-second ones. */
-        s->cmp_last_period[cpu] = delta;
-    }
+    delta = s->cmpreg[cpu] - now;
+    now_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
     fire_ns = now_ns + muldiv64(delta, 1000000000ULL, IP19_RTC_HZ);
     timer_mod(s->cmp_timer[cpu], fire_ns);
 }
@@ -1547,6 +1538,7 @@ static const MemoryRegionOps ip19_earom_ops = {
 
 #define EPC_INTR_DUART0     0x01
 #define EPC_INTR_DUART12    0x02
+#define EPC_INTR_PROFTIM    0x08
 
 /* EPC PBUS Ethernet ID PROM (pdev 2). */
 #define EPC_ENETPROM_BASE   0x2000
@@ -1601,6 +1593,9 @@ static const MemoryRegionOps ip19_earom_ops = {
 #define NVR_DM                  0x04
 #define NVR_MILTIME             0x02
 #define NVR_OSC_ON              0x20
+#define NVR_PIE                 0x40
+#define NVR_RTCC_PF             0x40
+#define NVR_RTCC_IRQF           0x80
 #define NVR_VRT                 0x80
 
 static uint8_t ip19_bin_to_bcd(unsigned v)
@@ -1636,8 +1631,13 @@ static uint8_t ip19_epc_rtc_read_reg(SGI_IP19State *s, unsigned reg)
         return (s->epc_rtc_regs[reg] & 0x70) | NVR_OSC_ON;
     case NVR_RTCB:
         return regb;
-    case NVR_RTCC:
-        return 0;
+    case NVR_RTCC: {
+        /* Reading register C returns and clears the interrupt flags. */
+        uint8_t flags = s->epc_rtc_regs[NVR_RTCC];
+
+        s->epc_rtc_regs[NVR_RTCC] = 0;
+        return flags;
+    }
     case NVR_RTCD:
         return NVR_VRT;
     default:
@@ -1700,6 +1700,34 @@ static uint8_t ip19_epc_rtc_read_reg(SGI_IP19State *s, unsigned reg)
     return v & 0xff;
 }
 
+/*
+ * Register B bit PIE enables the periodic interrupt; register A bits RS3:0
+ * select the rate as 32768 >> (RS - 1) Hz (RS 6 is the 1.024 kHz the kernel
+ * uses for its fast clock).  Each tick raises the EPC profiling source.
+ */
+static void ip19_epc_rtc_pie_arm(SGI_IP19State *s)
+{
+    unsigned rs = s->epc_rtc_regs[NVR_RTCA] & 0xf;
+    int64_t period;
+
+    if (!(s->epc_rtc_regs[NVR_RTCB] & NVR_PIE) || rs == 0) {
+        timer_del(s->epc_rtc_pie);
+        return;
+    }
+    period = (NANOSECONDS_PER_SECOND << (rs - 1)) / 32768;
+    timer_mod(s->epc_rtc_pie, qemu_clock_get_ns(QEMU_CLOCK_HOST) + period);
+}
+
+static void ip19_epc_rtc_pie_cb(void *opaque)
+{
+    SGI_IP19State *s = opaque;
+
+    s->epc_rtc_regs[NVR_RTCC] |= NVR_RTCC_PF | NVR_RTCC_IRQF;
+    s->epc_ipend |= EPC_INTR_PROFTIM;
+    ip19_epc_update_irq(s);
+    ip19_epc_rtc_pie_arm(s);
+}
+
 static void ip19_epc_rtc_write_reg(SGI_IP19State *s, unsigned reg,
                                    uint8_t val)
 {
@@ -1754,6 +1782,9 @@ static void ip19_epc_rtc_write_reg(SGI_IP19State *s, unsigned reg,
     s->epc_rtc_regs[reg] = val;
     if (reg == NVR_RTCA) {
         s->epc_rtc_regs[reg] |= NVR_OSC_ON;
+    }
+    if (reg == NVR_RTCA || reg == NVR_RTCB) {
+        ip19_epc_rtc_pie_arm(s);
     }
 }
 
@@ -1902,9 +1933,19 @@ static void ip19_epc_update_irq(SGI_IP19State *s)
             unsigned idx =
                 (ip19_epc_sources[i].iid_reg - EPC_CTRL_BASE) >> 3;
             uint64_t vector = s->epc_regs[idx];
+            uint64_t bit = ip19_epc_sources[i].src_bit;
 
             if (vector) {
                 ip19_deliver_vector(s, vector);
+            }
+            /*
+             * The profiling source is masked by delivery and only the
+             * handler's EPC_IMSET re-enables it (epc_intr_proftim), so a
+             * tick is taken once per re-enable and never re-fires.
+             */
+            if (bit == EPC_INTR_PROFTIM) {
+                s->epc_imask &= ~bit;
+                s->epc_ipend &= ~bit;
             }
         }
     }
@@ -2716,6 +2757,8 @@ static void sgi_ip19_init(MachineState *machine)
     s->epc_mac[4] = 0x00;
     s->epc_mac[5] = 0x01;
 
+    s->epc_rtc_pie = timer_new_ns(QEMU_CLOCK_HOST, ip19_epc_rtc_pie_cb, s);
+
     for (i = 0; i < IP19_MAX_CPUS; i++) {
         s->cmp_ctx[i].s = s;
         s->cmp_ctx[i].cpu = i;
@@ -2973,6 +3016,8 @@ static void sgi_ip19_reset(MachineState *machine, ResetType type)
     s->epc_imask = 0;
     s->epc_ipend = 0;
     s->epc_prst = 0;
+    timer_del(s->epc_rtc_pie);
+    s->epc_rtc_regs[NVR_RTCC] = 0;
     /*
      * The real CC RTC is free-running across a system reset.  Keeping the
      * original epoch avoids moving time backwards under a booted kernel.
@@ -2984,7 +3029,6 @@ static void sgi_ip19_reset(MachineState *machine, ResetType type)
         s->cmpint[i] = false;
         s->uartint[i] = false;
         s->cmpreg[i] = 0;
-        s->cmp_last_period[i] = 0;
     }
 
     CPU_FOREACH(cs) {
