@@ -18,7 +18,9 @@ Currently emulates:
 - SGI Challenge Desk-side IP19 (2x R4400 with 2Gb RAM). Supports Irix 5.3 to 6.5.22m.
 
 
-## Quick start (Indy)
+## Quick start 
+
+### Indy
 
 From a source checkout:
 
@@ -30,6 +32,14 @@ From a source checkout:
 
 Release archives: run `install.sh`/`install.bat` first, then the same
 launchers. Challenge/Onyx (IP19) uses `run-challenge.sh`/`.bat`.
+
+### Challenge IP19 4xR4400@500MHz 2Gb RAM
+
+As above with following changes:
+
+- Startup script is ***run-challenge.sh (or run-challenge.bat)***
+- Deafult disk image is sgi/ip19-main.chd (see disk images below)
+
 
 ## Disk images
 
@@ -57,10 +67,15 @@ See also - **[usage.md](usage.md)** for detailed cli / env options.
 ## What's new
 
 ### What's new in 0.1.5
- - Defaults to 4 CPUs on IP19
+ - Refactored source tree to push noisy qemu root folder one level down.
+ - Support for 4 R4400 CPUs on IP19, and up to two IP19 boards 
  - TCG now fully capable of supporting multi-threaded 64-bit MIPS
    so 4 guest CPUs run on 4 host cores
- - nvram is saved on ip19, with a workaround for checksum zap
+ - nvram can be saved on ip19. The distribution ships with a bin file
+   which is usually a good fallback. Instead of overwriting that, changes are
+   saved to "flash" file. Note saving nvram is disabled by default 
+   (see **[usage.md](usage.md)** if you need to enable saving).
+ - Reset from gui and guest-initiated reset now work.
  - Many minor improvements.
 
 ### What's new in 0.1.4
@@ -146,6 +161,7 @@ So you can just use your existing CHD and get all the performance benefits.
 
 
 ## Known issues
+
 
 ### Graphics / OpenGL bugs
 

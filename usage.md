@@ -10,10 +10,12 @@ variables, and the runtime helper tools.
 | Indy, IRIX 6.5 | `run-irix.sh` | `run-irix.bat` | `sgi/irix65_4020.chd` |
 | Indy, IRIX 5.3 | `run-irix53.sh` | `run-irix53.bat` | `sgi/irix53.chd` |
 | Challenge/Onyx (IP19) | `run-challenge.sh` | `run-challenge.bat` | searched, see `IRIX_DISK` |
+| Challenge L (IP19, two boards, 8 CPU/4 GB) | `run-challengel.sh` | - | `sgi/ip19-main-l.chd` |
 
 Shorthand used below: **Indy sh** = `run-irix.sh` and `run-irix53.sh`;
 **Indy bat** = `run-irix.bat` and `run-irix53.bat`;
-**IP19 sh/bat** = `run-challenge.sh`/`run-challenge.bat`.
+**IP19 sh/bat** = `run-challenge.sh`/`run-challenge.bat`;
+**IP19-L sh** = `run-challengel.sh` (two-board Challenge L, 8 CPUs, 4 GB).
 
 All launchers forward their command-line arguments to QEMU, after the
 launcher's own arguments. For example:
@@ -52,7 +54,16 @@ Notes:
   and is not part of the published tree.
 - On IP19, if `IRIX_DISK` is unset, the launcher searches
   `sgi/ip19-main.chd`, then `./ip19-main.chd`, then `../ip19-main.chd`
-  (Windows: `sgi\ip19-main.chd` first).
+  (Windows: `sgi\ip19-main.chd` first). `run-challengel.sh` searches
+  `sgi/ip19-main-l.chd` instead.
+
+## IP19 NVRAM
+
+| Variable | Launchers | Default | Meaning |
+| --- | --- | --- | --- |
+| `IP19_NVRAM_READONLY` | IP19 sh | set (`1`) | If set at all, the guest NVRAM/EAROM is not written back |
+| `IP19_NVRAM_FILE` | IP19 sh | `ip19-nvram.bin` beside `io4prom.bin` | NVRAM/EAROM backing file |
+
 
 ## Machine and memory variables
 
