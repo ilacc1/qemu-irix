@@ -15,30 +15,49 @@ very limited testing so it may or may not work for you.
 Currently emulates:
 
 - SGI Indy (1xR4000CPU, 384Mb RAM). Supports Irix 5.3 and up to 6.5.30m. 
-- SGI Challenge Desk-side IP19 (2x R4400 with 2Gb RAM). Supports Irix 5.3 to 6.5.22m.
+- SGI Challenge Desk-side IP19 (4xR4400 with 2Gb RAM). Supports Irix 5.3 to 6.5.22m.
+- SGI Challenge L 2xIP19 (8xR4400 with 4Gb RAM). Tested only 6.5.22m.
 
+## Quick start
 
-## Quick start 
+### Binary packages (recommended)
 
-### Indy
+Download the archive for your platform from the
+[releases page](https://github.com/ilacc1/qemu-irix/releases):
 
-From a source checkout:
+- Linux: `qemu-irix-<version>-ubuntu.tar.gz`
+- Windows: `qemu-irix-<version>-windows.zip` (MSYS2 is required; the matching
+  `msys2-x86_64-*.exe` installer is provided in the same release)
 
-1. `./build.sh` (Linux) or `build.bat` (Windows) to produce `qemu/build/qemu-system-mips64[.exe]`.
-2. Put your Indy IRIX 6.5 CHD at `sgi/irix65_4020.chd` (or set `IRIX_DISK`).
-3. Run `./run-irix.sh` (Linux) or `run-irix.bat` (Windows).
-4. See [usage.md](usage.md) for every launcher option and environment
+No source tree or build is needed. Then for indy:
+
+1. Extract the archive.
+2. Run `install.sh` (Linux) or `install.bat` (Windows) once.
+3. Put your Indy IRIX 6.5 CHD at `sgi/irix65_4020.chd` (or set `IRIX_DISK`).
+4. Run `./run-irix.sh` (Linux) or `run-irix.bat` (Windows).
+5. See [usage.md](usage.md) for every launcher option and environment
    variable, and [networking.md](networking.md) for TAP setup.
 
-Release archives: run `install.sh`/`install.bat` first, then the same
-launchers. Challenge/Onyx (IP19) uses `run-challenge.sh`/`.bat`.
+### From source
+
+Only needed to build or modify QEMU:
+
+1. `./build.sh` (Linux) or `build.bat` (Windows) to produce `qemu/build/qemu-system-mips64[.exe]`.
+2. Continue with steps 3-5 above.
 
 ### Challenge IP19 4xR4400@500MHz 2Gb RAM
 
-As above with following changes:
+As above, with these changes:
 
-- Startup script is ***run-challenge.sh (or run-challenge.bat)***
-- Deafult disk image is sgi/ip19-main.chd (see disk images below)
+- Startup script is `run-challenge.sh` (Linux) or `run-challenge.bat` (Windows).
+- Default disk image is `sgi/ip19-main.chd`; decompress the release image
+  `ip19-main.chd.gz` there (see [Disk images](#disk-images)).
+
+### Challenge L 2 x IP19 8xR4400@500MHz 4Gb RAM
+
+For the two-board Challenge L, use `run-challengel.sh` /
+  `run-challengel.bat`. The same `ip19-main.chd.gz` image works on both; set
+  `IRIX_DISK` or place it as `sgi/ip19-main-l.chd` for the L launcher.
 
 
 ## Disk images
@@ -46,7 +65,7 @@ As above with following changes:
 I understand Indy R4000 images are relatively easy to find, but Challenge
 images are not. 
 
-So in release 0.1.4 I've included a minimal IP19 image. Decompress it
+So in release 0.1.5 I've included a minimal IP19 image. Decompress it
 and place it in sgi/ subfolder to align with the expected location in
 run-challenge.sh
 
