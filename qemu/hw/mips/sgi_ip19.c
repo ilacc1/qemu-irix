@@ -3031,6 +3031,13 @@ static void sgi_ip19_reset(MachineState *machine, ResetType type)
          * time-of-day is separate and keeps wall-clock time.
          */
         s->rtc_epoch_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+        /*
+         * Re-base the EPC time-of-day on the host clock as at startup.
+         * The guest can rewrite the RTC through the SET registers, and a
+         * reboot after that otherwise leaves the TOD wrong ("clock lost").
+         */
+        s->epc_rtc_base_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+        s->epc_rtc_base_sec = (int64_t)time(NULL);
         memset(s->cfg_regs, 0, sizeof(s->cfg_regs));
         ip19_cfg_defaults(s, machine);
         ip19_prom_load(s, machine);
