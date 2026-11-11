@@ -54,16 +54,18 @@ ldd "$EXE" | awk '/=> \//{print $1 "=" $3}' | while IFS='=' read -r soname path;
 done
 
 mkdir -p "$UBUNTU_STAGE/sgi"
-rsync -a --exclude '*.chd' --exclude '*.qcow2' --exclude '*.raw' \
-      --exclude '*.img' --exclude '*.iso' --exclude '*.tar' \
-      "$ROOT_DIR/sgi/" "$UBUNTU_STAGE/sgi/"
+rsync -a --exclude '*.bk' --exclude '*.min' --exclude '*.gz' \
+      --exclude 'ip19-nvram.bin' \
+      "$ROOT_DIR/sgi/indy" "$ROOT_DIR/sgi/challenge" "$UBUNTU_STAGE/sgi/"
 cp "$ROOT_DIR/run-irix.sh" "$ROOT_DIR/run-irix53.sh" \
-   "$ROOT_DIR/run-challenge.sh" "$ROOT_DIR/install.sh" \
+   "$ROOT_DIR/run-challenge.sh" "$ROOT_DIR/run-challengel.sh" \
+   "$ROOT_DIR/install.sh" \
    "$ROOT_DIR/readme.md" "$ROOT_DIR/building.md" "$ROOT_DIR/networking.md" \
    "$ROOT_DIR/usage.md" "$UBUNTU_STAGE/"
 chmod +x "$UBUNTU_STAGE/qemu/build/qemu-system-mips64" \
          "$UBUNTU_STAGE/run-irix.sh" "$UBUNTU_STAGE/run-irix53.sh" \
-         "$UBUNTU_STAGE/run-challenge.sh" "$UBUNTU_STAGE/install.sh"
+         "$UBUNTU_STAGE/run-challenge.sh" "$UBUNTU_STAGE/run-challengel.sh" \
+         "$UBUNTU_STAGE/install.sh"
 
 # Sanity: everything must resolve through the bundle.
 if LD_LIBRARY_PATH="$UBUNTU_STAGE/lib" ldd "$UBUNTU_STAGE/qemu/build/qemu-system-mips64" \
@@ -108,12 +110,12 @@ if [ "$WITH_WINDOWS" -eq 1 ]; then
     mv "$DIST/win-remote"/mingw64/{lib,share} "$WIN_STAGE/msys64/mingw64/"
 
     mkdir -p "$WIN_STAGE/sgi"
-    rsync -a --exclude '*.chd' --exclude '*.qcow2' --exclude '*.raw' \
-          --exclude '*.img' --exclude '*.iso' --exclude '*.tar' \
-          "$ROOT_DIR/sgi/" "$WIN_STAGE/sgi/"
+    rsync -a --exclude '*.bk' --exclude '*.min' --exclude '*.gz' \
+          --exclude 'ip19-nvram.bin' \
+          "$ROOT_DIR/sgi/indy" "$ROOT_DIR/sgi/challenge" "$WIN_STAGE/sgi/"
     # CRLF for everything cmd.exe parses (normalize first: repo copies
     # may be LF or CRLF depending on checkout settings).
-    for f in run-irix.bat run-irix53.bat run-challenge.bat install.bat; do
+    for f in run-irix.bat run-irix53.bat run-challenge.bat run-challengel.bat install.bat; do
         sed 's/\r$//' "$ROOT_DIR/$f" | sed 's/$/\r/' > "$WIN_STAGE/$f"
     done
     cp "$ROOT_DIR/readme.md" "$ROOT_DIR/building.md" "$ROOT_DIR/networking.md" \

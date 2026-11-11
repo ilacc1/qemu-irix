@@ -75,7 +75,9 @@ xcopy /e /i /y "%MSYS2%\mingw64\share\glib-2.0\schemas" "%STAGE%\msys64\mingw64\
 
 xcopy /e /i /y "sgi\indy" "%STAGE%\sgi\indy\" >nul
 xcopy /e /i /y "sgi\challenge" "%STAGE%\sgi\challenge\" >nul
-for %%F in (run-irix.bat run-irix53.bat run-challenge.bat install.bat readme.md building.md networking.md usage.md) do (
+rem Keep the bundled firmware to the same set as the Linux package.
+del /q "%STAGE%\sgi\challenge\ip19-nvram.bin" 2>nul
+for %%F in (run-irix.bat run-irix53.bat run-challenge.bat run-challengel.bat install.bat readme.md building.md networking.md usage.md) do (
     if exist "%%F" copy /y "%%F" "%STAGE%\%%F" >nul
 )
 
