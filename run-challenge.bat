@@ -54,6 +54,13 @@ if "%RAM%"=="" set "RAM=2G"
 rem Temporary default while debugging PROM boot failures.
 if "%IRIX_MONITOR%"=="" set "IRIX_MONITOR=tcp:127.0.0.1:4445,server=on,wait=off"
 if not defined IP19_NVRAM_READONLY set "IP19_NVRAM_READONLY=1"
+rem Match the SGI_* defaults exported by run-challenge.sh.
+if not defined SGI_CHD_CACHE_MB set "SGI_CHD_CACHE_MB=256"
+if not defined SGI_IDLE_SPIN set "SGI_IDLE_SPIN=1"
+if not defined SGI_IDLE_SLEEP set "SGI_IDLE_SLEEP=0"
+if not defined SGI_IDLE_THRESH set "SGI_IDLE_THRESH=100"
+if not defined SGI_IDLE_PC set "SGI_IDLE_PC=0"
+if not defined SGI_CHD_SYNC set "SGI_CHD_SYNC=0"
 set "DISK_FORMAT=chd"
 if not "%IRIX_DISK_FORMAT%"=="" set "DISK_FORMAT=%IRIX_DISK_FORMAT%"
 
