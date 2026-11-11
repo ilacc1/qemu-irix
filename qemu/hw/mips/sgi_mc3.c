@@ -524,6 +524,24 @@ static bool mc3_split_ram(uint64_t ram_size,
         return false;
     }
 
+    /*
+     * Above the 2 GiB a single board can carry with 256 MiB SIMMs, fall
+     * back to 1 GiB banks (used by the two-board 4 GiB Challenge L).  This
+     * path is only taken for sizes the layout below cannot express, so the
+     * existing layouts are unchanged.
+     */
+    if (mib > 2048) {
+        if (mib % 1024 == 0 && mib / 1024 <= SGI_MC3_NUM_BANKS) {
+            unsigned count = mib / 1024;
+
+            for (n = 0; n < count; n++) {
+                installed[n & 1][n >> 1] = 5;    /* 1 GiB */
+            }
+            return true;
+        }
+        return false;
+    }
+
     for (i = 0; i < ARRAY_SIZE(sizes); i++) {
         if (mib % sizes[i].mib == 0 && mib / sizes[i].mib <= 4) {
             unsigned count = mib / sizes[i].mib;

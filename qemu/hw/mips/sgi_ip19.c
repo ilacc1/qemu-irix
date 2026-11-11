@@ -67,7 +67,9 @@ static bool ip19_debug_enabled(void)
 
 #define IP19_DPRINT(...)     do { if (ip19_debug_enabled()) fprintf(stderr, "ip19: " __VA_ARGS__); } while (0)
 
-#define IP19_MAX_CPUS       4
+/* Up to two 4-CPU IP19 boards (Challenge L); single-board ip19 uses 4. */
+#define IP19_MAX_CPUS       8
+#define IP19_CPUS_PER_BOARD 4
 #define IP19_MAX_SLOTS      16
 #define IP19_CFG_REGS       256
 
@@ -239,6 +241,12 @@ static bool ip19_debug_enabled(void)
 #define IP19_SLOT_CPU       1
 #define IP19_SLOT_MC3       2
 #define IP19_SLOT_IO4       3
+/* Challenge L (two CPU boards): CPU boards in slots 2 and 3, MC3 slot 1,
+ * main IO4 slot 5 (IP19_SMP.md slot map). */
+#define IP19_L_CPU_SLOT0    2
+#define IP19_L_CPU_SLOT1    3
+#define IP19_L_MC3_SLOT     1
+#define IP19_L_IO4_SLOT     5
 
 #define IO4_EBUSERROR_BADIOA   0x0008
 #define IO4_EBUSERROR_STICKY   0x0001
@@ -307,6 +315,12 @@ struct SGI_IP19State {
     uint64_t ip[IP19_MAX_CPUS][2];
     bool bm_claimed;
     bool reset_armed;   /* the first reset runs during init, before vCPUs start */
+    unsigned board_count;
+    unsigned cpu_slot[IP19_MAX_CPUS];
+    unsigned cpu_slice[IP19_MAX_CPUS];
+    unsigned mc3_slot;
+    unsigned io4_slot;
+    bool rtc_started;   /* CC counter starts on SYNC_DEST (two-board) */
     uint64_t grp_pending[64][2];
     uint64_t grp_delivered[64][IP19_MAX_CPUS][2];
     uint64_t ile[IP19_MAX_CPUS];
@@ -409,6 +423,19 @@ static unsigned ip19_attached_cpu(MemTxAttrs attrs)
     unsigned cpu = attrs.requester_id;
 
     return cpu < IP19_MAX_CPUS ? cpu : 0;
+}
+
+/* Map a config-bus slot/slice to the vCPU index, or -1 if absent. */
+static int ip19_cpu_for_slot(SGI_IP19State *s, unsigned slot, unsigned slice)
+{
+    unsigned i;
+
+    for (i = 0; i < IP19_MAX_CPUS; i++) {
+        if (s->cpu_slot[i] == slot && s->cpu_slice[i] == slice) {
+            return (int)i;
+        }
+    }
+    return -1;
 }
 
 static int ip19_hpil(SGI_IP19State *s, unsigned cpu)
@@ -624,9 +651,9 @@ static void ip19_deliver_vector(SGI_IP19State *s, uint64_t vector)
         }
     } else {
         unsigned slot = (dest >> 2) & 0xf;
-        unsigned target = dest & 0x3;
+        int target = ip19_cpu_for_slot(s, slot, dest & 0x3);
 
-        if (slot == IP19_SLOT_CPU && target < IP19_MAX_CPUS) {
+        if (target >= 0) {
             ip19_set_pending(s, target, level);
         }
     }
@@ -652,9 +679,9 @@ static void ip19_clear_vector(SGI_IP19State *s, uint64_t vector)
         }
     } else {
         unsigned slot = (dest >> 2) & 0xf;
-        unsigned target = dest & 0x3;
+        int target = ip19_cpu_for_slot(s, slot, dest & 0x3);
 
-        if (slot == IP19_SLOT_CPU && target < IP19_MAX_CPUS) {
+        if (target >= 0) {
             ip19_clear_pending(s, target, level);
         }
     }
@@ -705,19 +732,25 @@ static MemTxResult ip19_cc_read(void *opaque, hwaddr off, uint64_t *data,
     switch (off) {
     case CC_SPNUM:
         /* slot/proc as encoded by IP19 PROM/kernel */
-        ret = ((uint64_t)IP19_SLOT_CPU << EV_SLOTNUM_SHFT) |
-              ((uint64_t)cpu & EV_PROCNUM_MASK);
+        ret = ((uint64_t)s->cpu_slot[cpu] << EV_SLOTNUM_SHFT) |
+              ((uint64_t)s->cpu_slice[cpu] & EV_PROCNUM_MASK);
         break;
-    case CC_SYSCONFIG:
+    case CC_SYSCONFIG: {
         /*
-         * Presence bits as seen by IP19.
-         * Low bits indicate boards present; high bits give board class info.
+         * Presence bits as seen by IP19: one bit per occupied slot, a
+         * CPU-class bit per CPU board, a memory-class bit per MC3 slot.
          */
-        ret = (1ULL << IP19_SLOT_CPU) | (1ULL << IP19_SLOT_MC3) |
-              (1ULL << IP19_SLOT_IO4) |
-              (1ULL << (16 + IP19_SLOT_CPU)) |
-              (1ULL << (32 + IP19_SLOT_MC3));
+        unsigned b;
+
+        ret = (1ULL << s->mc3_slot) | (1ULL << s->io4_slot) |
+              (1ULL << (32 + s->mc3_slot));
+        for (b = 0; b < s->board_count; b++) {
+            unsigned slot = s->cpu_slot[b * IP19_CPUS_PER_BOARD];
+
+            ret |= (1ULL << slot) | (1ULL << (16 + slot));
+        }
         break;
+    }
     case CC_IP0:
         ret = s->ip[cpu][0];
         break;
@@ -782,12 +815,14 @@ static MemTxResult ip19_cc_read_with_attrs(void *opaque, hwaddr off, uint64_t *d
          * via config space (EV_SET_PROCREG). The PROM writes 0x12345678
          * across CMPREG0-3 and expects it back here.
          */
-        unsigned base = CFG_PROC_BASE + cpu * CFG_PROC_STRIDE;
+        unsigned slot = s->cpu_slot[cpu];
+        unsigned base = CFG_PROC_BASE +
+                        s->cpu_slice[cpu] * CFG_PROC_STRIDE;
 
-        *data = s->cfg_regs[IP19_SLOT_CPU][base] |
-                (s->cfg_regs[IP19_SLOT_CPU][base + 1] << 8) |
-                (s->cfg_regs[IP19_SLOT_CPU][base + 2] << 16) |
-                (s->cfg_regs[IP19_SLOT_CPU][base + 3] << 24);
+        *data = s->cfg_regs[slot][base] |
+                (s->cfg_regs[slot][base + 1] << 8) |
+                (s->cfg_regs[slot][base + 2] << 16) |
+                (s->cfg_regs[slot][base + 3] << 24);
         return MEMTX_OK;
     }
     if (off == CC_WGDST) {
@@ -1046,7 +1081,7 @@ static MemTxResult ip19_cfg_read(void *opaque, hwaddr off, uint64_t *data,
         *data = 0;
         return MEMTX_OK;
     }
-    if (slot == IP19_SLOT_IO4) {
+    if (slot == s->io4_slot) {
         switch (reg) {
         case CFG_IO4_LW:
             *data = s->io4_lw;
@@ -1090,16 +1125,17 @@ static MemTxResult ip19_cfg_write(void *opaque, hwaddr off, uint64_t val,
     unsigned reg = (off & 0x7ff) >> 3;
 
     if (slot < IP19_MAX_SLOTS && reg < IP19_CFG_REGS) {
-        if (slot == IP19_SLOT_CPU && reg >= CFG_PROC_CMPREG0) {
+        if (reg >= CFG_PROC_CMPREG0) {
             unsigned proc = (reg - CFG_PROC_CMPREG0) / CFG_PROC_STRIDE;
             unsigned preg = (reg - CFG_PROC_CMPREG0) % CFG_PROC_STRIDE;
+            int c = ip19_cpu_for_slot(s, slot, proc);
 
-            if (proc < IP19_MAX_CPUS && preg <= 3) {
+            if (c >= 0 && preg <= 3) {
                 unsigned base = CFG_PROC_CMPREG0 +
                                 proc * CFG_PROC_STRIDE;
 
                 s->cfg_regs[slot][reg] = val;
-                s->cmpreg[proc] =
+                s->cmpreg[c] =
                     (s->cfg_regs[slot][base] & 0xff) |
                     ((s->cfg_regs[slot][base + 1] & 0xff) << 8) |
                     ((s->cfg_regs[slot][base + 2] & 0xff) << 16) |
@@ -1111,16 +1147,16 @@ static MemTxResult ip19_cfg_write(void *opaque, hwaddr off, uint64_t val,
                  * write would use stale upper bytes and fire at once.
                  */
                 if (preg == 0) {
-                    if (s->cmp_timer[proc]) {
-                        timer_del(s->cmp_timer[proc]);
+                    if (s->cmp_timer[c]) {
+                        timer_del(s->cmp_timer[c]);
                     }
                 } else if (preg == 3) {
-                    ip19_cmp_rearm(s, proc);
+                    ip19_cmp_rearm(s, c);
                 }
                 return MEMTX_OK;
             }
         }
-        if (slot == IP19_SLOT_IO4) {
+        if (slot == s->io4_slot) {
             switch (reg) {
             case CFG_IO4_LW:
                 s->io4_lw = val;
@@ -1256,6 +1292,11 @@ static void ip19_flash_load(SGI_IP19State *s)
 /* Lives beside io4prom.bin, like the IO4 flash image. */
 static char *ip19_nvram_path(void)
 {
+    const char *file = g_getenv("IP19_NVRAM_FILE");
+
+    if (file && file[0]) {
+        return g_strdup(file);
+    }
     g_autofree char *seed =
         qemu_find_file(QEMU_FILE_TYPE_BIOS, "io4prom.bin");
 
@@ -2211,21 +2252,21 @@ static unsigned ip19_io4_padap_type(SGI_IP19State *s, unsigned padap)
     if (padap >= 8) {
         return IO4_ADAP_NULL;
     }
-    reg = s->cfg_regs[IP19_SLOT_IO4][padap < 4 ? CFG_IO4_IODEV0
-                                              : CFG_IO4_IODEV1];
+    reg = s->cfg_regs[s->io4_slot][padap < 4 ? CFG_IO4_IODEV0
+                                             : CFG_IO4_IODEV1];
     return (reg >> ((padap & 3) * 8)) & 0xff;
 }
 
 static bool ip19_io4_padap_enabled(SGI_IP19State *s, unsigned padap)
 {
     return padap < 8 &&
-           (s->cfg_regs[IP19_SLOT_IO4][CFG_IO4_ADAP] & (1ULL << padap));
+           (s->cfg_regs[s->io4_slot][CFG_IO4_ADAP] & (1ULL << padap));
 }
 
 static void ip19_io4_bad_ioa(SGI_IP19State *s)
 {
-    uint64_t mask = s->cfg_regs[IP19_SLOT_IO4][CFG_IO4_INTRMASK];
-    uint64_t vector = s->cfg_regs[IP19_SLOT_IO4][CFG_IO4_INTRVECTOR];
+    uint64_t mask = s->cfg_regs[s->io4_slot][CFG_IO4_INTRMASK];
+    uint64_t vector = s->cfg_regs[s->io4_slot][CFG_IO4_INTRVECTOR];
 
     s->io4_ebus_error |= IO4_EBUSERROR_BADIOA | IO4_EBUSERROR_STICKY;
 
@@ -2522,40 +2563,47 @@ static const MemoryRegionOps ip19_sync_ops = {
 
 static void ip19_cfg_defaults(SGI_IP19State *s, MachineState *machine)
 {
-    unsigned proc;
-    unsigned slices = MIN(machine->smp.cpus, IP19_MAX_CPUS);
+    unsigned cpus = MIN(machine->smp.cpus, IP19_MAX_CPUS);
+    unsigned b, proc;
 
     /*
-     * A_ENABLE is the slice vector for this IP19 board.  One 2-CPU
-     * board has slices 0-1 enabled (0x03); a 4-CPU board uses 0x0f.
-     * Do not advertise unpopulated slices as enabled.
+     * A_ENABLE is the slice vector for one IP19 board.  A 2-CPU board has
+     * slices 0-1 enabled (0x03); a 4-CPU board uses 0x0f.  Do not
+     * advertise unpopulated slices as enabled.
      */
-    s->cfg_regs[IP19_SLOT_CPU][CFG_BOARD_ENABLE] = (1U << slices) - 1;
-    s->cfg_regs[IP19_SLOT_CPU][CFG_BOARD_TYPE] = 0x01; /* IP19 */
-    s->cfg_regs[IP19_SLOT_CPU][CFG_BOARD_LEVEL] = 0x03;
-    for (proc = 0; proc < slices; proc++) {
-        unsigned base = CFG_PROC_BASE + proc * CFG_PROC_STRIDE;
+    for (b = 0; b < s->board_count; b++) {
+        unsigned first = b * IP19_CPUS_PER_BOARD;
+        unsigned slot = s->cpu_slot[first];
+        unsigned slices = cpus > first ?
+                          MIN(cpus - first, IP19_CPUS_PER_BOARD) : 0;
 
-        s->cfg_regs[IP19_SLOT_CPU][base + CFG_PROC_CCREV] = 0x1e; /* CC rev 2 */
-        /*
-         * EV_CACHE_SZ code 1 == 4 MiB secondary cache, matching the
-         * EAROM EV_CACHE_SZ_LOC value used by the PROM and kernel.
-         */
-        s->cfg_regs[IP19_SLOT_CPU][base + CFG_PROC_CACHE_SZ] = 0x01;
+        s->cfg_regs[slot][CFG_BOARD_ENABLE] = (1U << slices) - 1;
+        s->cfg_regs[slot][CFG_BOARD_TYPE] = 0x01; /* IP19 */
+        s->cfg_regs[slot][CFG_BOARD_LEVEL] = 0x03;
+        for (proc = 0; proc < slices; proc++) {
+            unsigned base = CFG_PROC_BASE + proc * CFG_PROC_STRIDE;
+
+            s->cfg_regs[slot][base + CFG_PROC_CCREV] = 0x1e; /* CC rev 2 */
+            /*
+             * EV_CACHE_SZ code 1 == 4 MiB secondary cache, matching the
+             * EAROM EV_CACHE_SZ_LOC value used by the PROM and kernel.
+             */
+            s->cfg_regs[slot][base + CFG_PROC_CACHE_SZ] = 0x01;
+        }
     }
 
-    /* IO4 on slot 2 */
-    s->cfg_regs[IP19_SLOT_IO4][CFG_BOARD_ENABLE] = 0x01;
-    s->cfg_regs[IP19_SLOT_IO4][CFG_BOARD_TYPE] = 0x0a; /* IO4 */
-    s->cfg_regs[IP19_SLOT_IO4][CFG_BOARD_LEVEL] = 0x21;
+    /* IO4 */
+    s->cfg_regs[s->io4_slot][CFG_BOARD_ENABLE] = 0x01;
+    s->cfg_regs[s->io4_slot][CFG_BOARD_TYPE] = 0x0a; /* IO4 */
+    s->cfg_regs[s->io4_slot][CFG_BOARD_LEVEL] = 0x21;
     s->io4_lw = IP19_EPC_REGION;
     s->io4_sw = (uint64_t)IP19_EPC_REGION << 8;
-    s->cfg_regs[IP19_SLOT_IO4][CFG_IO4_ADAP] =
+    s->cfg_regs[s->io4_slot][CFG_IO4_ADAP] =
         (1ULL << IP19_EPC_PADAP) | (1ULL << IP19_S1_PADAP);
-    s->cfg_regs[IP19_SLOT_IO4][CFG_IO4_INTRMASK] = IO4_INTRMASK_ERROR;
+    s->cfg_regs[s->io4_slot][CFG_IO4_INTRMASK] = IO4_INTRMASK_ERROR;
     /* IODEV bytes are indexed by physical adapter number. */
-    s->cfg_regs[IP19_SLOT_IO4][CFG_IO4_IODEV0] = IO4_ADAP_EPC << 8;
-    s->cfg_regs[IP19_SLOT_IO4][CFG_IO4_IODEV1] = IO4_ADAP_SCSI;
+    s->cfg_regs[s->io4_slot][CFG_IO4_IODEV0] = IO4_ADAP_EPC << 8;
+    s->cfg_regs[s->io4_slot][CFG_IO4_IODEV1] = IO4_ADAP_SCSI;
 }
 
 static void ip19_earom_defaults(SGI_IP19State *s)
@@ -2723,9 +2771,33 @@ static void sgi_ip19_init(MachineState *machine)
     cpuclk = clock_new(OBJECT(machine), "cpu-refclk");
     clock_set_hz(cpuclk, IP19_CPU_HZ);
 
+    /*
+     * More than four CPUs selects the two-board Challenge L layout:
+     * CPU boards in slots 2 and 3, MC3 in slot 1, main IO4 in slot 5.
+     * The single-board machine keeps its original slots 1/2/3.
+     */
+    if (machine->smp.cpus > IP19_CPUS_PER_BOARD) {
+        s->board_count = 2;
+        s->mc3_slot = IP19_L_MC3_SLOT;
+        s->io4_slot = IP19_L_IO4_SLOT;
+    } else {
+        s->board_count = 1;
+        s->mc3_slot = IP19_SLOT_MC3;
+        s->io4_slot = IP19_SLOT_IO4;
+    }
+
     for (i = 0; i < machine->smp.cpus; i++) {
+        unsigned board = i / IP19_CPUS_PER_BOARD;
         MIPSCPU *cpu = mips_cpu_create_with_clock(machine->cpu_type, cpuclk,
                                                   TARGET_BIG_ENDIAN);
+
+        if (s->board_count > 1) {
+            s->cpu_slot[i] = board == 0 ? IP19_L_CPU_SLOT0
+                                        : IP19_L_CPU_SLOT1;
+        } else {
+            s->cpu_slot[i] = IP19_SLOT_CPU;
+        }
+        s->cpu_slice[i] = i % IP19_CPUS_PER_BOARD;
 
         /*
          * IRIX 6.5.22 IP19 reaches the K2 refill handler before any
@@ -2770,6 +2842,7 @@ static void sgi_ip19_init(MachineState *machine)
     s->cc_uart_rx = 0;
     s->cc_uart_rx_ready = false;
     s->rtc_epoch_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+    s->rtc_started = false;
     s->epc_rtc_base_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
     s->epc_rtc_base_sec = (int64_t)time(NULL);
     memset(s->epc_rtc_regs, 0, sizeof(s->epc_rtc_regs));
@@ -2855,7 +2928,7 @@ static void sgi_ip19_init(MachineState *machine)
     ip19_cfg_defaults(s, machine);
     memory_region_init_io(&s->cfg, NULL, &ip19_cfg_ops, s, "ip19.cfg",
                           IP19_CFG_SIZE);
-    memory_region_add_subregion(&s->cfg, IP19_SLOT_MC3 << 11,
+    memory_region_add_subregion(&s->cfg, s->mc3_slot << 11,
                                 sgi_mc3_config_region(s->mc3));
     memory_region_add_subregion(sysmem, IP19_LOCAL_ALIAS(IP19_CFG_BASE), &s->cfg);
 
@@ -3031,6 +3104,7 @@ static void sgi_ip19_reset(MachineState *machine, ResetType type)
          * time-of-day is separate and keeps wall-clock time.
          */
         s->rtc_epoch_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+        s->rtc_started = false;
         /*
          * Re-base the EPC time-of-day on the host clock as at startup.
          * The guest can rewrite the RTC through the SET registers, and a
@@ -3119,11 +3193,25 @@ static void sgi_ip19_class_init(ObjectClass *oc, const void *data)
     mc->desc = "SGI IP19 (Everest Challenge/Onyx)";
     mc->init = sgi_ip19_init;
     mc->reset = sgi_ip19_reset;
-    mc->max_cpus = IP19_MAX_CPUS;
+    mc->max_cpus = IP19_CPUS_PER_BOARD;
     mc->default_cpus = 4;
     mc->default_cpu_type = MIPS_CPU_TYPE_NAME("R4400SC");
     mc->default_ram_size = 512 * MiB;
     mc->default_ram_id = "sgi_ip19.ram";
+}
+
+static void sgi_ip19_l_class_init(ObjectClass *oc, const void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+
+    mc->desc = "SGI IP19 two-board (Challenge L)";
+    mc->init = sgi_ip19_init;
+    mc->reset = sgi_ip19_reset;
+    mc->max_cpus = IP19_MAX_CPUS;
+    mc->default_cpus = IP19_MAX_CPUS;
+    mc->default_cpu_type = MIPS_CPU_TYPE_NAME("R4400SC");
+    mc->default_ram_size = 4 * GiB;
+    mc->default_ram_id = "sgi_ip19_l.ram";
 }
 
 static const TypeInfo sgi_ip19_type = {
@@ -3133,9 +3221,16 @@ static const TypeInfo sgi_ip19_type = {
     .class_init = sgi_ip19_class_init,
 };
 
+static const TypeInfo sgi_ip19_l_type = {
+    .name = MACHINE_TYPE_NAME("ip19-l"),
+    .parent = TYPE_SGI_IP19_MACHINE,
+    .class_init = sgi_ip19_l_class_init,
+};
+
 static void sgi_ip19_machine_init(void)
 {
     type_register_static(&sgi_ip19_type);
+    type_register_static(&sgi_ip19_l_type);
 }
 
 type_init(sgi_ip19_machine_init)
