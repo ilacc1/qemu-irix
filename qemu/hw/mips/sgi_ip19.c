@@ -306,6 +306,7 @@ struct SGI_IP19State {
 
     uint64_t ip[IP19_MAX_CPUS][2];
     bool bm_claimed;
+    bool reset_armed;   /* the first reset runs during init, before vCPUs start */
     uint64_t grp_pending[64][2];
     uint64_t grp_delivered[64][IP19_MAX_CPUS][2];
     uint64_t ile[IP19_MAX_CPUS];
@@ -2681,6 +2682,34 @@ static void ip19_prom_compat_fixups(SGI_IP19State *s)
     IP19_DPRINT("PROM compatibility fixups applied: %u\n", applied);
 }
 
+/*
+ * The PROM lives in writable RAM: the kernel treats all low physical
+ * memory as usable, including the PROM window, so a booted kernel will
+ * have scribbled over it.  A system reset must reload the image, or the
+ * PROM re-entry after a warm reset executes garbage.
+ */
+static void ip19_prom_load(SGI_IP19State *s, MachineState *machine)
+{
+    const char *firmware = machine->firmware ?: "ip19prom.bin";
+    g_autofree char *filename =
+        qemu_find_file(QEMU_FILE_TYPE_BIOS, firmware);
+
+    if (filename) {
+        g_autofree gchar *prom_buf = NULL;
+        gsize prom_len = 0;
+
+        if (g_file_get_contents(filename, &prom_buf, &prom_len, NULL)) {
+            memcpy(memory_region_get_ram_ptr(&s->prom), prom_buf,
+                   MIN(prom_len, IP19_PROM_SIZE));
+        } else {
+            error_report("ip19: cannot read PROM image '%s'", filename);
+        }
+        ip19_prom_compat_fixups(s);
+    } else {
+        error_report("ip19: no PROM image '%s'", firmware);
+    }
+}
+
 static void sgi_ip19_init(MachineState *machine)
 {
     SGI_IP19State *s = SGI_IP19_MACHINE(machine);
@@ -2785,26 +2814,7 @@ static void sgi_ip19_init(MachineState *machine)
     memory_region_init_ram(&s->prom, NULL, "ip19.prom", IP19_PROM_SIZE,
                            &error_fatal);
     memory_region_add_subregion(sysmem, IP19_PROM_BASE, &s->prom);
-    {
-        const char *firmware = machine->firmware ?: "ip19prom.bin";
-        g_autofree char *filename =
-            qemu_find_file(QEMU_FILE_TYPE_BIOS, firmware);
-
-        if (filename) {
-            g_autofree gchar *prom_buf = NULL;
-            gsize prom_len = 0;
-
-            if (g_file_get_contents(filename, &prom_buf, &prom_len, NULL)) {
-                memcpy(memory_region_get_ram_ptr(&s->prom), prom_buf,
-                       MIN(prom_len, IP19_PROM_SIZE));
-            } else {
-                error_report("ip19: cannot read PROM image '%s'", filename);
-            }
-            ip19_prom_compat_fixups(s);
-        } else {
-            error_report("ip19: no PROM image '%s'", firmware);
-        }
-    }
+    ip19_prom_load(s, machine);
 
     memory_region_init_io(&s->lwin, NULL, &ip19_lwin_ops, s, "ip19.lwin",
                           IP19_LWIN_SIZE);
@@ -3002,6 +3012,65 @@ static void sgi_ip19_reset(MachineState *machine, ResetType type)
     qemu_devices_reset(type);
 
     /*
+     * A runtime system reset must look like a cold power-on for all of
+     * the machine state that is not a qdev.  The device reset above does
+     * not cover the config bus, the IO4 window, the bootmaster claim or
+     * the CC UART, and the processors are not returned to the PROM reset
+     * vector, so the kernel keeps running and its restart handler
+     * retriggers KZRESET in a loop.  Skip the first call: it runs during
+     * machine init, after the vCPUs were created at the reset vector and
+     * before they start.
+     */
+    if (s->reset_armed) {
+        /*
+         * The CC cycle counter (EV_RTC) restarts on a system reset.  The
+         * PROM's bootmaster arbitration barriers on 2*RTC_SPEED and derives
+         * per-CPU wait offsets from it, which only works from a near-zero
+         * timeline; a free-running counter skips the barrier and lets the
+         * CPUs race, so no bootmaster is elected.  The battery-backed EPC
+         * time-of-day is separate and keeps wall-clock time.
+         */
+        s->rtc_epoch_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+        memset(s->cfg_regs, 0, sizeof(s->cfg_regs));
+        ip19_cfg_defaults(s, machine);
+        ip19_prom_load(s, machine);
+        CPU_FOREACH(cs) {
+            MIPSCPU *mc = MIPS_CPU(cs);
+
+            cpu_reset(cs);
+            /* As in init: keep Config0 bit 17 clear for the PROM probe. */
+            mc->env.CP0_Config0 &= ~(1U << 17);
+            mc->env.sgi_idle_count = 0;
+        }
+        sgi_idle_reset();
+        s->io4_ebus_error = 0;
+        s->io4_error_vector = 0;
+        memset(s->wgdst, 0, sizeof(s->wgdst));
+        memset(s->wgcntrl, 0, sizeof(s->wgcntrl));
+        s->cc_ertoip = 0;
+        s->cc_eccsb_dis = 0;
+        s->pgbren = 0;
+        /*
+         * The PROM stops at "hardware inventory has changed, press Enter"
+         * when the stored inventory disagrees with the hardware.  At
+         * power-on the model invalidates the stored copy so the PROM
+         * rescans silently; do the same on reset so a reboot does not wait
+         * for a console keypress.
+         */
+        s->epc_nvram[EPC_NV_INVENT_VALID] = 0;
+        s->epc_nvram[EPC_NV_NEW_CHECKSUM] = ip19_nv_new_checksum(s);
+        s->bm_claimed = false;
+        s->cc_cmd_len = 0;
+        s->cc_uart_rx = 0;
+        s->cc_uart_rx_ready = false;
+        for (i = 0; i < IP19_MAX_CPUS; i++) {
+            s->cc_uart_rxq_head[i] = 0;
+            s->cc_uart_rxq_tail[i] = 0;
+        }
+    }
+    s->reset_armed = true;
+
+    /*
      * The CC/IP state is machine state, not device state.  Clear it on
      * reset so a reboot starts from a clean interrupt configuration and
      * so the bootmaster has to claim the master group again.
@@ -3019,8 +3088,8 @@ static void sgi_ip19_reset(MachineState *machine, ResetType type)
     timer_del(s->epc_rtc_pie);
     s->epc_rtc_regs[NVR_RTCC] = 0;
     /*
-     * The real CC RTC is free-running across a system reset.  Keeping the
-     * original epoch avoids moving time backwards under a booted kernel.
+     * The EPC time-of-day is battery-backed and is not touched here; only
+     * the CC cycle counter was restarted above.
      */
     for (i = 0; i < IP19_MAX_CPUS; i++) {
         if (s->cmp_timer[i]) {

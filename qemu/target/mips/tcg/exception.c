@@ -370,6 +370,27 @@ void sgi_idle_detect_enable(void)
     qemu_mutex_unlock(&sgi_idle_lock);
 }
 
+/*
+ * Discard all idle-loop monitoring state and start learning again.  Called
+ * on a system reset so a stale learned idle PC or partial sample history
+ * from the previous boot cannot make a fresh kernel halt or sleep.
+ */
+void sgi_idle_reset(void)
+{
+    qemu_mutex_lock(&sgi_idle_lock);
+    qatomic_set(&sgi_idle_pc, 0);
+    qatomic_set(&sgi_idle_detecting, 0);
+    sgi_idle_started = false;
+    sgi_idle_t0 = 0;
+    sgi_idle_epoch_t0 = 0;
+    memset(&sgi_idle_cur, 0, sizeof(sgi_idle_cur));
+    memset(sgi_idle_hist, 0, sizeof(sgi_idle_hist));
+    sgi_idle_nepoch = 0;
+    qemu_mutex_unlock(&sgi_idle_lock);
+
+    sgi_idle_detect_enable();
+}
+
 static void __attribute__((constructor)) sgi_idle_config(void)
 {
     const char *e;
